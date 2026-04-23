@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fcp-mcp"
+version = "0.1.0"
+description = "The most capable Final Cut Pro MCP server — FCPXML engine + live FCP control + media analysis + parametric puppets"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Adam Steen", email = "dreliq9@gmail.com" },
+]
+keywords = [
+    "mcp",
+    "final-cut-pro",
+    "fcpxml",
+    "video-editing",
+    "claude",
+    "llm",
+    "davinci-resolve",
+    "premiere",
+    "compressor",
+    "ffprobe",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Video :: Non-Linear Editor",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "defusedxml>=0.7.1",
+    "lxml>=4.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+    "ruff>=0.1.0",
+    "build>=1.0",
+    "twine>=5.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/dreliq9/fcp-mcp"
+Repository = "https://github.com/dreliq9/fcp-mcp"
+Issues = "https://github.com/dreliq9/fcp-mcp/issues"
+Changelog = "https://github.com/dreliq9/fcp-mcp/blob/main/CHANGELOG.md"
+
+[project.scripts]
+fcp-mcp = "fcp_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+fcp_mcp = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# F841 (unused variable) is noisy for in-progress scaffolding; re-enable
+# per-call-site once the EDL parse and rough-cut scaffolds are complete.
+ignore = ["F841"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E402", "E741", "F401", "F811"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["src"]

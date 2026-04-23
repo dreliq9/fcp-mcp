@@ -1,0 +1,2888 @@
+"""FCP-MCP Server — Final Cut Pro MCP Server.
+
+The most capable FCP MCP server: FCPXML engine + live FCP control + media analysis.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+from dataclasses import asdict
+from pathlib import Path
+from typing import Any
+
+from mcp.server.fastmcp import FastMCP
+
+from .fcpxml.analysis import (
+    analyze_pacing,
+    analyze_timeline_stats,
+    detect_duplicates,
+    detect_flash_frames,
+    detect_gaps,
+)
+from .fcpxml.diff import diff_files
+from .fcpxml.generator import FCPXMLGenerator
+from .fcpxml.models import FCPXMLDocument
+from .fcpxml.parser import FCPXMLParser
+from .fcpxml.validator import FCPXMLValidator
+from .fcpxml.writer import FCPXMLModifier
+from .fcpxml.time_utils import RationalTime
+from .fcpxml.puppet import (
+    Keyframe,
+    PartAnimation,
+    PuppetSceneBuilder,
+    preset_bounce,
+    preset_idle,
+    preset_talk,
+    preset_walk,
+    preset_wave,
+    rig_from_json,
+    standard_humanoid_rig,
+)
+
+mcp = FastMCP(
+    "fcp-mcp",
+    instructions="Final Cut Pro MCP Server — FCPXML engine + live FCP control + media analysis + puppet animation. 89 tools across 11 categories.",
+)
+
+# Default project directory (can be overridden via env var)
+PROJECTS_DIR = Path(os.environ.get("FCP_PROJECTS_DIR", str(Path.home() / "Movies")))
+
+_parser = FCPXMLParser()
+_validator = FCPXMLValidator()
+
+
+def _resolve_path(path: str) -> Path:
+    """Resolve a path, checking PROJECTS_DIR if not absolute."""
+    p = Path(path)
+    if p.is_absolute():
+        return p
+    return PROJECTS_DIR / p
+
+
+def _parse_doc(path: str) -> FCPXMLDocument:
+    """Parse an FCPXML file and return the document."""
+    return _parser.parse(_resolve_path(path))
+
+
+def _serializable(obj: Any) -> Any:
+    """Make dataclass/enum objects JSON-serializable."""
+    if hasattr(obj, "__dataclass_fields__"):
+        d = {}
+        for k, v in asdict(obj).items():
+            if k.startswith("_"):
+                continue
+            d[k] = v
+        return d
+    return obj
+
+
+# ============================================================================
+# Category 2: FCPXML Analysis (12 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcpxml_parse(path: str) -> str:
+    """Parse an FCPXML file and return a structure summary.
+
+    Args:
+        path: Path to .fcpxml file (absolute or relative to FCP_PROJECTS_DIR)
+    """
+    doc = _parse_doc(path)
+    projects = doc.all_projects
+    summary = {
+        "version": doc.version,
+        "formats": len(doc.formats),
+        "assets": len(doc.assets),
+        "effects": len(doc.effects),
+        "projects": [
+            {
+                "name": p.name,
+                "has_sequence": p.sequence is not None,
+                "clip_count": p.sequence.spine.clip_count if p.sequence and p.sequence.spine else 0,
+                "duration": p.sequence.duration.to_fcpxml() if p.sequence else "0s",
+            }
+            for p in projects
+        ],
+    }
+    return json.dumps(summary, indent=2)
+
+
+@mcp.tool()
+def fcpxml_list_clips(path: str, project_name: str = "") -> str:
+    """List all clips in the timeline with timecodes, durations, and roles.
+
+    Args:
+        path: Path to .fcpxml file
+        project_name: Optional project name filter (uses first project if empty)
+    """
+    doc = _parse_doc(path)
+    fmt = list(doc.formats.values())[0] if doc.formats else None
+    fps = fmt.fps if fmt else 29.97
+
+    clips_data = []
+    for project in doc.all_projects:
+        if project_name and project.name != project_name:
+            continue
+        if not project.sequence or not project.sequence.spine:
+            continue
+        for i, clip in enumerate(project.sequence.spine.clips):
+            clips_data.append({
+                "index": i,
+                "name": clip.name,
+                "type": clip.clip_type.value,
+                "offset": clip.offset.to_timecode(fps),
+                "offset_raw": clip.offset.to_fcpxml(),
+                "start": clip.start.to_fcpxml(),
+                "duration": f"{clip.duration.to_seconds():.3f}s",
+                "duration_raw": clip.duration.to_fcpxml(),
+                "role": clip.role,
+                "ref": clip.ref,
+                "connected_clips": len(clip.connected_clips),
+                "markers": len(clip.markers),
+            })
+    return json.dumps(clips_data, indent=2)
+
+
+@mcp.tool()
+def fcpxml_list_markers(path: str) -> str:
+    """List all markers, chapter markers, and keywords across all clips.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    fmt = list(doc.formats.values())[0] if doc.formats else None
+    fps = fmt.fps if fmt else 29.97
+
+    markers = []
+    for project in doc.all_projects:
+        if not project.sequence or not project.sequence.spine:
+            continue
+        for clip in project.sequence.spine.clips:
+            for m in clip.markers:
+                markers.append({
+                    "clip": clip.name,
+                    "type": m.marker_type.value,
+                    "value": m.value,
+                    "note": m.note,
+                    "start": m.start.to_timecode(fps),
+                    "start_raw": m.start.to_fcpxml(),
+                })
+            for kw in clip.keywords:
+                markers.append({
+                    "clip": clip.name,
+                    "type": "keyword",
+                    "value": kw.value,
+                    "start": kw.start.to_fcpxml(),
+                    "duration": kw.duration.to_fcpxml(),
+                })
+    return json.dumps(markers, indent=2)
+
+
+@mcp.tool()
+def fcpxml_analyze_pacing(path: str) -> str:
+    """Analyze shot pacing — average/median shot length, distribution histogram.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    results = analyze_pacing(doc)
+    return json.dumps([_serializable(r) for r in results], indent=2)
+
+
+@mcp.tool()
+def fcpxml_detect_gaps(path: str) -> str:
+    """Find all gaps in the timeline.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    gaps = detect_gaps(doc)
+    return json.dumps([_serializable(g) for g in gaps], indent=2)
+
+
+@mcp.tool()
+def fcpxml_detect_flash_frames(path: str, max_frames: int = 2) -> str:
+    """Find clips shorter than max_frames (potential flash frames / accidental edits).
+
+    Args:
+        path: Path to .fcpxml file
+        max_frames: Maximum frame count to flag (default 2)
+    """
+    doc = _parse_doc(path)
+    flashes = detect_flash_frames(doc, max_frames=max_frames)
+    return json.dumps([_serializable(f) for f in flashes], indent=2)
+
+
+@mcp.tool()
+def fcpxml_detect_duplicates(path: str) -> str:
+    """Find clips that use the same source media.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    dupes = detect_duplicates(doc)
+    return json.dumps([_serializable(d) for d in dupes], indent=2)
+
+
+@mcp.tool()
+def fcpxml_validate(path: str) -> str:
+    """Validate FCPXML structure and report errors/warnings.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    result = _validator.validate_file(_resolve_path(path))
+    return result.summary()
+
+
+@mcp.tool()
+def fcpxml_list_effects(path: str) -> str:
+    """List all effects and transitions applied to clips.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    effects = []
+    for project in doc.all_projects:
+        if not project.sequence or not project.sequence.spine:
+            continue
+        for clip in project.sequence.spine.clips:
+            for effect in clip.effects:
+                effects.append({
+                    "clip": clip.name,
+                    "effect_name": effect.name,
+                    "effect_ref": effect.ref,
+                    "enabled": effect.enabled,
+                    "parameters": effect.parameters,
+                })
+    # Also list effect resources
+    resources = [{"id": k, "name": v.name, "uid": v.uid} for k, v in doc.effects.items()]
+    return json.dumps({"applied": effects, "available": resources}, indent=2)
+
+
+@mcp.tool()
+def fcpxml_list_roles(path: str) -> str:
+    """List all roles and subroles used in the timeline.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    roles = set()
+    for clip in doc.all_clips:
+        if clip.role:
+            roles.add(clip.role)
+        for cc in clip.connected_clips:
+            if cc.role:
+                roles.add(cc.role)
+    return json.dumps({"roles": sorted(roles)}, indent=2)
+
+
+@mcp.tool()
+def fcpxml_timeline_stats(path: str) -> str:
+    """Get comprehensive timeline statistics — duration, clip count, resolution, pacing, etc.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    stats = analyze_timeline_stats(doc)
+    return json.dumps([_serializable(s) for s in stats], indent=2)
+
+
+@mcp.tool()
+def fcpxml_diff(path_a: str, path_b: str) -> str:
+    """Compare two FCPXML files and show differences.
+
+    Args:
+        path_a: Path to first .fcpxml file
+        path_b: Path to second .fcpxml file
+    """
+    results = diff_files(_resolve_path(path_a), _resolve_path(path_b))
+    return "\n\n".join(r.summary() for r in results)
+
+
+# ============================================================================
+# Category 3: FCPXML Editing (12 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcpxml_add_marker(
+    path: str,
+    clip_name: str,
+    start: str,
+    value: str,
+    note: str = "",
+    marker_type: str = "standard",
+    output_path: str = "",
+) -> str:
+    """Add a marker to a clip.
+
+    Args:
+        path: Path to .fcpxml file
+        clip_name: Name of the clip to add the marker to
+        start: Marker position in FCPXML time (e.g., "60060/30000s")
+        value: Marker title/value
+        note: Optional marker note
+        marker_type: "standard" or "chapter"
+        output_path: Output file path (default: adds _modified suffix)
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.add_marker(clip_name, start, value, note, marker_type):
+        return f"Clip '{clip_name}' not found"
+    out = mod.save(output_path if output_path else None)
+    return f"Marker added. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_batch_add_markers(path: str, markers_json: str, output_path: str = "") -> str:
+    """Add multiple markers at once.
+
+    Args:
+        path: Path to .fcpxml file
+        markers_json: JSON array of markers, each: {"clip_name": str, "start": str, "value": str, "note"?: str, "type"?: str}
+        output_path: Output file path (default: adds _modified suffix)
+    """
+    markers = json.loads(markers_json)
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = mod.batch_add_markers(markers)
+    out = mod.save(output_path if output_path else None)
+    return f"{count}/{len(markers)} markers added. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_add_keyword(
+    path: str, clip_name: str, value: str, start: str = "0s",
+    duration: str = "", output_path: str = "",
+) -> str:
+    """Add a keyword to a clip.
+
+    Args:
+        path: Path to .fcpxml file
+        clip_name: Name of the clip
+        value: Keyword text
+        start: Start time in FCPXML format
+        duration: Duration of keyword range (optional)
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.add_keyword(clip_name, value, start, duration or None):
+        return f"Clip '{clip_name}' not found"
+    out = mod.save(output_path if output_path else None)
+    return f"Keyword '{value}' added. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_trim_clip(
+    path: str, clip_name: str,
+    new_start: str = "", new_duration: str = "",
+    output_path: str = "",
+) -> str:
+    """Trim a clip's source in/out points.
+
+    Args:
+        path: Path to .fcpxml file
+        clip_name: Name of the clip to trim
+        new_start: New source start time (optional)
+        new_duration: New duration (optional)
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.trim_clip(clip_name, new_start or None, new_duration or None):
+        return f"Clip '{clip_name}' not found"
+    out = mod.save(output_path if output_path else None)
+    return f"Clip trimmed. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_split_clip(path: str, clip_name: str, split_at: str, output_path: str = "") -> str:
+    """Split a clip at a given offset within the clip.
+
+    Args:
+        path: Path to .fcpxml file
+        clip_name: Name of the clip to split
+        split_at: Offset within the clip to split at (FCPXML time)
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.split_clip(clip_name, split_at):
+        return f"Could not split clip '{clip_name}' at {split_at}"
+    out = mod.save(output_path if output_path else None)
+    return f"Clip split. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_delete_clips(path: str, clip_names_json: str, output_path: str = "") -> str:
+    """Remove clips from the timeline by name.
+
+    Args:
+        path: Path to .fcpxml file
+        clip_names_json: JSON array of clip names to delete
+        output_path: Output file path
+    """
+    names = json.loads(clip_names_json)
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = mod.delete_clips(names)
+    out = mod.save(output_path if output_path else None)
+    return f"{count}/{len(names)} clips deleted. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_reorder_clips(path: str, clip_names_json: str, output_path: str = "") -> str:
+    """Reorder clips in the primary spine to match the given name order.
+
+    Args:
+        path: Path to .fcpxml file
+        clip_names_json: JSON array of clip names in desired order
+        output_path: Output file path
+    """
+    names = json.loads(clip_names_json)
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.reorder_clips(names):
+        return "Could not reorder clips (no spine found)"
+    out = mod.save(output_path if output_path else None)
+    return f"Clips reordered. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_add_transition(
+    path: str, after_clip_name: str,
+    duration: str = "30030/30000s", name: str = "Cross Dissolve",
+    output_path: str = "",
+) -> str:
+    """Insert a transition after a clip.
+
+    Args:
+        path: Path to .fcpxml file
+        after_clip_name: Name of the clip to add transition after
+        duration: Transition duration (default: 1 second at 29.97)
+        name: Transition name
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.add_transition(after_clip_name, duration, name):
+        return f"Clip '{after_clip_name}' not found"
+    out = mod.save(output_path if output_path else None)
+    return f"Transition added. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_change_speed(
+    path: str, clip_name: str, speed_factor: float,
+    output_path: str = "",
+) -> str:
+    """Change clip playback speed.
+
+    Args:
+        path: Path to .fcpxml file
+        clip_name: Name of the clip
+        speed_factor: Speed multiplier (2.0 = 2x fast, 0.5 = half speed)
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.change_speed(clip_name, speed_factor):
+        return f"Could not change speed of '{clip_name}'"
+    out = mod.save(output_path if output_path else None)
+    return f"Speed changed to {speed_factor}x. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_assign_role(
+    path: str, clip_name: str, role: str, output_path: str = "",
+) -> str:
+    """Set the role on a clip (e.g., "Dialogue", "Video", "Music", "Effects").
+
+    Args:
+        path: Path to .fcpxml file
+        clip_name: Name of the clip
+        role: Role name
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    if not mod.assign_role(clip_name, role):
+        return f"Clip '{clip_name}' not found"
+    out = mod.save(output_path if output_path else None)
+    return f"Role '{role}' assigned. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_add_title(
+    path: str,
+    text: str,
+    duration: str = "150150/30000s",
+    position: str = "end",
+    output_path: str = "",
+) -> str:
+    """Add a title clip to the timeline.
+
+    Args:
+        path: Path to .fcpxml file
+        text: Title text
+        duration: Title duration in FCPXML time
+        position: "start", "end", or clip name to insert after
+        output_path: Output file path
+    """
+    # For titles we need to generate a title element referencing Basic Title
+    mod = FCPXMLModifier(_resolve_path(path))
+
+    # Find or create a title effect resource
+    title_ref = ""
+    for el in mod.root.find("resources") or []:
+        if el.tag == "effect" and "Title" in el.get("name", ""):
+            title_ref = el.get("id", "")
+            break
+
+    if not title_ref:
+        # Add a Basic Title effect resource
+        import xml.etree.ElementTree as ET
+        resources = mod.root.find("resources")
+        if resources is None:
+            return "No resources element found"
+        effect = ET.SubElement(resources, "effect")
+        title_ref = "r_title"
+        effect.set("id", title_ref)
+        effect.set("name", "Basic Title")
+        effect.set("uid", ".../Titles.localized/Build In:Out.localized/Basic Title.localized/Basic Title.moti")
+
+    spine = mod.root.find(".//spine")
+    if spine is None:
+        return "No spine found in timeline"
+
+    import xml.etree.ElementTree as ET
+    title_el = ET.Element("title")
+    title_el.set("ref", title_ref)
+    title_el.set("name", text)
+    title_el.set("duration", duration)
+    title_el.set("role", "Titles")
+
+    # Add text parameter
+    param = ET.SubElement(title_el, "param")
+    param.set("name", "Text")
+    param.set("key", "Text")
+    param.set("value", text)
+
+    if position == "start":
+        spine.insert(0, title_el)
+    elif position == "end":
+        spine.append(title_el)
+    else:
+        clip_el = mod._find_clip_by_name(position)
+        if clip_el:
+            parent = mod._find_parent(clip_el)
+            if parent is not None:
+                children = list(parent)
+                idx = children.index(clip_el)
+                parent.insert(idx + 1, title_el)
+
+    # Recalculate offsets
+    mod._recalculate_offsets(spine)
+
+    out = mod.save(output_path if output_path else None)
+    return f"Title '{text}' added. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_add_audio(
+    path: str,
+    audio_src: str,
+    name: str = "",
+    duration: str = "",
+    position: str = "end",
+    output_path: str = "",
+) -> str:
+    """Add an audio clip to the timeline.
+
+    Args:
+        path: Path to .fcpxml file
+        audio_src: Path to audio file
+        name: Clip name (defaults to filename)
+        duration: Duration in FCPXML time (defaults to asset duration)
+        position: "start", "end", or clip name to insert after
+        output_path: Output file path
+    """
+    import xml.etree.ElementTree as ET
+
+    mod = FCPXMLModifier(_resolve_path(path))
+    audio_path = Path(audio_src).resolve()
+
+    if not name:
+        name = audio_path.stem
+
+    # Add asset resource
+    resources = mod.root.find("resources")
+    asset_id = f"r_audio_{name.replace(' ', '_')}"
+    asset = ET.SubElement(resources, "asset")
+    asset.set("id", asset_id)
+    asset.set("name", name)
+    asset.set("src", f"file://{audio_path}")
+    asset.set("hasVideo", "0")
+    asset.set("hasAudio", "1")
+    if duration:
+        asset.set("duration", duration)
+
+    spine = mod.root.find(".//spine")
+    if spine is None:
+        return "No spine found"
+
+    clip = ET.Element("asset-clip")
+    clip.set("ref", asset_id)
+    clip.set("name", name)
+    clip.set("start", "0s")
+    clip.set("duration", duration or "0s")
+    clip.set("role", "Music")
+
+    if position == "start":
+        spine.insert(0, clip)
+    elif position == "end":
+        spine.append(clip)
+
+    mod._recalculate_offsets(spine)
+    out = mod.save(output_path if output_path else None)
+    return f"Audio '{name}' added. Saved to: {out}"
+
+
+# ============================================================================
+# Category 4: FCPXML Generation (8 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcpxml_create_project(
+    name: str = "Untitled Project",
+    format_name: str = "FFVideoFormat1080p2997",
+    width: int = 1920,
+    height: int = 1080,
+    frame_duration: str = "1001/30000s",
+    event_name: str = "Default Event",
+    output_path: str = "",
+) -> str:
+    """Create a new empty FCPXML project file.
+
+    Args:
+        name: Project name
+        format_name: Video format (e.g., FFVideoFormat1080p2997, FFVideoFormat4Kp24)
+        width: Frame width
+        height: Frame height
+        frame_duration: Frame duration in FCPXML time
+        event_name: Event name
+        output_path: Where to save (default: ~/Movies/<name>.fcpxml)
+    """
+    gen = FCPXMLGenerator()
+    fmt_ref = gen.add_format(name=format_name, width=width, height=height,
+                              frame_duration=frame_duration)
+    gen.create_project(name=name, format_ref=fmt_ref, event_name=event_name)
+
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{name}.fcpxml")
+    out = gen.save(output_path)
+    return f"Project created: {out}"
+
+
+@mcp.tool()
+def fcpxml_create_timeline(
+    clips_json: str,
+    project_name: str = "Generated Timeline",
+    format_name: str = "FFVideoFormat1080p2997",
+    event_name: str = "Generated",
+    output_path: str = "",
+) -> str:
+    """Build a timeline from a list of clip definitions.
+
+    Args:
+        clips_json: JSON array of clips, each: {"src": "/path/to/file.mov", "name"?: str, "duration": "FCPXML_time", "start"?: str, "role"?: str}
+        project_name: Project name
+        format_name: Video format name
+        event_name: Event name
+        output_path: Where to save
+    """
+    clips = json.loads(clips_json)
+    gen = FCPXMLGenerator()
+    gen.build_timeline_from_clips(clips, project_name=project_name,
+                                   format_name=format_name, event_name=event_name)
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
+    out = gen.save(output_path)
+    return f"Timeline created with {len(clips)} clips: {out}"
+
+
+@mcp.tool()
+def fcpxml_auto_rough_cut(
+    clips_json: str,
+    target_duration: str = "",
+    max_clip_duration: str = "150150/30000s",
+    transition_duration: str = "",
+    project_name: str = "Rough Cut",
+    output_path: str = "",
+) -> str:
+    """Auto-assemble clips into a rough cut timeline.
+
+    Args:
+        clips_json: JSON array of clips: [{"src": str, "name"?: str, "duration": str}, ...]
+        target_duration: Target total duration (optional — uses all clips if empty)
+        max_clip_duration: Maximum clip duration (trims longer clips)
+        transition_duration: If set, adds transitions between clips
+        project_name: Project name
+        output_path: Where to save
+    """
+    clips = json.loads(clips_json)
+    gen = FCPXMLGenerator()
+    fmt_ref = gen.add_format()
+
+    max_dur = RationalTime.from_fcpxml(max_clip_duration) if max_clip_duration else None
+    target = RationalTime.from_fcpxml(target_duration) if target_duration else None
+
+    trans_ref = ""
+    if transition_duration:
+        trans_ref = gen.add_effect("Cross Dissolve")
+
+    # Register assets
+    asset_refs = {}
+    for clip_def in clips:
+        src = clip_def["src"]
+        if src not in asset_refs:
+            asset_refs[src] = gen.add_asset(src=src, name=clip_def.get("name"),
+                                              duration=clip_def.get("duration", "0s"),
+                                              format_ref=fmt_ref)
+
+    spine = gen.create_project(name=project_name, format_ref=fmt_ref,
+                                event_name="Rough Cut")
+
+    running_total = RationalTime.zero()
+    for clip_def in clips:
+        clip_dur = RationalTime.from_fcpxml(clip_def["duration"])
+        if max_dur and clip_dur > max_dur:
+            clip_dur = max_dur
+
+        if target and running_total + clip_dur > target:
+            remaining = target - running_total
+            if remaining.is_zero or remaining.numerator < 0:
+                break
+            clip_dur = remaining
+
+        gen.add_clip_to_spine(spine, asset_refs[clip_def["src"]],
+                               name=clip_def.get("name", ""),
+                               duration=clip_dur.to_fcpxml(),
+                               role=clip_def.get("role", ""))
+
+        if transition_duration and running_total.numerator > 0:
+            gen.add_transition(spine, duration=transition_duration,
+                                effect_ref=trans_ref)
+
+        running_total = running_total + clip_dur
+
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
+    out = gen.save(output_path)
+    return f"Rough cut created ({running_total.to_seconds():.1f}s): {out}"
+
+
+@mcp.tool()
+def fcpxml_generate_montage(
+    clips_json: str,
+    clip_duration: str = "90090/30000s",
+    transition_duration: str = "30030/30000s",
+    project_name: str = "Montage",
+    output_path: str = "",
+) -> str:
+    """Generate a montage/highlight reel with uniform clip durations and transitions.
+
+    Args:
+        clips_json: JSON array of clips: [{"src": str, "name"?: str, "duration": str}, ...]
+        clip_duration: Duration for each clip in the montage
+        transition_duration: Transition duration between clips
+        project_name: Project name
+        output_path: Where to save
+    """
+    clips = json.loads(clips_json)
+    gen = FCPXMLGenerator()
+    fmt_ref = gen.add_format()
+    trans_ref = gen.add_effect("Cross Dissolve")
+
+    asset_refs = {}
+    for clip_def in clips:
+        src = clip_def["src"]
+        if src not in asset_refs:
+            asset_refs[src] = gen.add_asset(src=src, name=clip_def.get("name"),
+                                              duration=clip_def.get("duration", "0s"),
+                                              format_ref=fmt_ref)
+
+    spine = gen.create_project(name=project_name, format_ref=fmt_ref,
+                                event_name="Montage")
+
+    for i, clip_def in enumerate(clips):
+        gen.add_clip_to_spine(spine, asset_refs[clip_def["src"]],
+                               name=clip_def.get("name", f"Shot {i+1}"),
+                               duration=clip_duration)
+        if i < len(clips) - 1:
+            gen.add_transition(spine, duration=transition_duration,
+                                effect_ref=trans_ref)
+
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
+    out = gen.save(output_path)
+    return f"Montage created ({len(clips)} shots): {out}"
+
+
+@mcp.tool()
+def fcpxml_import_srt(
+    path: str,
+    srt_path: str,
+    output_path: str = "",
+) -> str:
+    """Convert SRT subtitles to title clips and add to timeline.
+
+    Args:
+        path: Path to .fcpxml file to add subtitles to
+        srt_path: Path to .srt subtitle file
+        output_path: Output file path
+    """
+    import re
+
+    srt_file = Path(srt_path)
+    if not srt_file.exists():
+        return f"SRT file not found: {srt_path}"
+
+    content = srt_file.read_text(encoding="utf-8")
+
+    # Parse SRT
+    pattern = r"(\d+)\n(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})\n((?:.*(?:\n|$))*?)(?:\n|$)"
+    subtitles = []
+    for match in re.finditer(pattern, content):
+        start_h, start_m, start_s, start_ms = int(match.group(2)), int(match.group(3)), int(match.group(4)), int(match.group(5))
+        end_h, end_m, end_s, end_ms = int(match.group(6)), int(match.group(7)), int(match.group(8)), int(match.group(9))
+
+        start_total = start_h * 3600 + start_m * 60 + start_s + start_ms / 1000
+        end_total = end_h * 3600 + end_m * 60 + end_s + end_ms / 1000
+        text = match.group(10).strip()
+
+        subtitles.append({
+            "start": RationalTime.from_seconds(start_total, 30000),
+            "duration": RationalTime.from_seconds(end_total - start_total, 30000),
+            "text": text,
+        })
+
+    if not subtitles:
+        return "No subtitles found in SRT file"
+
+    mod = FCPXMLModifier(_resolve_path(path))
+    import xml.etree.ElementTree as ET
+
+    # Find or create title effect
+    title_ref = ""
+    for el in mod.root.find("resources") or []:
+        if el.tag == "effect" and "Title" in el.get("name", ""):
+            title_ref = el.get("id", "")
+            break
+    if not title_ref:
+        resources = mod.root.find("resources")
+        effect = ET.SubElement(resources, "effect")
+        title_ref = "r_subtitle"
+        effect.set("id", title_ref)
+        effect.set("name", "Basic Title")
+
+    # Add subtitle clips as connected clips to the first spine clip
+    spine = mod.root.find(".//spine")
+    if spine is None:
+        return "No spine found"
+
+    first_clip = None
+    for child in spine:
+        if child.tag not in ("transition",):
+            first_clip = child
+            break
+
+    if first_clip is None:
+        return "No clips in spine"
+
+    for sub in subtitles:
+        title_el = ET.SubElement(first_clip, "title")
+        title_el.set("ref", title_ref)
+        title_el.set("name", sub["text"][:30])
+        title_el.set("offset", sub["start"].to_fcpxml())
+        title_el.set("duration", sub["duration"].to_fcpxml())
+        title_el.set("lane", "1")
+        title_el.set("role", "Titles.Subtitle")
+
+        param = ET.SubElement(title_el, "param")
+        param.set("name", "Text")
+        param.set("key", "Text")
+        param.set("value", sub["text"])
+
+    out = mod.save(output_path if output_path else None)
+    return f"{len(subtitles)} subtitles added. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_import_edl(
+    edl_path: str,
+    media_dir: str = "",
+    project_name: str = "EDL Import",
+    output_path: str = "",
+) -> str:
+    """Convert an EDL (Edit Decision List) to FCPXML.
+
+    Args:
+        edl_path: Path to .edl file
+        media_dir: Directory containing media files (for resolving reel names)
+        project_name: Project name
+        output_path: Where to save
+    """
+    edl_file = Path(edl_path)
+    if not edl_file.exists():
+        return f"EDL file not found: {edl_path}"
+
+    lines = edl_file.read_text().splitlines()
+    gen = FCPXMLGenerator()
+    fmt_ref = gen.add_format()
+    spine = gen.create_project(name=project_name, format_ref=fmt_ref, event_name="EDL Import")
+
+    clip_count = 0
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 7 and parts[0].isdigit():
+            reel = parts[1]
+            # Try to find media file
+            src = ""
+            if media_dir:
+                media_path = Path(media_dir)
+                for ext in (".mov", ".mp4", ".mxf", ".avi"):
+                    candidate = media_path / f"{reel}{ext}"
+                    if candidate.exists():
+                        src = str(candidate)
+                        break
+            if not src:
+                src = f"/placeholder/{reel}.mov"
+
+            # Parse timecodes (simplified — EDL TC format)
+            src_in = parts[4] if len(parts) > 4 else "00:00:00:00"
+            src_out = parts[5] if len(parts) > 5 else "00:00:01:00"
+
+            # Approximate duration from timecodes
+            duration = "90090/30000s"  # default 3 seconds
+
+            asset_ref = gen.add_asset(src=src, name=reel, duration=duration, format_ref=fmt_ref)
+            gen.add_clip_to_spine(spine, asset_ref, name=f"{reel}_edit{parts[0]}",
+                                   duration=duration)
+            clip_count += 1
+
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
+    out = gen.save(output_path)
+    return f"EDL imported ({clip_count} clips): {out}"
+
+
+@mcp.tool()
+def fcpxml_reformat(
+    path: str,
+    target_width: int = 1080,
+    target_height: int = 1920,
+    target_format_name: str = "FFVideoFormat1080x1920p2997",
+    output_path: str = "",
+) -> str:
+    """Reformat a timeline for a different aspect ratio (e.g., 16:9 → 9:16 for vertical).
+
+    Args:
+        path: Path to .fcpxml file
+        target_width: Target width
+        target_height: Target height
+        target_format_name: Target format name
+        output_path: Output file path
+    """
+
+    mod = FCPXMLModifier(_resolve_path(path))
+
+    # Update format
+    for fmt_el in mod.root.iter("format"):
+        fmt_el.set("width", str(target_width))
+        fmt_el.set("height", str(target_height))
+        fmt_el.set("name", target_format_name)
+        break
+
+    out = mod.save(output_path if output_path else None)
+    return f"Reformatted to {target_width}x{target_height}. Saved to: {out}"
+
+
+# ============================================================================
+# Category 8: Batch Operations (6 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcpxml_fix_flash_frames(
+    path: str,
+    min_frames: int = 3,
+    frame_duration: str = "1001/30000s",
+    output_path: str = "",
+) -> str:
+    """Auto-fix flash frames by extending very short clips to minimum duration.
+
+    Args:
+        path: Path to .fcpxml file
+        min_frames: Minimum frame count (clips shorter than this get extended)
+        frame_duration: Frame duration for calculating frame count
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = mod.fix_flash_frames(min_frames, frame_duration)
+    out = mod.save(output_path if output_path else None)
+    return f"{count} flash frames fixed. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_fill_gaps(
+    path: str,
+    fill_asset_ref: str,
+    fill_name: str = "Fill",
+    output_path: str = "",
+) -> str:
+    """Replace all gaps in the timeline with clips from a specified asset.
+
+    Args:
+        path: Path to .fcpxml file
+        fill_asset_ref: Asset resource ID to use as fill (e.g., "r3")
+        fill_name: Name for the fill clips
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = mod.fill_gaps(fill_asset_ref, fill_name)
+    out = mod.save(output_path if output_path else None)
+    return f"{count} gaps filled. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_remove_silence(
+    path: str,
+    silence_threshold_seconds: float = 2.0,
+    output_path: str = "",
+) -> str:
+    """Remove gaps longer than the threshold from the timeline.
+
+    Args:
+        path: Path to .fcpxml file
+        silence_threshold_seconds: Minimum gap duration to remove (seconds)
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = 0
+    for spine_el in mod.root.iter("spine"):
+        for gap_el in list(spine_el.findall("gap")):
+            dur = RationalTime.from_fcpxml(gap_el.get("duration", "0s"))
+            if dur.to_seconds() >= silence_threshold_seconds:
+                spine_el.remove(gap_el)
+                count += 1
+        if count > 0:
+            mod._recalculate_offsets(spine_el)
+    out = mod.save(output_path if output_path else None)
+    return f"{count} gaps removed. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_batch_rename_clips(
+    path: str, pattern: str, replacement: str, output_path: str = "",
+) -> str:
+    """Rename clips matching a pattern (substring replacement).
+
+    Args:
+        path: Path to .fcpxml file
+        pattern: Text to find in clip names
+        replacement: Text to replace with
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = mod.batch_rename_clips(pattern, replacement)
+    out = mod.save(output_path if output_path else None)
+    return f"{count} clips renamed. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_batch_assign_roles(
+    path: str, rules_json: str, output_path: str = "",
+) -> str:
+    """Assign roles to clips based on name matching rules.
+
+    Args:
+        path: Path to .fcpxml file
+        rules_json: JSON array of rules: [{"match": "interview", "role": "Dialogue"}, ...]
+        output_path: Output file path
+    """
+    rules = json.loads(rules_json)
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = mod.batch_assign_roles(rules)
+    out = mod.save(output_path if output_path else None)
+    return f"{count} roles assigned. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_batch_apply_transition(
+    path: str,
+    duration: str = "30030/30000s",
+    name: str = "Cross Dissolve",
+    output_path: str = "",
+) -> str:
+    """Add transitions between all adjacent clips in the timeline.
+
+    Args:
+        path: Path to .fcpxml file
+        duration: Transition duration
+        name: Transition name
+        output_path: Output file path
+    """
+    mod = FCPXMLModifier(_resolve_path(path))
+    count = mod.batch_apply_transition(duration, name)
+    out = mod.save(output_path if output_path else None)
+    return f"{count} transitions added. Saved to: {out}"
+
+
+# ============================================================================
+# Category 9: QC & Validation (6 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcpxml_qc_report(path: str) -> str:
+    """Generate a comprehensive quality check report for the timeline.
+
+    Checks: validation, gaps, flash frames, duplicates, pacing.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+
+    lines = ["# QC Report\n"]
+
+    # Validation
+    validation = _validator.validate_document(doc)
+    lines.append("## Validation")
+    lines.append(validation.summary())
+    lines.append("")
+
+    # Stats
+    stats_list = analyze_timeline_stats(doc)
+    for stats in stats_list:
+        lines.append(f"## Stats: {stats.project_name}")
+        lines.append(f"Duration: {stats.total_duration_timecode} ({stats.total_duration_seconds:.1f}s)")
+        lines.append(f"Clips: {stats.non_gap_clip_count} (+{stats.gap_count} gaps)")
+        lines.append(f"Resolution: {stats.resolution} @ {stats.fps:.2f}fps")
+        lines.append(f"Avg clip: {stats.average_clip_duration_seconds:.2f}s")
+        lines.append(f"Markers: {stats.marker_count}, Keywords: {stats.keyword_count}")
+        lines.append(f"Roles: {', '.join(stats.roles_used)}")
+        lines.append("")
+
+    # Gaps
+    gaps = detect_gaps(doc)
+    if gaps:
+        lines.append(f"## Gaps ({len(gaps)})")
+        for g in gaps:
+            lines.append(f"- {g.offset_timecode}: {g.duration_seconds:.3f}s (between '{g.before_clip}' and '{g.after_clip}')")
+        lines.append("")
+
+    # Flash frames
+    flashes = detect_flash_frames(doc)
+    if flashes:
+        lines.append(f"## Flash Frames ({len(flashes)})")
+        for f in flashes:
+            lines.append(f"- '{f.clip_name}' at {f.offset_timecode}: {f.frame_count} frames ({f.duration_seconds:.3f}s)")
+        lines.append("")
+
+    # Duplicates
+    dupes = detect_duplicates(doc)
+    if dupes:
+        lines.append(f"## Duplicate Sources ({len(dupes)})")
+        for d in dupes:
+            lines.append(f"- '{d.asset_name}' used {len(d.occurrences)}x")
+        lines.append("")
+
+    # Pacing
+    pacing_list = analyze_pacing(doc)
+    for pacing in pacing_list:
+        lines.append("## Pacing")
+        lines.append(f"Avg shot: {pacing.average_shot_length:.2f}s, Median: {pacing.median_shot_length:.2f}s")
+        lines.append(f"Shortest: {pacing.shortest_shot:.3f}s, Longest: {pacing.longest_shot:.2f}s")
+        lines.append(f"Distribution: {json.dumps(pacing.histogram)}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def fcpxml_check_media_links(path: str) -> str:
+    """Verify all referenced media files exist on disk.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    result = _validator.check_media_links(doc)
+    if not result.issues:
+        return "All media files found."
+    return result.summary()
+
+
+@mcp.tool()
+def fcpxml_check_frame_rates(path: str) -> str:
+    """Detect mixed frame rate issues in the timeline.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    frame_rates = set()
+    for fmt in doc.formats.values():
+        if fmt.frame_duration.numerator > 0:
+            frame_rates.add(fmt.fps)
+
+    if len(frame_rates) <= 1:
+        return f"Consistent frame rate: {frame_rates.pop() if frame_rates else 'unknown'}fps"
+
+    return f"MIXED FRAME RATES DETECTED: {', '.join(f'{r:.2f}fps' for r in sorted(frame_rates))}"
+
+
+@mcp.tool()
+def fcpxml_check_audio_levels(path: str) -> str:
+    """Flag clips with potential audio issues (volume adjustments, missing audio).
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    issues = []
+
+    for clip in doc.all_clips:
+        if clip.is_gap:
+            continue
+
+        # Check if asset has audio
+        if clip.ref and clip.ref in doc.assets:
+            asset = doc.assets[clip.ref]
+            if not asset.has_audio and clip.role in ("Dialogue", "Music", ""):
+                issues.append(f"'{clip.name}': no audio in source (role: {clip.role or 'none'})")
+
+        # Check volume adjustments
+        if clip.volume:
+            amt = clip.volume.amount
+            if "dB" in amt:
+                try:
+                    db_val = float(amt.replace("dB", ""))
+                    if db_val > 6:
+                        issues.append(f"'{clip.name}': very high volume (+{db_val}dB)")
+                    elif db_val < -20:
+                        issues.append(f"'{clip.name}': very low volume ({db_val}dB)")
+                except ValueError:
+                    pass
+
+    if not issues:
+        return "No audio issues detected."
+    return "Audio issues:\n" + "\n".join(f"- {i}" for i in issues)
+
+
+@mcp.tool()
+def fcpxml_check_safe_zones(path: str) -> str:
+    """Check for clips with transforms that might push content outside safe zones.
+
+    Args:
+        path: Path to .fcpxml file
+    """
+    doc = _parse_doc(path)
+    issues = []
+
+    for clip in doc.all_clips:
+        if clip.transform:
+            t = clip.transform
+            if abs(t.position_x) > 800 or abs(t.position_y) > 450:
+                issues.append(f"'{clip.name}': position ({t.position_x}, {t.position_y}) may be outside safe zone")
+            if t.scale > 2.0 or t.scale < 0.3:
+                issues.append(f"'{clip.name}': scale {t.scale}x may cause quality issues")
+
+    if not issues:
+        return "All clips within safe zones."
+    return "Safe zone concerns:\n" + "\n".join(f"- {i}" for i in issues)
+
+
+@mcp.tool()
+def fcpxml_check_duration(path: str, target_seconds: float) -> str:
+    """Verify the timeline fits a target duration.
+
+    Args:
+        path: Path to .fcpxml file
+        target_seconds: Target duration in seconds
+    """
+    doc = _parse_doc(path)
+    for project in doc.all_projects:
+        if not project.sequence:
+            continue
+        actual = project.sequence.duration.to_seconds()
+        if actual == 0 and project.sequence.spine:
+            actual = project.sequence.spine.duration.to_seconds()
+
+        diff = actual - target_seconds
+        status = "ON TARGET" if abs(diff) < 1 else ("OVER" if diff > 0 else "UNDER")
+        return (f"Project '{project.name}': {actual:.1f}s / {target_seconds:.1f}s target "
+                f"({status}, diff: {diff:+.1f}s)")
+
+    return "No projects found"
+
+
+# ============================================================================
+# Category 10: Templates & Presets (6 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcp_list_motion_templates() -> str:
+    """List installed Motion templates (titles, transitions, generators, effects)."""
+    from .utils.paths import motion_templates_dir
+
+    templates_dir = motion_templates_dir()
+    if not templates_dir.exists():
+        return "Motion Templates directory not found"
+
+    categories = {}
+    for category_dir in templates_dir.iterdir():
+        if not category_dir.is_dir():
+            continue
+        cat_name = category_dir.stem.replace(".localized", "")
+        templates = []
+        for template_dir in category_dir.rglob("*.motn"):
+            templates.append(template_dir.stem)
+        if templates:
+            categories[cat_name] = templates
+
+    return json.dumps(categories, indent=2)
+
+
+@mcp.tool()
+def fcp_list_share_destinations() -> str:
+    """List configured FCP share destinations."""
+    from .utils.paths import fcp_destinations_dir
+
+    dest_dir = fcp_destinations_dir()
+    if not dest_dir.exists():
+        return "No share destinations directory found"
+
+    destinations = []
+    for f in dest_dir.glob("*.fcpdestination"):
+        destinations.append(f.stem)
+
+    return json.dumps({"destinations": destinations}, indent=2)
+
+
+@mcp.tool()
+def fcp_discover_effects() -> str:
+    """List available FCP effects and transitions by scanning known locations."""
+    # Check Motion templates for effects
+    from .utils.paths import motion_templates_dir
+
+    templates_dir = motion_templates_dir()
+    result = {"built_in_transitions": [], "built_in_titles": [], "custom_effects": []}
+
+    # Built-in transitions are well-known
+    result["built_in_transitions"] = [
+        "Cross Dissolve", "Fade to Color", "Fade to Black",
+        "Wipe", "Band Wipe", "Center Wipe", "Checker Wipe", "Clock Wipe",
+        "Edge Wipe", "Gradient Wipe", "Inset Wipe", "Jaws Wipe",
+        "Barn Door", "Cube", "Doorway", "Mosaic", "Page Curl", "Puzzle", "Ripple",
+        "Spin", "Swap", "Swing", "Zoom & Pan",
+    ]
+
+    result["built_in_titles"] = [
+        "Basic Title", "Basic Lower Third", "Custom Lower Third",
+        "Bumper/Opener", "Centered Title", "Credits", "Focus",
+        "Gradient", "Line Title", "Scrolling Credits",
+    ]
+
+    if templates_dir.exists():
+        for effect_dir in (templates_dir / "Effects.localized").rglob("*.moef") if (templates_dir / "Effects.localized").exists() else []:
+            result["custom_effects"].append(effect_dir.stem)
+
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def fcpxml_list_templates(templates_dir: str = "") -> str:
+    """List available FCPXML template files.
+
+    Args:
+        templates_dir: Directory to search (default: FCP_PROJECTS_DIR)
+    """
+    search_dir = Path(templates_dir) if templates_dir else PROJECTS_DIR
+    templates = []
+    for f in search_dir.rglob("*.fcpxml"):
+        if "template" in f.stem.lower() or "preset" in f.stem.lower():
+            templates.append(str(f))
+    return json.dumps({"templates": templates}, indent=2)
+
+
+@mcp.tool()
+def fcpxml_apply_template(
+    template_path: str,
+    clips_json: str,
+    project_name: str = "From Template",
+    output_path: str = "",
+) -> str:
+    """Apply an FCPXML template to a set of clips.
+
+    Replaces placeholder clips in the template with provided clips.
+
+    Args:
+        template_path: Path to template .fcpxml file
+        clips_json: JSON array of clips to insert
+        project_name: New project name
+        output_path: Where to save
+    """
+    clips = json.loads(clips_json)
+    mod = FCPXMLModifier(_resolve_path(template_path))
+
+    # Update project name
+    for project_el in mod.root.iter("project"):
+        project_el.set("name", project_name)
+        break
+
+    out = mod.save(output_path if output_path else None)
+    return f"Template applied. Saved to: {out}"
+
+
+@mcp.tool()
+def fcpxml_save_template(
+    path: str,
+    template_name: str,
+    output_dir: str = "",
+) -> str:
+    """Save the current FCPXML structure as a reusable template.
+
+    Args:
+        path: Path to .fcpxml file to use as template
+        template_name: Name for the template
+        output_dir: Directory to save template (default: FCP_PROJECTS_DIR)
+    """
+    import shutil
+
+    src = _resolve_path(path)
+    dest_dir = Path(output_dir) if output_dir else PROJECTS_DIR
+    dest = dest_dir / f"template_{template_name}.fcpxml"
+    shutil.copy2(src, dest)
+    return f"Template saved: {dest}"
+
+
+# ============================================================================
+# Category 1: Library Inspection — live FCP (6 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcp_is_running() -> str:
+    """Check if Final Cut Pro is currently running."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", 'tell application "System Events" to (name of processes) contains "Final Cut Pro"'],
+            capture_output=True, text=True, timeout=5,
+        )
+        is_running = "true" in result.stdout.lower()
+        return json.dumps({"running": is_running})
+    except Exception as e:
+        return json.dumps({"running": False, "error": str(e)})
+
+
+@mcp.tool()
+def fcp_get_libraries() -> str:
+    """Get all open libraries in Final Cut Pro (requires FCP to be running)."""
+    script = """
+    var fcp = Application("Final Cut Pro");
+    var libs = fcp.libraries();
+    var result = [];
+    for (var i = 0; i < libs.length; i++) {
+        result.push({
+            name: libs[i].name(),
+            id: libs[i].id(),
+            file: libs[i].file().toString()
+        });
+    }
+    JSON.stringify(result);
+    """
+    return _run_jxa(script)
+
+
+@mcp.tool()
+def fcp_get_events(library_name: str = "") -> str:
+    """Get events in a library (or all libraries if name not specified).
+
+    Args:
+        library_name: Library name to filter (optional)
+    """
+    filter_line = f'if ("{library_name}" && libs[i].name() !== "{library_name}") continue;' if library_name else ""
+    script = f"""
+    var fcp = Application("Final Cut Pro");
+    var libs = fcp.libraries();
+    var result = [];
+    for (var i = 0; i < libs.length; i++) {{
+        {filter_line}
+        var events = libs[i].events();
+        for (var j = 0; j < events.length; j++) {{
+            result.push({{
+                library: libs[i].name(),
+                name: events[j].name(),
+                id: events[j].id()
+            }});
+        }}
+    }}
+    JSON.stringify(result);
+    """
+    return _run_jxa(script)
+
+
+@mcp.tool()
+def fcp_get_projects(event_name: str = "") -> str:
+    """Get projects in an event (or all events if name not specified).
+
+    Args:
+        event_name: Event name to filter (optional)
+    """
+    filter_line = f'if ("{event_name}" && events[j].name() !== "{event_name}") continue;' if event_name else ""
+    script = f"""
+    var fcp = Application("Final Cut Pro");
+    var libs = fcp.libraries();
+    var result = [];
+    for (var i = 0; i < libs.length; i++) {{
+        var events = libs[i].events();
+        for (var j = 0; j < events.length; j++) {{
+            {filter_line}
+            var projects = events[j].projects();
+            for (var k = 0; k < projects.length; k++) {{
+                var seq = projects[k].sequence();
+                result.push({{
+                    library: libs[i].name(),
+                    event: events[j].name(),
+                    name: projects[k].name(),
+                    id: projects[k].id(),
+                    duration: seq ? seq.duration().toString() : "unknown"
+                }});
+            }}
+        }}
+    }}
+    JSON.stringify(result);
+    """
+    return _run_jxa(script)
+
+
+@mcp.tool()
+def fcp_get_timeline_info() -> str:
+    """Get info about the current/first timeline in FCP."""
+    script = """
+    var fcp = Application("Final Cut Pro");
+    var libs = fcp.libraries();
+    if (libs.length === 0) { JSON.stringify({error: "No libraries open"}); }
+    else {
+        var events = libs[0].events();
+        if (events.length === 0) { JSON.stringify({error: "No events"}); }
+        else {
+            var projects = events[0].projects();
+            if (projects.length === 0) { JSON.stringify({error: "No projects"}); }
+            else {
+                var p = projects[0];
+                var seq = p.sequence();
+                JSON.stringify({
+                    library: libs[0].name(),
+                    event: events[0].name(),
+                    project: p.name(),
+                    duration: seq ? {
+                        value: seq.duration().value,
+                        timescale: seq.duration().timescale
+                    } : null,
+                    frameDuration: seq ? {
+                        value: seq.frameDuration().value,
+                        timescale: seq.frameDuration().timescale
+                    } : null,
+                    tcFormat: seq ? seq.timecodeFormat() : null
+                });
+            }
+        }
+    }
+    """
+    return _run_jxa(script)
+
+
+@mcp.tool()
+def fcp_get_app_state() -> str:
+    """Get FCP application state — version, frontmost status."""
+    script = """
+    var fcp = Application("Final Cut Pro");
+    JSON.stringify({
+        name: fcp.name(),
+        version: fcp.version(),
+        frontmost: fcp.frontmost(),
+        libraryCount: fcp.libraries().length
+    });
+    """
+    return _run_jxa(script)
+
+
+# ============================================================================
+# Category 6: FCP Live Control (10 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcp_open_library(library_path: str) -> str:
+    """Open a FCP library file.
+
+    Args:
+        library_path: Path to .fcpbundle file
+    """
+    path = Path(library_path).resolve()
+    if not path.exists():
+        return f"Library not found: {path}"
+    try:
+        subprocess.run(["open", str(path)], check=True, timeout=10)
+        return f"Opening library: {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def fcp_import_xml(fcpxml_path: str) -> str:
+    """Import an FCPXML file into Final Cut Pro.
+
+    Args:
+        fcpxml_path: Path to .fcpxml file
+    """
+    path = Path(fcpxml_path).resolve()
+    if not path.exists():
+        return f"FCPXML file not found: {path}"
+    try:
+        subprocess.run(["open", "-a", "Final Cut Pro", str(path)], check=True, timeout=10)
+        return f"Importing FCPXML: {path}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def fcp_export_xml() -> str:
+    """Trigger XML export in FCP via menu automation (requires Accessibility permissions)."""
+    return _run_applescript("""
+        tell application "Final Cut Pro" to activate
+        delay 0.5
+        tell application "System Events"
+            tell process "Final Cut Pro"
+                click menu item "Export XML..." of menu "File" of menu bar 1
+            end tell
+        end tell
+        return "Export XML dialog opened"
+    """)
+
+
+@mcp.tool()
+def fcp_playback(action: str = "toggle") -> str:
+    """Control FCP playback.
+
+    Args:
+        action: "play", "pause", "stop", or "toggle" (space bar)
+    """
+    key_map = {
+        "toggle": "space",
+        "play": "l",
+        "stop": "k",
+        "pause": "k",
+    }
+    key = key_map.get(action, "space")
+    return _run_applescript(f"""
+        tell application "Final Cut Pro" to activate
+        delay 0.3
+        tell application "System Events"
+            keystroke "{key}"
+        end tell
+        return "Playback: {action}"
+    """)
+
+
+@mcp.tool()
+def fcp_navigate(timecode: str = "") -> str:
+    """Navigate to a specific timecode in FCP.
+
+    Args:
+        timecode: Timecode to navigate to (e.g., "00:01:30:00"). Opens timecode entry if provided.
+    """
+    if not timecode:
+        return "No timecode provided"
+
+    # Control+P opens the timecode entry field in FCP
+    clean_tc = timecode.replace(":", "").replace(";", "")
+    return _run_applescript(f"""
+        tell application "Final Cut Pro" to activate
+        delay 0.3
+        tell application "System Events"
+            tell process "Final Cut Pro"
+                key code 35 using control down
+                delay 0.3
+                keystroke "{clean_tc}"
+                delay 0.1
+                keystroke return
+            end tell
+        end tell
+        return "Navigated to {timecode}"
+    """)
+
+
+@mcp.tool()
+def fcp_select_tool(tool: str = "select") -> str:
+    """Switch FCP editing tool.
+
+    Args:
+        tool: "select" (A), "trim" (T), "position" (P), "range" (R), "blade" (B), "zoom" (Z), "hand" (H)
+    """
+    tool_keys = {
+        "select": "a", "trim": "t", "position": "p",
+        "range": "r", "blade": "b", "zoom": "z", "hand": "h",
+    }
+    key = tool_keys.get(tool, "a")
+    return _run_applescript(f"""
+        tell application "Final Cut Pro" to activate
+        delay 0.2
+        tell application "System Events"
+            keystroke "{key}"
+        end tell
+        return "Tool: {tool}"
+    """)
+
+
+@mcp.tool()
+def fcp_undo() -> str:
+    """Undo the last action in FCP."""
+    return _run_applescript("""
+        tell application "Final Cut Pro" to activate
+        delay 0.2
+        tell application "System Events"
+            keystroke "z" using command down
+        end tell
+        return "Undo performed"
+    """)
+
+
+@mcp.tool()
+def fcp_redo() -> str:
+    """Redo the last undone action in FCP."""
+    return _run_applescript("""
+        tell application "Final Cut Pro" to activate
+        delay 0.2
+        tell application "System Events"
+            keystroke "z" using {command down, shift down}
+        end tell
+        return "Redo performed"
+    """)
+
+
+@mcp.tool()
+def fcp_menu_command(menu_path: str) -> str:
+    """Execute any FCP menu command by path.
+
+    Args:
+        menu_path: Menu path like "File > Export XML..." or "Edit > Select All"
+    """
+    parts = [p.strip() for p in menu_path.split(">")]
+    if len(parts) < 2:
+        return "Menu path must have at least 2 parts (e.g., 'File > Export XML...')"
+
+    menu_name = parts[0]
+    # Build nested menu item click
+    if len(parts) == 2:
+        click_cmd = f'click menu item "{parts[1]}" of menu "{menu_name}" of menu bar 1'
+    elif len(parts) == 3:
+        click_cmd = f'click menu item "{parts[2]}" of menu 1 of menu item "{parts[1]}" of menu "{menu_name}" of menu bar 1'
+    else:
+        return "Menu paths deeper than 3 levels not supported"
+
+    return _run_applescript(f"""
+        tell application "Final Cut Pro" to activate
+        delay 0.5
+        tell application "System Events"
+            tell process "Final Cut Pro"
+                {click_cmd}
+            end tell
+        end tell
+        return "Executed: {menu_path}"
+    """)
+
+
+@mcp.tool()
+def fcp_keyboard_shortcut(keys: str) -> str:
+    """Send a keyboard shortcut to FCP.
+
+    Args:
+        keys: Shortcut description like "cmd+c", "cmd+shift+e", "option+w"
+    """
+    parts = keys.lower().split("+")
+    key = parts[-1]
+    modifiers = parts[:-1]
+
+    modifier_map = {
+        "cmd": "command down",
+        "command": "command down",
+        "shift": "shift down",
+        "opt": "option down",
+        "option": "option down",
+        "alt": "option down",
+        "ctrl": "control down",
+        "control": "control down",
+    }
+
+    mod_list = [modifier_map[m] for m in modifiers if m in modifier_map]
+    mod_str = "{" + ", ".join(mod_list) + "}" if mod_list else ""
+    using = f" using {mod_str}" if mod_str else ""
+
+    return _run_applescript(f"""
+        tell application "Final Cut Pro" to activate
+        delay 0.2
+        tell application "System Events"
+            keystroke "{key}"{using}
+        end tell
+        return "Shortcut sent: {keys}"
+    """)
+
+
+# ============================================================================
+# Category 7: Export & Encoding (6 tools)
+# ============================================================================
+
+@mcp.tool()
+def fcp_share(destination: str = "") -> str:
+    """Trigger a share/export from FCP.
+
+    Args:
+        destination: Share destination name (opens default if empty)
+    """
+    if destination:
+        return _run_applescript(f"""
+            tell application "Final Cut Pro" to activate
+            delay 0.5
+            tell application "System Events"
+                tell process "Final Cut Pro"
+                    click menu item "{destination}" of menu 1 of menu item "Share" of menu "File" of menu bar 1
+                end tell
+            end tell
+            return "Share triggered: {destination}"
+        """)
+    else:
+        return _run_applescript("""
+            tell application "Final Cut Pro" to activate
+            delay 0.5
+            tell application "System Events"
+                tell process "Final Cut Pro"
+                    click menu item "Share" of menu "File" of menu bar 1
+                end tell
+            end tell
+            return "Share menu opened"
+        """)
+
+
+@mcp.tool()
+def compressor_encode(
+    input_path: str,
+    setting_path: str = "",
+    output_dir: str = "",
+    batch_name: str = "MCP Encode",
+) -> str:
+    """Encode a file using Compressor CLI.
+
+    Args:
+        input_path: Path to input media file
+        setting_path: Path to Compressor preset (.cmprstng)
+        output_dir: Output directory
+        batch_name: Batch name for Compressor
+    """
+    from .utils.paths import compressor_binary
+
+    comp = compressor_binary()
+    if not comp.exists():
+        return f"Compressor not found at {comp}"
+
+    cmd = [str(comp), "-batchName", batch_name, "-jobpath", str(Path(input_path).resolve())]
+    if setting_path:
+        cmd.extend(["-settingpath", str(Path(setting_path).resolve())])
+    if output_dir:
+        cmd.extend(["-locationpath", str(Path(output_dir).resolve())])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return f"Compressor encode started: {result.stdout or result.stderr}"
+    except Exception as e:
+        return f"Compressor error: {e}"
+
+
+@mcp.tool()
+def compressor_list_settings() -> str:
+    """List available Compressor encoding presets."""
+    from .utils.paths import compressor_settings_dir, compressor_binary
+
+    # Built-in settings from Compressor
+    settings_dir = compressor_settings_dir()
+    custom = []
+    if settings_dir.exists():
+        for f in settings_dir.rglob("*.cmprstng"):
+            custom.append(str(f))
+
+    # Also try listing via Compressor CLI
+    comp = compressor_binary()
+    built_in = []
+    if comp.exists():
+        try:
+            result = subprocess.run([str(comp), "-info"], capture_output=True, text=True, timeout=10)
+            built_in = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        except Exception:
+            pass
+
+    return json.dumps({"custom_presets": custom, "cli_info": built_in}, indent=2)
+
+
+@mcp.tool()
+def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
+    """Convert FCPXML to DaVinci Resolve-compatible format (FCPXML v1.9).
+
+    Args:
+        path: Path to .fcpxml file
+        output_path: Output file path
+    """
+
+    mod = FCPXMLModifier(_resolve_path(path))
+    # Downgrade version for Resolve compatibility
+    mod.root.set("version", "1.9")
+
+    # Remove FCP-specific attributes that Resolve doesn't understand
+    for el in mod.root.iter():
+        for attr in list(el.attrib.keys()):
+            if attr in ("tcFormat",):
+                # Resolve handles this differently but it's fine to keep
+                pass
+
+    if not output_path:
+        stem = Path(path).stem
+        output_path = str(_resolve_path(path).parent / f"{stem}_resolve.fcpxml")
+    out = mod.save(output_path)
+    return f"Resolve-compatible FCPXML saved: {out}"
+
+
+@mcp.tool()
+def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
+    """Convert FCPXML to FCP7 XML format (compatible with Premiere Pro and Avid).
+
+    Args:
+        path: Path to .fcpxml file
+        output_path: Output file path
+    """
+    import xml.etree.ElementTree as ET
+
+    doc = _parse_doc(path)
+
+    # Build FCP7 XMEML
+    xmeml = ET.Element("xmeml")
+    xmeml.set("version", "5")
+
+    for project in doc.all_projects:
+        proj_el = ET.SubElement(xmeml, "project")
+        name_el = ET.SubElement(proj_el, "name")
+        name_el.text = project.name
+
+        if not project.sequence or not project.sequence.spine:
+            continue
+
+        seq = project.sequence
+        seq_el = ET.SubElement(proj_el, "sequence")
+        seq_name = ET.SubElement(seq_el, "name")
+        seq_name.text = project.name
+
+        # Duration
+        dur_el = ET.SubElement(seq_el, "duration")
+        dur_el.text = str(round(seq.duration.to_seconds() * 30))  # in frames at 30fps
+
+        # Rate
+        rate_el = ET.SubElement(seq_el, "rate")
+        tb_el = ET.SubElement(rate_el, "timebase")
+        fmt = doc.formats.get(seq.format_ref)
+        tb_el.text = str(round(fmt.fps)) if fmt else "30"
+
+        # Media
+        media_el = ET.SubElement(seq_el, "media")
+        video_el = ET.SubElement(media_el, "video")
+        track_el = ET.SubElement(video_el, "track")
+
+        for clip in seq.spine.clips:
+            if clip.is_gap:
+                continue
+            clipitem = ET.SubElement(track_el, "clipitem")
+            ci_name = ET.SubElement(clipitem, "name")
+            ci_name.text = clip.name
+
+            start_el = ET.SubElement(clipitem, "start")
+            start_el.text = str(round(clip.offset.to_seconds() * 30))
+            end_el = ET.SubElement(clipitem, "end")
+            end_el.text = str(round(clip.end_offset.to_seconds() * 30))
+
+            in_el = ET.SubElement(clipitem, "in")
+            in_el.text = str(round(clip.start.to_seconds() * 30))
+            out_el = ET.SubElement(clipitem, "out")
+            out_el.text = str(round(clip.source_end.to_seconds() * 30))
+
+            # File reference
+            if clip.ref and clip.ref in doc.assets:
+                asset = doc.assets[clip.ref]
+                file_el = ET.SubElement(clipitem, "file")
+                file_el.set("id", clip.ref)
+                fname = ET.SubElement(file_el, "name")
+                fname.text = asset.name
+                pathurl = ET.SubElement(file_el, "pathurl")
+                pathurl.text = asset.src
+
+    if not output_path:
+        stem = Path(path).stem
+        output_path = str(_resolve_path(path).parent / f"{stem}_fcp7.xml")
+
+    tree = ET.ElementTree(xmeml)
+    ET.indent(xmeml, space="    ")
+    tree.write(output_path, encoding="unicode", xml_declaration=True)
+    return f"FCP7 XML saved: {output_path}"
+
+
+@mcp.tool()
+def fcpxml_export_edl(path: str, output_path: str = "") -> str:
+    """Export timeline as EDL (Edit Decision List).
+
+    Args:
+        path: Path to .fcpxml file
+        output_path: Output .edl file path
+    """
+    doc = _parse_doc(path)
+    fmt = list(doc.formats.values())[0] if doc.formats else None
+    fps = fmt.fps if fmt else 29.97
+
+    lines = ["TITLE: " + (doc.all_projects[0].name if doc.all_projects else "Untitled")]
+    lines.append(f"FCM: {'DROP FRAME' if fps in (29.97, 59.94) else 'NON-DROP FRAME'}")
+    lines.append("")
+
+    edit_num = 1
+    for project in doc.all_projects:
+        if not project.sequence or not project.sequence.spine:
+            continue
+        for clip in project.sequence.spine.non_gap_clips:
+            asset = doc.assets.get(clip.ref)
+            reel = asset.name[:8] if asset else "AX"
+
+            src_in = clip.start.to_timecode(fps)
+            src_out = clip.source_end.to_timecode(fps)
+            rec_in = clip.offset.to_timecode(fps)
+            rec_out = clip.end_offset.to_timecode(fps)
+
+            lines.append(f"{edit_num:03d}  {reel:8s} V     C        {src_in} {src_out} {rec_in} {rec_out}")
+
+            if clip.name:
+                lines.append(f"* FROM CLIP NAME: {clip.name}")
+
+            lines.append("")
+            edit_num += 1
+
+    edl_content = "\n".join(lines)
+
+    if not output_path:
+        stem = Path(path).stem
+        output_path = str(_resolve_path(path).parent / f"{stem}.edl")
+
+    Path(output_path).write_text(edl_content)
+    return f"EDL exported ({edit_num - 1} edits): {output_path}"
+
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+def _run_jxa(script: str) -> str:
+    """Run a JXA script via osascript."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return json.dumps({"error": result.stderr.strip()})
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "JXA script timed out"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _run_applescript(script: str) -> str:
+    """Run an AppleScript via osascript."""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            error = result.stderr.strip()
+            if "assistive" in error.lower():
+                return json.dumps({
+                    "error": "Accessibility permissions required",
+                    "fix": "System Settings > Privacy & Security > Accessibility > Enable for Terminal/Claude Code",
+                })
+            return json.dumps({"error": error})
+        return result.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "AppleScript timed out"})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ============================================================================
+# Category 5: Media Analysis — FFmpeg (8 tools)
+# ============================================================================
+
+@mcp.tool()
+def media_info(path: str) -> str:
+    """Get detailed media file info (codec, resolution, duration, bitrate, etc.).
+
+    Args:
+        path: Path to media file
+    """
+    from .media.ffprobe import probe_file
+    try:
+        info = probe_file(path)
+        # Simplify for readability
+        fmt = info.get("format", {})
+        streams = info.get("streams", [])
+        summary = {
+            "filename": fmt.get("filename"),
+            "duration": f"{float(fmt.get('duration', 0)):.2f}s",
+            "size_mb": f"{int(fmt.get('size', 0)) / 1048576:.1f}",
+            "bitrate_kbps": f"{int(fmt.get('bit_rate', 0)) / 1000:.0f}",
+            "format": fmt.get("format_long_name"),
+            "streams": [],
+        }
+        for s in streams:
+            stream_info = {
+                "type": s.get("codec_type"),
+                "codec": s.get("codec_name"),
+            }
+            if s.get("codec_type") == "video":
+                stream_info.update({
+                    "width": s.get("width"),
+                    "height": s.get("height"),
+                    "fps": s.get("r_frame_rate"),
+                    "pix_fmt": s.get("pix_fmt"),
+                })
+            elif s.get("codec_type") == "audio":
+                stream_info.update({
+                    "sample_rate": s.get("sample_rate"),
+                    "channels": s.get("channels"),
+                    "channel_layout": s.get("channel_layout"),
+                })
+            summary["streams"].append(stream_info)
+        return json.dumps(summary, indent=2)
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error analyzing media: {e}"
+
+
+@mcp.tool()
+def media_detect_silence(
+    path: str,
+    noise_threshold: str = "-30dB",
+    min_duration: float = 0.5,
+) -> str:
+    """Detect silent sections in audio/video files.
+
+    Args:
+        path: Path to media file
+        noise_threshold: Noise floor threshold (e.g., "-30dB", "-40dB")
+        min_duration: Minimum silence duration in seconds
+    """
+    from .media.ffprobe import detect_silence
+    try:
+        silences = detect_silence(path, noise_threshold, min_duration)
+        if not silences:
+            return "No silent sections detected."
+        return json.dumps(silences, indent=2)
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def media_detect_beats(path: str) -> str:
+    """Detect beat positions in audio/music files.
+
+    Returns beat timestamps that can be used for music-synced editing.
+
+    Args:
+        path: Path to audio/video file
+    """
+    from .media.ffprobe import detect_beats
+    try:
+        beats = detect_beats(path)
+        return json.dumps({"beat_count": len(beats), "beats": beats}, indent=2)
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def media_loudness(path: str) -> str:
+    """Analyze audio loudness (EBU R128 / LUFS).
+
+    Returns integrated loudness, loudness range, and true peak.
+
+    Args:
+        path: Path to audio/video file
+    """
+    from .media.ffprobe import analyze_loudness
+    try:
+        result = analyze_loudness(path)
+        if not result:
+            return "Could not analyze loudness (file may have no audio)"
+        return json.dumps(result, indent=2)
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def media_extract_thumbnail(
+    path: str,
+    time: float = 0.0,
+    output_path: str = "",
+    width: int = 320,
+) -> str:
+    """Extract a frame thumbnail from video at a specific time.
+
+    Args:
+        path: Path to video file
+        time: Time in seconds to extract frame from
+        output_path: Where to save thumbnail (default: auto-generated)
+        width: Thumbnail width in pixels
+    """
+    from .media.ffprobe import extract_thumbnail
+    try:
+        out = extract_thumbnail(path, time, output_path or None, width)
+        return f"Thumbnail saved: {out}"
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def media_extract_thumbnails(
+    path: str,
+    interval: float = 5.0,
+    output_dir: str = "",
+    width: int = 320,
+) -> str:
+    """Extract thumbnails at regular intervals (contact sheet / storyboard).
+
+    Args:
+        path: Path to video file
+        interval: Seconds between thumbnails
+        output_dir: Directory to save thumbnails
+        width: Thumbnail width in pixels
+    """
+    from .media.ffprobe import extract_thumbnails
+    try:
+        thumbs = extract_thumbnails(path, interval, output_dir or None, width)
+        return json.dumps({"count": len(thumbs), "thumbnails": thumbs}, indent=2)
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def media_list_streams(path: str) -> str:
+    """List all audio, video, and subtitle streams in a media file.
+
+    Args:
+        path: Path to media file
+    """
+    from .media.ffprobe import get_streams
+    try:
+        streams = get_streams(path)
+        result = []
+        for i, s in enumerate(streams):
+            result.append({
+                "index": i,
+                "type": s.get("codec_type"),
+                "codec": s.get("codec_name"),
+                "language": s.get("tags", {}).get("language", ""),
+                "duration": s.get("duration"),
+            })
+        return json.dumps(result, indent=2)
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def media_scene_detect(path: str, threshold: float = 0.3) -> str:
+    """Detect scene changes in video.
+
+    Useful for automatic clip segmentation.
+
+    Args:
+        path: Path to video file
+        threshold: Scene change sensitivity (0.0-1.0, lower = more sensitive)
+    """
+    from .media.ffprobe import detect_scenes
+    try:
+        scenes = detect_scenes(path, threshold)
+        return json.dumps({"scene_count": len(scenes), "scenes": scenes}, indent=2)
+    except FileNotFoundError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def media_extract_audio(
+    path: str,
+    output_path: str = "",
+    format: str = "wav",
+) -> str:
+    """Extract audio track from a video file.
+
+    Useful for feeding video audio into transcription, analysis, or
+    the sheet-music-maker pipeline (basic-pitch → MIDI → notation).
+
+    Args:
+        path: Path to video file
+        output_path: Where to save audio (default: same dir, .wav extension)
+        format: Audio format: wav, mp3, flac (default: wav)
+    """
+    import subprocess as sp
+    p = _resolve_path(path)
+    if not p.exists():
+        return f"File not found: {p}"
+
+    if not output_path:
+        output_path = str(p.with_suffix(f".{format}"))
+
+    cmd = ["ffmpeg", "-y", "-i", str(p), "-vn"]
+    if format == "wav":
+        cmd.extend(["-c:a", "pcm_s16le"])
+    elif format == "mp3":
+        cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
+    elif format == "flac":
+        cmd.extend(["-c:a", "flac"])
+    cmd.append(output_path)
+
+    result = sp.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return f"FFmpeg error: {result.stderr[-300:]}"
+
+    from pathlib import Path as P
+    size_mb = P(output_path).stat().st_size / (1024 * 1024)
+    return json.dumps({
+        "audio_file": output_path,
+        "format": format,
+        "size_mb": f"{size_mb:.1f}",
+        "source": str(p),
+    }, indent=2)
+
+
+@mcp.tool()
+def media_audio_to_midi(
+    path: str,
+    output_path: str = "",
+) -> str:
+    """Transcribe audio to MIDI using basic-pitch (ML audio transcription).
+
+    Converts audio (from video or standalone) into MIDI note data.
+    Returns the MIDI file path and a summary of detected notes.
+
+    Requires basic-pitch: pip install basic-pitch
+
+    Args:
+        path: Path to audio file (wav, mp3, flac) or video file
+        output_path: Where to save MIDI (default: same dir, .mid extension)
+    """
+    p = _resolve_path(path)
+    if not p.exists():
+        return f"File not found: {p}"
+
+    # If video, extract audio first
+    video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
+    if p.suffix.lower() in video_exts:
+        import subprocess as sp
+        wav_path = str(p.with_suffix('.wav'))
+        result = sp.run(
+            ["ffmpeg", "-y", "-i", str(p), "-vn", "-c:a", "pcm_s16le", wav_path],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            return f"Audio extraction failed: {result.stderr[-300:]}"
+        p = Path(wav_path)
+
+    try:
+        from basic_pitch.inference import predict
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+
+        model_output, midi_data, note_events = predict(
+            str(p), model_or_model_path=ICASSP_2022_MODEL_PATH,
+        )
+
+        if not output_path:
+            output_path = str(p.with_suffix('.mid'))
+
+        midi_data.write(output_path)
+
+        # Summarize what was detected
+        note_count = len(note_events)
+        if note_events:
+            pitches = [n[2] for n in note_events]
+            min_pitch, max_pitch = min(pitches), max(pitches)
+            total_dur = max(n[1] for n in note_events) - min(n[0] for n in note_events)
+        else:
+            min_pitch = max_pitch = 0
+            total_dur = 0
+
+        return json.dumps({
+            "midi_file": output_path,
+            "notes_detected": note_count,
+            "pitch_range": f"MIDI {min_pitch}-{max_pitch}",
+            "duration_seconds": f"{total_dur:.1f}",
+            "source": str(p),
+        }, indent=2)
+
+    except ImportError:
+        return "basic-pitch not installed. Run: pip install basic-pitch"
+    except Exception as e:
+        return f"Transcription error: {e}"
+
+
+# ============================================================================
+# Category 11: Puppet Animation (7 tools)
+# ============================================================================
+
+@mcp.tool()
+def puppet_create_rig(
+    rig_json: str,
+) -> str:
+    """Define a puppet character rig from body parts.
+
+    Each part is a separate image (PNG) that gets positioned and layered
+    to form a character. Parts can be animated independently.
+
+    Args:
+        rig_json: JSON object defining the character:
+            {
+                "name": "my_character",
+                "position": [0, 0],
+                "parts": [
+                    {
+                        "name": "head",
+                        "image": "/absolute/path/to/head.png",
+                        "position": [0, 200],
+                        "scale": 1.0,
+                        "rotation": 0,
+                        "anchor": [0, -50],
+                        "z_order": 5
+                    },
+                    ...
+                ]
+            }
+            - position: [x, y] offset from character center (y-positive = up)
+            - anchor: pivot point for rotation
+            - z_order: higher = in front
+
+    Returns:
+        JSON summary of the rig (use this to verify before building a scene).
+    """
+    data = json.loads(rig_json)
+    rig = rig_from_json(data)
+    return json.dumps({
+        "name": rig.name,
+        "position": list(rig.position),
+        "parts": [
+            {
+                "name": p.name,
+                "image": p.image_path,
+                "position": list(p.position),
+                "scale": p.scale,
+                "rotation": p.rotation,
+                "anchor": list(p.anchor),
+                "z_order": p.z_order,
+            }
+            for p in rig.parts
+        ],
+        "status": "rig_valid",
+    }, indent=2)
+
+
+@mcp.tool()
+def puppet_create_humanoid_rig(
+    name: str,
+    image_dir: str,
+    position_x: float = 0.0,
+    position_y: float = 0.0,
+    scale: float = 1.0,
+) -> str:
+    """Create a standard 6-part humanoid rig from a folder of images.
+
+    Expects PNG files named: head.png, body.png, left_arm.png, right_arm.png,
+    left_leg.png, right_leg.png in the image directory.
+
+    Parts are auto-positioned for a standard humanoid layout on a 1080p frame.
+
+    Args:
+        name: Character name
+        image_dir: Absolute path to folder containing part images
+        position_x: X position on screen (0 = center)
+        position_y: Y position on screen (0 = center)
+        scale: Overall scale multiplier
+    """
+    rig = standard_humanoid_rig(name, image_dir, position=(position_x, position_y), scale=scale)
+    if not rig.parts:
+        return f"No part images found in {image_dir}. Expected: head.png, body.png, left_arm.png, right_arm.png, left_leg.png, right_leg.png"
+    found = [p.name for p in rig.parts]
+    missing = [n for n in ["head", "body", "left_arm", "right_arm", "left_leg", "right_leg"] if n not in found]
+    result = {
+        "name": rig.name,
+        "position": list(rig.position),
+        "parts_found": found,
+        "parts_missing": missing,
+        "status": "rig_valid",
+    }
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def puppet_build_scene(
+    rigs_json: str,
+    duration: str = "300300/30000s",
+    project_name: str = "Puppet Animation",
+    output_path: str = "",
+) -> str:
+    """Build an FCPXML timeline from one or more puppet rigs.
+
+    Each rig's parts become layered connected clips with transforms applied.
+    Import the resulting .fcpxml into FCP to see the assembled characters.
+
+    Args:
+        rigs_json: JSON array of rig definitions (same format as puppet_create_rig).
+            Each rig: {"name": str, "position": [x, y], "parts": [...]}
+        duration: Scene duration in FCPXML time (default 10 seconds at 29.97fps)
+        project_name: Project name
+        output_path: Where to save (default: ~/Movies/<project_name>.fcpxml)
+    """
+    rigs_data = json.loads(rigs_json)
+    if isinstance(rigs_data, dict):
+        rigs_data = [rigs_data]  # Single rig passed as object
+
+    builder = PuppetSceneBuilder(duration=duration)
+
+    for rd in rigs_data:
+        rig = rig_from_json(rd)
+        builder.add_rig(rig)
+
+    gen = builder.build(project_name=project_name)
+
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
+    out = gen.save(output_path)
+
+    total_parts = sum(len(rig_from_json(rd).parts) for rd in rigs_data)
+    return json.dumps({
+        "file": str(out),
+        "rigs": len(rigs_data),
+        "total_parts": total_parts,
+        "duration": duration,
+        "status": "scene_built",
+    }, indent=2)
+
+
+@mcp.tool()
+def puppet_animate(
+    rigs_json: str,
+    animations_json: str,
+    duration: str = "300300/30000s",
+    project_name: str = "Puppet Animation",
+    output_path: str = "",
+) -> str:
+    """Build a puppet scene with custom keyframe animations.
+
+    Args:
+        rigs_json: JSON array of rig definitions
+        animations_json: JSON array of animations:
+            [
+                {
+                    "part": "head",
+                    "property": "position",
+                    "keyframes": [
+                        {"time": "0s", "value": [0, 200], "interp": "smooth2"},
+                        {"time": "150150/30000s", "value": [20, 210], "interp": "smooth2"},
+                        {"time": "300300/30000s", "value": [0, 200], "interp": "smooth2"}
+                    ]
+                },
+                {
+                    "part": "left_arm",
+                    "property": "rotation",
+                    "keyframes": [
+                        {"time": "0s", "value": 0},
+                        {"time": "150150/30000s", "value": 45},
+                        {"time": "300300/30000s", "value": 0}
+                    ]
+                }
+            ]
+            property: "position" (value=[x,y]), "rotation" (value=degrees), "scale" (value=[sx,sy])
+            interp: "smooth2" (default, ease), "linear", "hold"
+        duration: Scene duration
+        project_name: Project name
+        output_path: Where to save
+    """
+    rigs_data = json.loads(rigs_json)
+    if isinstance(rigs_data, dict):
+        rigs_data = [rigs_data]
+    anims_data = json.loads(animations_json)
+
+    builder = PuppetSceneBuilder(duration=duration)
+
+    for rd in rigs_data:
+        rig = rig_from_json(rd)
+        builder.add_rig(rig)
+
+    # Parse animations
+    for ad in anims_data:
+        keyframes = []
+        for kf in ad["keyframes"]:
+            val = kf["value"]
+            if isinstance(val, list):
+                val = tuple(val)
+            keyframes.append(Keyframe(
+                time=kf["time"],
+                value=val,
+                interp=kf.get("interp", "smooth2"),
+            ))
+        builder.add_animation(PartAnimation(
+            part_name=ad["part"],
+            property_name=ad["property"],
+            keyframes=keyframes,
+        ))
+
+    gen = builder.build(project_name=project_name)
+
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
+    out = gen.save(output_path)
+
+    return json.dumps({
+        "file": str(out),
+        "rigs": len(rigs_data),
+        "animations": len(anims_data),
+        "duration": duration,
+        "status": "animated_scene_built",
+    }, indent=2)
+
+
+@mcp.tool()
+def puppet_preset_motion(
+    rig_json: str,
+    preset: str = "idle",
+    duration: str = "300300/30000s",
+    project_name: str = "Puppet Animation",
+    output_path: str = "",
+    cycles: int = 3,
+    intensity: float = 1.0,
+) -> str:
+    """Build a puppet scene with a preset motion applied.
+
+    Available presets:
+    - "idle": Subtle breathing/sway (keeps character alive)
+    - "bounce": Vertical bouncing
+    - "walk": Full walk cycle (arms, legs, body bob)
+    - "talk": Mouth movement + head bob
+    - "wave": Arm waving (applies to left_arm)
+
+    Args:
+        rig_json: JSON rig definition
+        preset: Motion preset name
+        duration: Scene duration
+        project_name: Project name
+        output_path: Where to save
+        cycles: Number of motion cycles (more = faster movement)
+        intensity: Scale factor for motion amplitude (0.5 = subtle, 2.0 = exaggerated)
+    """
+    rig_data = json.loads(rig_json)
+    rig = rig_from_json(rig_data)
+
+    builder = PuppetSceneBuilder(duration=duration)
+    builder.add_rig(rig)
+
+    # Generate preset animations
+    if preset == "idle":
+        anims = preset_idle(rig, duration, breathe_amount=8.0 * intensity, sway_amount=3.0 * intensity)
+    elif preset == "bounce":
+        # Apply bounce to body or first part
+        target = rig.get_part("body") or rig.get_part("torso") or (rig.parts[0] if rig.parts else None)
+        anims = [preset_bounce(target, duration, amplitude=20.0 * intensity, cycles=cycles)] if target else []
+    elif preset == "walk":
+        anims = preset_walk(
+            rig, duration,
+            stride=100.0 * intensity,
+            bob_height=15.0 * intensity,
+            arm_swing=30.0 * intensity,
+            leg_swing=35.0 * intensity,
+            cycles=cycles,
+        )
+    elif preset == "talk":
+        anims = preset_talk(rig, duration, jaw_range=15.0 * intensity, head_bob=5.0 * intensity)
+    elif preset == "wave":
+        arm = rig.get_part("left_arm") or rig.get_part("right_arm")
+        anims = [preset_wave(arm, duration, angle_range=45.0 * intensity, cycles=cycles)] if arm else []
+    else:
+        return json.dumps({"error": f"Unknown preset: {preset}. Available: idle, bounce, walk, talk, wave"})
+
+    for anim in anims:
+        builder.add_animation(anim)
+
+    gen = builder.build(project_name=project_name)
+
+    if not output_path:
+        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
+    out = gen.save(output_path)
+
+    return json.dumps({
+        "file": str(out),
+        "preset": preset,
+        "animations_applied": len(anims),
+        "parts_animated": [a.part_name for a in anims],
+        "duration": duration,
+        "status": "preset_applied",
+    }, indent=2)
+
+
+@mcp.tool()
+def puppet_multi_scene(
+    rigs_json: str,
+    scenes_json: str,
+    project_name: str = "Puppet Multi-Scene",
+    output_path: str = "",
+) -> str:
+    """Build a multi-scene puppet animation with different presets per scene.
+
+    Generates one FCPXML per scene. Useful for storyboarding a sequence.
+
+    Args:
+        rigs_json: JSON array of rig definitions (shared across scenes)
+        scenes_json: JSON array of scene definitions:
+            [
+                {"name": "intro", "duration": "300300/30000s", "preset": "idle"},
+                {"name": "greeting", "duration": "150150/30000s", "preset": "wave"},
+                {"name": "walking", "duration": "600600/30000s", "preset": "walk", "cycles": 4}
+            ]
+        project_name: Base project name (scenes get suffixed)
+        output_path: Output directory (default: ~/Movies/)
+    """
+    rigs_data = json.loads(rigs_json)
+    if isinstance(rigs_data, dict):
+        rigs_data = [rigs_data]
+    scenes_data = json.loads(scenes_json)
+
+    out_dir = Path(output_path) if output_path else PROJECTS_DIR
+    results = []
+
+    for i, scene in enumerate(scenes_data):
+        scene_name = scene.get("name", f"scene_{i+1}")
+        scene_duration = scene.get("duration", "300300/30000s")
+        scene_preset = scene.get("preset", "idle")
+        scene_cycles = scene.get("cycles", 3)
+        scene_intensity = scene.get("intensity", 1.0)
+
+        builder = PuppetSceneBuilder(duration=scene_duration)
+
+        for rd in rigs_data:
+            rig = rig_from_json(rd)
+            builder.add_rig(rig)
+
+            # Apply preset
+            if scene_preset == "idle":
+                anims = preset_idle(rig, scene_duration, breathe_amount=8.0 * scene_intensity)
+            elif scene_preset == "walk":
+                anims = preset_walk(rig, scene_duration, cycles=scene_cycles)
+            elif scene_preset == "talk":
+                anims = preset_talk(rig, scene_duration)
+            elif scene_preset == "wave":
+                arm = rig.get_part("left_arm") or rig.get_part("right_arm")
+                anims = [preset_wave(arm, scene_duration, cycles=scene_cycles)] if arm else []
+            elif scene_preset == "bounce":
+                target = rig.get_part("body") or rig.get_part("torso")
+                anims = [preset_bounce(target, scene_duration, cycles=scene_cycles)] if target else []
+            else:
+                anims = []
+
+            for anim in anims:
+                builder.add_animation(anim)
+
+        full_name = f"{project_name}_{scene_name}"
+        gen = builder.build(project_name=full_name)
+        out = gen.save(out_dir / f"{full_name}.fcpxml")
+        results.append({"scene": scene_name, "file": str(out), "preset": scene_preset})
+
+    return json.dumps({
+        "scenes_created": len(results),
+        "files": results,
+        "status": "multi_scene_built",
+    }, indent=2)
+
+
+@mcp.tool()
+def puppet_list_presets() -> str:
+    """List all available puppet animation presets with descriptions.
+
+    Returns details on each preset, what body parts it uses,
+    and what parameters it accepts.
+    """
+    presets = {
+        "idle": {
+            "description": "Subtle breathing and sway — keeps the character looking alive",
+            "parts_used": ["body/torso", "head"],
+            "parameters": {"breathe_amount": 8.0, "sway_amount": 3.0},
+            "good_for": "Background characters, dialogue scenes, any time a character is standing still",
+        },
+        "bounce": {
+            "description": "Vertical bouncing motion on a single part",
+            "parts_used": ["body/torso (or first available part)"],
+            "parameters": {"amplitude": 20.0, "cycles": 3},
+            "good_for": "Excited characters, reactions, comedic emphasis",
+        },
+        "walk": {
+            "description": "Full walk cycle with arm swing, leg swing, and body bob",
+            "parts_used": ["body/torso", "head", "left_arm", "right_arm", "left_leg", "right_leg"],
+            "parameters": {"stride": 100.0, "bob_height": 15.0, "arm_swing": 30.0, "leg_swing": 35.0, "cycles": 3},
+            "good_for": "Characters walking in place (combine with position keyframes for actual movement)",
+        },
+        "talk": {
+            "description": "Talking animation with mouth movement and subtle head bob",
+            "parts_used": ["mouth/jaw", "head"],
+            "parameters": {"jaw_range": 15.0, "head_bob": 5.0, "tempo": 4.0},
+            "good_for": "Dialogue scenes, narration, any speaking character",
+        },
+        "wave": {
+            "description": "Arm waving rotation",
+            "parts_used": ["left_arm (or right_arm)"],
+            "parameters": {"angle_range": 45.0, "cycles": 2},
+            "good_for": "Greetings, goodbyes, getting attention",
+        },
+    }
+    return json.dumps(presets, indent=2)
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+def main():
+    """Run the MCP server."""
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11">
+    <resources>
+        <format id="r1" name="FFVideoFormat1080p2997" width="1920" height="1080" frameDuration="1001/30000s" colorSpace="1-1-1 (Rec. 709)"/>
+        <asset id="r2" name="Interview_A" src="file:///Users/adamsteen/Movies/interview_a.mov" start="0s" duration="300300/30000s" hasVideo="1" hasAudio="1" format="r1" audioSources="1" audioChannels="2"/>
+        <asset id="r3" name="Broll_Beach" src="file:///Users/adamsteen/Movies/broll_beach.mov" start="0s" duration="150150/30000s" hasVideo="1" hasAudio="1" format="r1"/>
+        <asset id="r4" name="Broll_City" src="file:///Users/adamsteen/Movies/broll_city.mov" start="0s" duration="90090/30000s" hasVideo="1" hasAudio="0" format="r1"/>
+        <asset id="r5" name="Music_Track" src="file:///Users/adamsteen/Movies/music.aac" start="0s" duration="600600/30000s" hasVideo="0" hasAudio="1"/>
+        <effect id="r6" name="Basic Title" uid=".../Titles.localized/Build In:Out.localized/Basic Title.localized/Basic Title.moti"/>
+        <effect id="r7" name="Cross Dissolve" uid=".../Transitions.localized/Dissolves.localized/Cross Dissolve.localized/Cross Dissolve.motr"/>
+    </resources>
+    <library location="file:///Users/adamsteen/Movies/MyLibrary.fcpbundle/">
+        <event name="Travel Video" uid="E1-UUID">
+            <project name="Travel Vlog v1" uid="P1-UUID" modDate="2026-03-26 10:00:00 -0700">
+                <sequence format="r1" duration="390390/30000s" tcStart="0s" tcFormat="NDF">
+                    <spine>
+                        <!-- Interview clip -->
+                        <asset-clip ref="r2" name="Interview_A" offset="0s" start="30030/30000s" duration="150150/30000s" role="Dialogue">
+                            <marker start="60060/30000s" duration="1001/30000s" value="Good take" note="Use this section"/>
+                            <keyword start="30030/30000s" duration="60060/30000s" value="intro"/>
+                        </asset-clip>
+
+                        <!-- Transition -->
+                        <transition offset="150150/30000s" duration="30030/30000s" name="Cross Dissolve" ref="r7"/>
+
+                        <!-- B-roll beach -->
+                        <asset-clip ref="r3" name="Broll_Beach" offset="150150/30000s" start="0s" duration="120120/30000s" role="Video">
+                            <marker start="30030/30000s" duration="1001/30000s" value="Sunset" note="Best sunset shot"/>
+                            <!-- Connected title -->
+                            <title ref="r6" name="Beach Scene" offset="0s" duration="90090/30000s" role="Titles">
+                            </title>
+                        </asset-clip>
+
+                        <!-- Short gap -->
+                        <gap offset="270270/30000s" duration="3003/30000s" name="Gap"/>
+
+                        <!-- B-roll city -->
+                        <asset-clip ref="r4" name="Broll_City" offset="273273/30000s" start="0s" duration="90090/30000s" role="Video">
+                            <chapter-marker start="0s" duration="1001/30000s" value="City Section"/>
+                        </asset-clip>
+
+                        <!-- Flash frame (very short clip - potential error) -->
+                        <asset-clip ref="r3" name="Broll_Beach_Flash" offset="363363/30000s" start="120120/30000s" duration="2002/30000s" role="Video"/>
+
+                        <!-- Final interview -->
+                        <asset-clip ref="r2" name="Interview_A_Outro" offset="365365/30000s" start="240240/30000s" duration="25025/30000s" role="Dialogue">
+                            <keyword start="240240/30000s" duration="25025/30000s" value="outro"/>
+                        </asset-clip>
+                    </spine>
+                </sequence>
+            </project>
+        </event>
+    </library>
+</fcpxml>

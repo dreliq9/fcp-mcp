@@ -1,0 +1,30 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.dreliq9/fcp-mcp",
+  "title": "fcp-mcp — Final Cut Pro MCP Server",
+  "description": "The most capable Final Cut Pro MCP server — FCPXML engine + live FCP control + media analysis + parametric puppets. 88 tools across 12 categories.",
+  "repository": {
+    "url": "https://github.com/dreliq9/fcp-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "fcp-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "description": "Directory for modified FCPXML outputs (default: alongside input with _modified suffix)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "FCP_MCP_OUTPUT_DIR"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+.DS_Store
+.mcpregistry_*
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.pytest_cache/
+.eggs/
+*.so
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.venv/
+env/
+
+# Planning artifacts (local only — not for publication)
+.planning/
+
+# Local Claude Code config (points to LLM_GUIDE.md)
+CLAUDE.md
+
+# Local scratch/output
+smoke_test*.fcpxml
+examples/_roundtrip.fcpxml

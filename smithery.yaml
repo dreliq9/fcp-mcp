@@ -1,0 +1,14 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      FCP_MCP_OUTPUT_DIR:
+        type: string
+        description: "Directory for modified FCPXML outputs (default: alongside input with _modified suffix)"
+  commandFunction: |
+    (config) => ({
+      command: "fcp-mcp",
+      args: [],
+      env: config.FCP_MCP_OUTPUT_DIR ? { FCP_MCP_OUTPUT_DIR: config.FCP_MCP_OUTPUT_DIR } : {}
+    })
