@@ -3,14 +3,14 @@
 <fcpxml version="1.11">
     <resources>
         <format id="r1" name="FFVideoFormat1080p2997" width="1920" height="1080" frameDuration="1001/30000s" colorSpace="1-1-1 (Rec. 709)"/>
-        <asset id="r2" name="Interview_A" src="file:///Users/adamsteen/Movies/interview_a.mov" start="0s" duration="300300/30000s" hasVideo="1" hasAudio="1" format="r1" audioSources="1" audioChannels="2"/>
-        <asset id="r3" name="Broll_Beach" src="file:///Users/adamsteen/Movies/broll_beach.mov" start="0s" duration="150150/30000s" hasVideo="1" hasAudio="1" format="r1"/>
-        <asset id="r4" name="Broll_City" src="file:///Users/adamsteen/Movies/broll_city.mov" start="0s" duration="90090/30000s" hasVideo="1" hasAudio="0" format="r1"/>
-        <asset id="r5" name="Music_Track" src="file:///Users/adamsteen/Movies/music.aac" start="0s" duration="600600/30000s" hasVideo="0" hasAudio="1"/>
+        <asset id="r2" name="Interview_A" src="file:///Users/example/Movies/interview_a.mov" start="0s" duration="300300/30000s" hasVideo="1" hasAudio="1" format="r1" audioSources="1" audioChannels="2"/>
+        <asset id="r3" name="Broll_Beach" src="file:///Users/example/Movies/broll_beach.mov" start="0s" duration="150150/30000s" hasVideo="1" hasAudio="1" format="r1"/>
+        <asset id="r4" name="Broll_City" src="file:///Users/example/Movies/broll_city.mov" start="0s" duration="90090/30000s" hasVideo="1" hasAudio="0" format="r1"/>
+        <asset id="r5" name="Music_Track" src="file:///Users/example/Movies/music.aac" start="0s" duration="600600/30000s" hasVideo="0" hasAudio="1"/>
         <effect id="r6" name="Basic Title" uid=".../Titles.localized/Build In:Out.localized/Basic Title.localized/Basic Title.moti"/>
         <effect id="r7" name="Cross Dissolve" uid=".../Transitions.localized/Dissolves.localized/Cross Dissolve.localized/Cross Dissolve.motr"/>
     </resources>
-    <library location="file:///Users/adamsteen/Movies/MyLibrary.fcpbundle/">
+    <library location="file:///Users/example/Movies/MyLibrary.fcpbundle/">
         <event name="Travel Video" uid="E1-UUID">
             <project name="Travel Vlog v1" uid="P1-UUID" modDate="2026-03-26 10:00:00 -0700">
                 <sequence format="r1" duration="390390/30000s" tcStart="0s" tcFormat="NDF">

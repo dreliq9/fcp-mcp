@@ -11,6 +11,7 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "Adam Steen", email = "dreliq9@gmail.com" },
+    { name = "Claude (Anthropic)", email = "noreply@anthropic.com" },
 ]
 keywords = [
     "mcp",
