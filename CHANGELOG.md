@@ -3,6 +3,27 @@
 All notable changes to fcp-mcp are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.2.0 — 2026-04-23 — MCP Prompts
+
+Adds five `@mcp.prompt()` decorators that wrap the most common tool
+sequences so MCP clients can invoke them by name instead of chaining
+tool calls by hand.
+
+### Prompts (5)
+
+- **`qc-check`** — runs `fcpxml_qc_report` and interprets the results as a
+  triaged checklist (auto-fixable vs. manual).
+- **`rough-cut`** — wraps `fcpxml_auto_rough_cut` with an optional target
+  duration, then re-QCs the output.
+- **`cleanup`** — chains `fcpxml_fix_flash_frames` → `fcpxml_fill_gaps` →
+  `fcpxml_qc_report` and reports before/after counts.
+- **`youtube-chapters`** — extracts FCPXML markers and emits a
+  YouTube-ready chapter blob (`HH:MM:SS Title`).
+- **`beat-sync`** — calls `media_detect_beats` then builds a rough cut
+  whose clip durations land on the detected beats.
+
+No breaking changes. All 88 tools from v0.1.0 are unchanged.
+
 ## v0.1.0 — 2026-04-22 — Initial public release
 
 First public release. 88 tools across 12 categories covering FCPXML

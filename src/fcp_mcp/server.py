@@ -2876,6 +2876,119 @@ def puppet_list_presets() -> str:
 
 
 # ============================================================================
+# MCP Prompts (5) — pre-baked flows that wrap the most common tool sequences
+# ============================================================================
+
+@mcp.prompt(
+    name="qc-check",
+    description="Run a full QC sweep on an FCPXML timeline and interpret the results.",
+)
+def prompt_qc_check(path: str) -> str:
+    """Run qc report, then explain what needs attention."""
+    return (
+        f"Run `fcpxml_qc_report(path={path!r})` on this FCPXML file and give me a triaged "
+        "summary of the results.\n\n"
+        "For each issue category (flash frames, gaps, media links, frame-rate mismatches, "
+        "audio levels, safe-zone violations, duration drift), tell me:\n"
+        "  1. How many items were flagged.\n"
+        "  2. Whether it is fixable automatically — and if so, which tool to call "
+        "(`fcpxml_fix_flash_frames`, `fcpxml_fill_gaps`, `fcpxml_remove_silence`, etc.).\n"
+        "  3. Whether it requires manual intervention in Final Cut Pro.\n\n"
+        "End with a short prioritized checklist of the next 3 actions."
+    )
+
+
+@mcp.prompt(
+    name="rough-cut",
+    description="Assemble a rough cut from a list of clips, optionally target a duration.",
+)
+def prompt_rough_cut(clips_json: str, target_duration: str = "") -> str:
+    """Auto-assemble a rough cut, then QC it."""
+    target_clause = (
+        f" targeting a total duration of {target_duration}"
+        if target_duration
+        else " using all clips"
+    )
+    return (
+        f"Assemble a rough cut from the clips in:\n\n{clips_json}\n\n"
+        f"Steps:\n"
+        f"  1. Call `fcpxml_auto_rough_cut(clips_json=<above>, "
+        f"target_duration={target_duration!r})` to build the timeline"
+        f"{target_clause}.\n"
+        "  2. Run `fcpxml_qc_report` on the output path and surface any flash frames or gaps.\n"
+        "  3. If cleanup is needed, call `fcpxml_fix_flash_frames` and `fcpxml_fill_gaps`, "
+        "then re-QC.\n"
+        "  4. Return the final output path and a one-line summary of what was assembled."
+    )
+
+
+@mcp.prompt(
+    name="cleanup",
+    description="Heal flash frames and gaps in an existing FCPXML, then re-QC.",
+)
+def prompt_cleanup(path: str, output_path: str = "") -> str:
+    """Fix flash frames, fill gaps, re-QC."""
+    out_clause = (
+        f" Save the cleaned file to {output_path!r}."
+        if output_path
+        else " Save to a `_cleaned.fcpxml` sibling of the input."
+    )
+    return (
+        f"Clean up the FCPXML at {path!r}.{out_clause}\n\n"
+        "Steps (in order):\n"
+        f"  1. `fcpxml_fix_flash_frames(path={path!r}, output_path=...)` — extend clips "
+        "shorter than 2 frames.\n"
+        "  2. `fcpxml_fill_gaps(path=<output from step 1>, output_path=...)` — fill spine "
+        "gaps with placeholder gap elements.\n"
+        "  3. `fcpxml_qc_report(path=<output from step 2>)` — confirm the issues are gone.\n\n"
+        "Report: before/after counts for flash frames and gaps, plus any QC items that "
+        "still need manual attention."
+    )
+
+
+@mcp.prompt(
+    name="youtube-chapters",
+    description="Extract FCPXML markers and emit a YouTube chapter timestamp blob.",
+)
+def prompt_youtube_chapters(path: str) -> str:
+    """Convert FCPXML markers to a YouTube description chapter blob."""
+    return (
+        f"Turn the markers in {path!r} into a YouTube chapter list.\n\n"
+        "Steps:\n"
+        f"  1. `fcpxml_list_markers(path={path!r})` to get every marker with its start time.\n"
+        "  2. Sort by start time ascending. Drop markers before 00:00.\n"
+        "  3. Format each as `HH:MM:SS Title` (or `MM:SS Title` if the video is under an "
+        "hour). The first entry MUST start at `00:00` — if the earliest marker is later, "
+        "prepend a `00:00 Intro` line.\n"
+        "  4. Return the blob as a single code block ready to paste into a YouTube "
+        "description. Below it, note how many markers were used and flag any that looked "
+        "like internal notes (e.g., TODO/FIXME) that were skipped."
+    )
+
+
+@mcp.prompt(
+    name="beat-sync",
+    description="Detect beats in an audio file and cut clips to land on them.",
+)
+def prompt_beat_sync(audio_path: str, clips_json: str, project_name: str = "Beat Sync") -> str:
+    """Detect beats, build a rough cut that hits them."""
+    return (
+        f"Build a beat-synced cut using audio {audio_path!r} and clips:\n\n{clips_json}\n\n"
+        "Steps:\n"
+        f"  1. `media_detect_beats(path={audio_path!r})` — get the beat timestamps.\n"
+        "  2. Convert each beat (in seconds) to an FCPXML rational-time string. The cadence "
+        "of the beat list sets the per-clip duration window.\n"
+        "  3. Call `fcpxml_auto_rough_cut` with the clips above, setting `max_clip_duration` "
+        "to the median inter-beat interval so cuts land on beats.\n"
+        f"  4. Name the project {project_name!r}.\n"
+        "  5. Add a marker at every beat via `fcpxml_batch_add_markers` so the editor can "
+        "see the grid.\n"
+        "  6. Run `fcpxml_qc_report` on the result and report the final path plus how many "
+        "beats were used."
+    )
+
+
+# ============================================================================
 # Entry point
 # ============================================================================
 
