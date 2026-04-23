@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.dreliq9/fcp-mcp",
   "title": "fcp-mcp — Final Cut Pro MCP Server",
-  "description": "The most capable Final Cut Pro MCP server — FCPXML engine + live FCP control + media analysis + parametric puppets. 88 tools across 12 categories.",
+  "description": "Final Cut Pro MCP — 88 tools: FCPXML engine, live FCP control, media analysis, puppets.",
   "repository": {
     "url": "https://github.com/dreliq9/fcp-mcp",
     "source": "github"
