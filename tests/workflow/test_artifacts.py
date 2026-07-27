@@ -861,6 +861,295 @@ def test_single_windows_handle_failure_preserves_primary_and_checks_close():
     assert primary.details["cleanup_errors"]
 
 
+@pytest.mark.parametrize("failure", ["inspect", "reparse", "adopt"])
+def test_windows_final_file_handle_failures_check_cleanup(
+    failure: str,
+):
+    primary_calls: list[str] = []
+    close_calls: list[int] = []
+
+    def inspect_handle() -> int:
+        primary_calls.append("inspect")
+        if failure == "inspect":
+            raise OSError("inspect failed")
+        return 0x00000400 if failure == "reparse" else 0
+
+    def adopt_handle(handle: int) -> int:
+        primary_calls.append("adopt")
+        if failure == "adopt":
+            raise OSError("adopt failed")
+        return 99
+
+    def failing_close(handle: int) -> bool:
+        close_calls.append(handle)
+        return False
+
+    with pytest.raises((FCPMCPError, OSError)) as error:
+        artifact_module._adopt_windows_file_handle(
+            7,
+            inspect_handle=inspect_handle,
+            adopt_handle=adopt_handle,
+            close_handle=failing_close,
+        )
+
+    assert close_calls == [7]
+    cleanup = (
+        error.value.details.get("cleanup_errors")
+        if isinstance(error.value, FCPMCPError)
+        else getattr(error.value, "_fcp_cleanup_errors", ())
+    )
+    assert cleanup
+
+
+def test_windows_file_open_error_wrap_preserves_handle_cleanup_evidence():
+    primary = OSError("inspect failed")
+    primary._fcp_cleanup_errors = ("CloseHandle(7) returned false",)
+
+    wrapped = artifact_module._coded_with_cleanup(
+        ErrorCode.ARTIFACT_CORRUPT,
+        "safe Windows artifact file open is unavailable",
+        primary,
+    )
+
+    assert wrapped.__cause__ is primary
+    assert wrapped.details["cleanup_errors"] == ["CloseHandle(7) returned false"]
+
+
+def test_fallback_open_file_preserves_checked_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import ctypes
+
+    close_calls: list[int] = []
+
+    class FakeFunction:
+        def __init__(self, implementation):
+            self.implementation = implementation
+
+        def __call__(self, *args):
+            return self.implementation(*args)
+
+    kernel32 = SimpleNamespace(
+        CreateFileW=FakeFunction(lambda *args: 7),
+        GetFileInformationByHandle=FakeFunction(lambda *args: False),
+        CloseHandle=FakeFunction(
+            lambda handle: close_calls.append(int(handle)) is None and False
+        ),
+    )
+    fake_os = SimpleNamespace(
+        name="nt",
+        O_RDWR=os.O_RDWR,
+        O_RDONLY=os.O_RDONLY,
+        O_BINARY=0,
+    )
+    monkeypatch.setattr(artifact_module, "os", fake_os)
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *args, **kwargs: kernel32, raising=False)
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 5, raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "msvcrt",
+        SimpleNamespace(open_osfhandle=lambda handle, flags: 99),
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        artifact_module._fallback_open_file(Path("candidate.fcpxml"), write=False)
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert close_calls == [7]
+    assert error.value.details["cleanup_errors"]
+
+
+@pytest.mark.parametrize("failure_boundary", ["write", "file_fsync", "validation", "replace"])
+def test_fallback_precommit_failures_dispose_owned_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_boundary: str,
+):
+    store = _store(tmp_path)
+    run_directory = store.paths.run_dir(RUN_ID)
+    run_directory.mkdir(mode=0o700)
+    disposed: list[tuple[int, Path]] = []
+    real_write = os.write
+    real_fsync = os.fsync
+    real_fstat = os.fstat
+
+    def recording_dispose(fd: int, path: Path) -> None:
+        real_fstat(fd)
+        disposed.append((fd, path))
+
+    def failing_write(fd: int, data: bytes) -> int:
+        raise OSError("injected write failure")
+
+    def failing_fsync(fd: int) -> None:
+        raise OSError("injected fsync failure")
+
+    def wrong_size_fstat(fd: int):
+        result = real_fstat(fd)
+        return SimpleNamespace(
+            st_mode=result.st_mode,
+            st_size=result.st_size + 1,
+            st_file_attributes=getattr(result, "st_file_attributes", 0),
+        )
+
+    def failing_replace(fd: int, source: Path, target: Path) -> None:
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(
+        artifact_module,
+        "_dispose_owned_fallback_temp",
+        recording_dispose,
+    )
+    if failure_boundary == "write":
+        monkeypatch.setattr(artifact_module.os, "write", failing_write)
+    elif failure_boundary == "file_fsync":
+        monkeypatch.setattr(artifact_module.os, "fsync", failing_fsync)
+    elif failure_boundary == "validation":
+        monkeypatch.setattr(artifact_module.os, "fstat", wrong_size_fstat)
+    else:
+        monkeypatch.setattr(
+            artifact_module,
+            "_replace_owned_fallback_file",
+            failing_replace,
+        )
+
+    with pytest.raises(FCPMCPError):
+        store._write_guarded_fallback(
+            RUN_ID,
+            ArtifactKind.CANDIDATE,
+            b"candidate",
+            run_directory,
+        )
+
+    assert len(disposed) == 1
+    with pytest.raises(OSError):
+        real_fstat(disposed[0][0])
+    monkeypatch.setattr(artifact_module.os, "write", real_write)
+    monkeypatch.setattr(artifact_module.os, "fsync", real_fsync)
+    monkeypatch.setattr(artifact_module.os, "fstat", real_fstat)
+
+
+def test_fallback_disposition_failure_still_closes_owned_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path)
+    run_directory = store.paths.run_dir(RUN_ID)
+    run_directory.mkdir(mode=0o700)
+    real_fstat = os.fstat
+    disposed: list[int] = []
+
+    def failing_write(fd: int, data: bytes) -> int:
+        raise OSError("injected write failure")
+
+    def failing_dispose(fd: int, path: Path) -> None:
+        real_fstat(fd)
+        disposed.append(fd)
+        raise FCPMCPError(ErrorCode.TRANSACTION_FAILED, "injected disposition failure")
+
+    monkeypatch.setattr(artifact_module.os, "write", failing_write)
+    monkeypatch.setattr(
+        artifact_module,
+        "_dispose_owned_fallback_temp",
+        failing_dispose,
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        store._write_guarded_fallback(
+            RUN_ID,
+            ArtifactKind.CANDIDATE,
+            b"candidate",
+            run_directory,
+        )
+
+    assert disposed
+    with pytest.raises(OSError):
+        real_fstat(disposed[0])
+    assert error.value.details["cleanup_errors"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX partial-open cleanup regression")
+def test_open_posix_run_failure_closes_all_acquired_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path)
+    real_close = os.close
+    real_open_directory_at = artifact_module._open_directory_at
+    attempted: list[int] = []
+    failed_fd: int | None = None
+
+    def first_failing_close(fd: int) -> None:
+        nonlocal failed_fd
+        attempted.append(fd)
+        if failed_fd is None:
+            failed_fd = fd
+            raise OSError("injected close failure")
+        real_close(fd)
+
+    def missing_run(parent_fd: int, name: str, **kwargs):
+        if name == RUN_ID:
+            monkeypatch.setattr(artifact_module.os, "close", first_failing_close)
+            raise FileNotFoundError(name)
+        return real_open_directory_at(parent_fd, name, **kwargs)
+
+    monkeypatch.setattr(artifact_module, "_open_directory_at", missing_run)
+    with pytest.raises(FCPMCPError) as error:
+        store._open_posix_run(RUN_ID, create=False)
+    monkeypatch.setattr(artifact_module.os, "close", real_close)
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert len(attempted) == 2
+    assert error.value.details["cleanup_errors"]
+    assert failed_fd is not None
+    real_close(failed_fd)
+
+
+def test_windows_rename_name_uses_utf16_code_units_for_astral_path():
+    path = "C:\\state\\😀\\candidate.fcpxml"
+    encoded = artifact_module._windows_rename_name_bytes(path)
+    buffer, file_name_offset, file_name_length = (
+        artifact_module._build_windows_rename_information(path)
+    )
+
+    assert encoded == path.encode("utf-16-le")
+    assert len(encoded) // 2 == len(path) + 1
+    assert file_name_length == len(encoded)
+    assert len(buffer) == file_name_offset + len(encoded)
+    assert bytes(buffer)[file_name_offset:] == encoded
+
+
+def test_windows_temporary_file_access_includes_delete_permission():
+    assert artifact_module._windows_file_desired_access(write=True) == (
+        0x80000000 | 0x40000000 | 0x00010000
+    )
+    assert artifact_module._windows_file_desired_access(write=False) == 0x80000000
+
+
+def test_windows_delete_disposition_checks_bool_and_last_error():
+    calls: list[tuple[int, int, object, int]] = []
+
+    def failing_set_information(
+        handle: int,
+        information_class: int,
+        information: object,
+        information_size: int,
+    ) -> bool:
+        calls.append((handle, information_class, information, information_size))
+        return False
+
+    with pytest.raises(OSError) as error:
+        artifact_module._apply_windows_delete_disposition(
+            7,
+            set_information=failing_set_information,
+            information=object(),
+            information_size=1,
+            get_last_error=lambda: 5,
+        )
+
+    assert error.value.errno == 5
+    assert calls and calls[0][0:2] == (7, 4)
+
+
 def test_complete_diff_artifact_is_not_limited_by_rendered_summary_limit(tmp_path: Path):
     store = _store(tmp_path, limit=100)
     complete = "αβγ complete canonical diff".encode()

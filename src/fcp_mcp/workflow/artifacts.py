@@ -74,6 +74,18 @@ def _coded(code: ErrorCode, message: str, cause: BaseException | None = None) ->
     return error
 
 
+def _coded_with_cleanup(
+    code: ErrorCode,
+    message: str,
+    cause: BaseException,
+) -> FCPMCPError:
+    error = _coded(code, message, cause)
+    cleanup_errors = getattr(cause, "_fcp_cleanup_errors", ())
+    if isinstance(cleanup_errors, (list, tuple)):
+        _attach_cleanup_errors(error, [str(item) for item in cleanup_errors])
+    return error
+
+
 def _canonical_run_id(value: object) -> str:
     if not isinstance(value, str) or not _UUID_PATTERN.fullmatch(value):
         raise _coded(
@@ -238,6 +250,30 @@ def _close_windows_handle_after_failure(
         close_handle,
         primary_error=primary_error,
     )
+
+
+def _adopt_windows_file_handle(
+    handle: int,
+    *,
+    inspect_handle,
+    adopt_handle,
+    close_handle,
+) -> int:
+    try:
+        attributes = int(inspect_handle())
+        if attributes & (0x00000010 | 0x00000400):
+            raise _coded(
+                ErrorCode.ARTIFACT_CORRUPT,
+                "artifact file is a directory or reparse point",
+            )
+        return int(adopt_handle(handle))
+    except BaseException as error:
+        _close_windows_handle_after_failure(
+            handle,
+            close_handle,
+            error,
+        )
+        raise
 
 
 def _acquire_windows_directory_handles(path: Path) -> list[int]:
@@ -523,8 +559,12 @@ def _fallback_open_file(
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
+        def checked_close(handle: int) -> bool:
+            if not close_handle(handle):
+                raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+            return True
 
-        desired_access = (0x80000000 | 0x40000000 | 0x00010000) if write else 0x80000000
+        desired_access = _windows_file_desired_access(write=write)
         share_mode = (0x00000001 | 0x00000002) if write else 0x00000001
         creation = 1 if exclusive else 3
         attributes = 0x00000080 | 0x00200000
@@ -542,29 +582,77 @@ def _fallback_open_file(
         if handle_value in {0, invalid_handle}:
             raise OSError(ctypes.get_last_error(), "CreateFileW failed")
         information = _ByHandleFileInformation()
-        if not get_attributes(handle, ctypes.byref(information)):
-            close_handle(handle)
-            raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
-        if information.dwFileAttributes & (0x00000010 | 0x00000400):
-            close_handle(handle)
-            raise _coded(
-                ErrorCode.ARTIFACT_CORRUPT,
-                "artifact file is a directory or reparse point",
-            )
         flags = (os.O_RDWR if write else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
-        try:
-            return msvcrt.open_osfhandle(handle_value, flags)
-        except OSError:
-            close_handle(handle)
-            raise
+        def inspect_handle() -> int:
+            if not get_attributes(handle, ctypes.byref(information)):
+                raise OSError(
+                    ctypes.get_last_error(),
+                    "GetFileInformationByHandle failed",
+                )
+            return int(information.dwFileAttributes)
+
+        def adopt_handle(owned_handle: int) -> int:
+            return int(msvcrt.open_osfhandle(owned_handle, flags))
+
+        return _adopt_windows_file_handle(
+            handle_value,
+            inspect_handle=inspect_handle,
+            adopt_handle=adopt_handle,
+            close_handle=checked_close,
+        )
     except FCPMCPError:
         raise
     except (AttributeError, OSError) as error:
-        raise _coded(
+        raise _coded_with_cleanup(
             failure_code,
             "safe Windows artifact file open is unavailable",
             error,
         )
+
+
+def _windows_rename_name_bytes(file_name: str) -> bytes:
+    return file_name.encode("utf-16-le")
+
+
+def _build_windows_rename_information(file_name: str):
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileRenameInformationHeader(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOLEAN),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+        ]
+
+    class _FileRenameInformationLayout(ctypes.Structure):
+        _fields_ = [
+            ("ReplaceIfExists", wintypes.BOOLEAN),
+            ("RootDirectory", wintypes.HANDLE),
+            ("FileNameLength", wintypes.DWORD),
+            ("FileName", wintypes.WCHAR * 1),
+        ]
+
+    file_name_bytes = _windows_rename_name_bytes(file_name)
+    file_name_offset = _FileRenameInformationLayout.FileName.offset
+    buffer = ctypes.create_string_buffer(file_name_offset + len(file_name_bytes))
+    information = _FileRenameInformationHeader.from_buffer(buffer)
+    information.ReplaceIfExists = True
+    information.RootDirectory = None
+    information.FileNameLength = len(file_name_bytes)
+    ctypes.memmove(
+        ctypes.addressof(buffer) + file_name_offset,
+        file_name_bytes,
+        len(file_name_bytes),
+    )
+    return buffer, file_name_offset, int(information.FileNameLength)
+
+
+def _windows_file_desired_access(*, write: bool) -> int:
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    delete = 0x00010000
+    return generic_read | generic_write | delete if write else generic_read
 
 
 def _replace_owned_fallback_file(fd: int, source: Path, target: Path) -> None:
@@ -577,21 +665,7 @@ def _replace_owned_fallback_file(fd: int, source: Path, target: Path) -> None:
         import msvcrt
         from ctypes import wintypes
 
-        file_name = str(target)
-
-        class _FileRenameInformation(ctypes.Structure):
-            _fields_ = [
-                ("ReplaceIfExists", wintypes.BOOLEAN),
-                ("RootDirectory", wintypes.HANDLE),
-                ("FileNameLength", wintypes.DWORD),
-                ("FileName", wintypes.WCHAR * len(file_name)),
-            ]
-
-        information = _FileRenameInformation()
-        information.ReplaceIfExists = True
-        information.RootDirectory = None
-        information.FileNameLength = len(file_name.encode("utf-16-le"))
-        information.FileName = file_name
+        buffer, _, _ = _build_windows_rename_information(str(target))
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         rename = kernel32.SetFileInformationByHandle
         rename.argtypes = [
@@ -605,8 +679,8 @@ def _replace_owned_fallback_file(fd: int, source: Path, target: Path) -> None:
         if not rename(
             handle,
             3,
-            ctypes.byref(information),
-            ctypes.sizeof(information),
+            ctypes.byref(buffer),
+            len(buffer),
         ):
             raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
     except (AttributeError, OSError) as error:
@@ -615,6 +689,74 @@ def _replace_owned_fallback_file(fd: int, source: Path, target: Path) -> None:
             "failed to replace target with owned Windows artifact",
             error,
         )
+
+
+def _apply_windows_delete_disposition(
+    handle: int,
+    *,
+    set_information,
+    information,
+    information_size: int,
+    get_last_error,
+) -> None:
+    if not set_information(
+        handle,
+        4,
+        information,
+        information_size,
+    ):
+        raise OSError(get_last_error(), "FileDispositionInfo failed")
+
+
+def _set_windows_delete_disposition(fd: int) -> None:
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        class _FileDispositionInformation(ctypes.Structure):
+            _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+        information = _FileDispositionInformation(DeleteFile=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        set_information = kernel32.SetFileInformationByHandle
+        set_information.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        set_information.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(fd)
+        _apply_windows_delete_disposition(
+            handle,
+            set_information=set_information,
+            information=ctypes.byref(information),
+            information_size=ctypes.sizeof(information),
+            get_last_error=ctypes.get_last_error,
+        )
+    except (AttributeError, OSError) as error:
+        raise _coded(
+            ErrorCode.TRANSACTION_FAILED,
+            "failed to dispose owned Windows temporary artifact",
+            error,
+        )
+
+
+def _dispose_owned_fallback_temp(fd: int, path: Path) -> None:
+    if os.name == "nt":
+        _set_windows_delete_disposition(fd)
+        return
+    try:
+        current_result = path.lstat()
+    except FileNotFoundError:
+        return
+    opened_result = os.fstat(fd)
+    if (
+        not _is_link_or_reparse(path, current_result)
+        and os.path.samestat(opened_result, current_result)
+    ):
+        path.unlink()
 
 
 def _read_opened_payload(fd: int, expected_size: int) -> bytes:
@@ -1133,22 +1275,27 @@ class ArtifactStore:
                 description="artifact run directory",
             )
             return root_fd, artifacts_fd, run_fd
-        except FileNotFoundError as error:
-            for fd in (
-                locals().get("artifacts_fd"),
-                locals().get("root_fd"),
+        except BaseException as error:  # noqa: BLE001 - close all acquired descriptors
+            primary_error = (
+                _coded(ErrorCode.ARTIFACT_CORRUPT, "artifact path is missing", error)
+                if isinstance(error, FileNotFoundError)
+                else error
+            )
+            cleanup_failures: list[str] = []
+            for description, fd in (
+                ("artifacts", locals().get("artifacts_fd")),
+                ("root", locals().get("root_fd")),
             ):
-                if isinstance(fd, int):
+                if not isinstance(fd, int):
+                    continue
+                try:
                     os.close(fd)
-            raise _coded(ErrorCode.ARTIFACT_CORRUPT, "artifact path is missing", error)
-        except BaseException:
-            for fd in (
-                locals().get("artifacts_fd"),
-                locals().get("root_fd"),
-            ):
-                if isinstance(fd, int):
-                    os.close(fd)
-            raise
+                except OSError as cleanup_error:
+                    cleanup_failures.append(
+                        f"close {description} fd {fd}: {cleanup_error}"
+                    )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
+            raise primary_error
 
     @staticmethod
     def _close_posix_run(root_fd: int, artifacts_fd: int, run_fd: int) -> None:
@@ -1551,41 +1698,24 @@ class ArtifactStore:
             raise _coded(ErrorCode.TRANSACTION_FAILED, f"failed to {action} private artifact", error)
         finally:
             primary_error = sys.exc_info()[1]
-            cleanup_error: OSError | None = None
+            cleanup_failures: list[str] = []
             if temporary_owned and temporary is not None and fd is not None:
                 try:
-                    current_result = temporary.lstat()
-                    opened_result = os.fstat(fd)
-                except FileNotFoundError:
-                    cleanup_error = None
+                    _dispose_owned_fallback_temp(fd, temporary)
+                except FCPMCPError as error:
+                    cleanup_failures.append(error.message)
                 except OSError as error:
-                    cleanup_error = error
-                else:
-                    if (
-                        not _is_link_or_reparse(temporary, current_result)
-                        and os.path.samestat(opened_result, current_result)
-                    ):
-                        for _ in range(2):
-                            try:
-                                temporary.unlink()
-                            except FileNotFoundError:
-                                cleanup_error = None
-                                break
-                            except OSError as error:
-                                cleanup_error = error
-                            else:
-                                cleanup_error = None
-                                break
+                    cleanup_failures.append(
+                        f"dispose private artifact temporary file: {error}"
+                    )
             if fd is not None:
                 try:
                     os.close(fd)
                 except OSError as error:
-                    cleanup_error = cleanup_error or error
-            if cleanup_error is not None:
-                _attach_cleanup_errors(
-                    primary_error,
-                    [f"cleanup private artifact temporary file: {cleanup_error}"],
-                )
+                    cleanup_failures.append(
+                        f"close private artifact temporary file: {error}"
+                    )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
         return self._metadata(run_id, kind, payload)
 
     @staticmethod
