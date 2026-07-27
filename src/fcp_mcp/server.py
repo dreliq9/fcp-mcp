@@ -65,10 +65,7 @@ class _ServerFacade(ModuleType):
             super().__setattr__(name, value)
             return
         runtime = _load_runtime()
-        if hasattr(runtime, name):
-            setattr(runtime, name, value)
-            return
-        super().__setattr__(name, value)
+        setattr(runtime, name, value)
 
     def __delattr__(self, name: str) -> None:
         if name in _FACADE_OWNED_NAMES or (
@@ -77,10 +74,7 @@ class _ServerFacade(ModuleType):
             super().__delattr__(name)
             return
         runtime = _load_runtime()
-        if hasattr(runtime, name):
-            delattr(runtime, name)
-            return
-        super().__delattr__(name)
+        delattr(runtime, name)
 
 
 sys.modules[__name__].__class__ = _ServerFacade

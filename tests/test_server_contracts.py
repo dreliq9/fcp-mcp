@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from mcp import ClientSession, StdioServerParameters
@@ -145,6 +146,55 @@ def test_private_helper_override_reaches_runtime_handler(
 
     result = server.fcpxml_parse("redirected.fcpxml")
 
+    assert result.structured.version == "1.11"
+    assert [project.name for project in result.structured.projects] == [
+        "Travel Vlog v1"
+    ]
+
+
+def test_patch_object_restores_runtime_owned_attributes_after_teardown(
+    monkeypatch,
+    sample_fcpxml_path: Path,
+    tmp_path: Path,
+):
+    base_config = RuntimeConfig.from_env(
+        {
+            "FCP_MCP_OUTPUT_DIR": str(tmp_path),
+            "FCP_MCP_ALLOWED_ROOTS": os.pathsep.join(
+                [str(sample_fcpxml_path.parent), str(tmp_path)]
+            ),
+        },
+        home=tmp_path,
+    )
+    base_paths = PathPolicy(base_config)
+    temporary_config = RuntimeConfig.from_env(
+        {"FCP_MCP_OUTPUT_DIR": str(tmp_path)},
+        home=tmp_path,
+    )
+    temporary_paths = PathPolicy(temporary_config)
+    monkeypatch.setattr(server, "CONFIG", base_config)
+    monkeypatch.setattr(server, "PATHS", base_paths)
+
+    runtime = server._load_runtime()
+    original_resolve_input = runtime._resolve_input
+
+    def redirected_input(*_args, **_kwargs):
+        return sample_fcpxml_path
+
+    with (
+        patch.object(server, "_resolve_input", redirected_input),
+        patch.object(server, "CONFIG", temporary_config),
+        patch.object(server, "PATHS", temporary_paths),
+    ):
+        assert runtime._resolve_input is redirected_input
+        assert runtime.CONFIG is temporary_config
+        assert runtime.PATHS is temporary_paths
+
+    assert runtime._resolve_input is original_resolve_input
+    assert runtime.CONFIG is base_config
+    assert runtime.PATHS is base_paths
+
+    result = server.fcpxml_parse(str(sample_fcpxml_path))
     assert result.structured.version == "1.11"
     assert [project.name for project in result.structured.projects] == [
         "Travel Vlog v1"
