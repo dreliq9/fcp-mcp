@@ -1,7 +1,7 @@
 # fcp-mcp macOS-Only Runtime Design
 
 **Date:** 2026-07-27
-**Status:** Design direction approved; written review requested
+**Status:** Approved 2026-07-27
 **Amends:** [`2026-07-26-v0.3.0-transactional-workflows-design.md`](2026-07-26-v0.3.0-transactional-workflows-design.md)
 
 ## Decision
@@ -40,6 +40,12 @@ provide a runtime enforcement boundary. `fcp-mcp` therefore uses both truthful
 Mac-only metadata and an explicit operational guard:
 
 - [Python core metadata specification](https://packaging.python.org/en/latest/specifications/core-metadata/)
+
+PyPA's trusted-publishing action is a Docker action whose documented expected
+environment is GitHub's Ubuntu runner. The release design treats that isolated
+publisher as control-plane infrastructure, not a supported product runtime:
+
+- [PyPA publish action](https://github.com/marketplace/actions/pypi-publish)
 
 ## Runtime boundary
 
@@ -109,8 +115,13 @@ tagged `py3-none-any`; that tag describes wheel contents, not supported product
 runtime. The runtime guard is authoritative.
 
 Run tests, Ruff, contract validation, dependency audit, coverage, package
-build, installed-wheel smoke, and publication on macOS runners. Exercise
-Python 3.10 through 3.13 on macOS.
+build, tagged-candidate verification, and installed-wheel smoke on macOS
+runners. Exercise Python 3.10 through 3.13 on macOS.
+
+The final PyPI job may use Ubuntu solely to run the pinned
+`pypa/gh-action-pypi-publish` container. It may download the already verified
+distribution artifact but must not check out source, set up Python, install,
+import, test, build, or smoke-run `fcp-mcp`.
 
 Release documentation must state:
 
@@ -161,7 +172,9 @@ The amendment is complete when:
 - no supported-runtime claim names Windows or Linux;
 - all operational entry points reject non-Darwin before side effects;
 - Windows-specific production code and tests are removed;
-- CI and publication use macOS runners only;
+- every job that installs, imports, tests, builds, or smoke-runs the product
+  uses macOS;
+- any Ubuntu publication job is artifact-only and never executes `fcp-mcp`;
 - package metadata names only macOS;
 - Task 14 retains and passes every platform-independent acceptance repair;
 - the complete macOS suite, lint, contracts, coverage, audit, build, and wheel
