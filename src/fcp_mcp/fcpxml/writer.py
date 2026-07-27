@@ -217,7 +217,7 @@ class FCPXMLModifier:
         name_to_el = {}
         for child in list(spine_el):
             name = child.get("name", "")
-            if name in clip_names:
+            if child.tag != "transition" and name in clip_names:
                 name_to_el[name] = child
                 spine_el.remove(child)
 

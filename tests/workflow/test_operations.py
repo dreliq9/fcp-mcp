@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from defusedxml.common import DefusedXmlException
 
+import fcp_mcp.workflow.operations as operations_module
 from fcp_mcp.contracts import ErrorCode
 from fcp_mcp.fcpxml.writer import FCPXMLModifier
 from fcp_mcp.workflow.models import (
@@ -191,8 +192,16 @@ def _transition_attributes(root: ET.Element, duration: str) -> list[dict[str, st
                 kind="reorder_clips",
                 clip_names=["Broll_City", "Interview_A"],
             ),
-            2,
-            ("Broll_City", "Interview_A"),
+            7,
+            (
+                "Broll_City",
+                "Interview_A",
+                "Cross Dissolve",
+                "Broll_Beach",
+                "Gap",
+                "Broll_Beach_Flash",
+                "Interview_A_Outro",
+            ),
             lambda root: [
                 child.get("name")
                 for child in root.find(".//spine")
@@ -384,6 +393,8 @@ def test_registry_contains_all_and_only_model_operation_kinds():
 
 
 def test_registry_is_immutable():
+    assert not hasattr(operations_module, "_OPERATION_EXECUTORS")
+    assert set(OPERATION_EXECUTORS) == EXPECTED_KINDS
     with pytest.raises(TypeError):
         OPERATION_EXECUTORS["unsupported"] = OPERATION_EXECUTORS["add_marker"]
 
@@ -680,6 +691,103 @@ def test_reorder_rejects_unrelated_collateral_removal(
     assert execution.candidate_bytes is None
 
 
+def test_delete_rejects_collateral_nested_deletion(
+    sample_fcpxml_path, monkeypatch
+):
+    real_delete = FCPXMLModifier.delete_clips
+
+    def delete_with_nested_collateral(modifier, clip_names):
+        result = real_delete(modifier, clip_names)
+        beach = modifier._find_clip_by_name("Broll_Beach")
+        title = beach.find("title")
+        beach.remove(title)
+        return result
+
+    monkeypatch.setattr(
+        FCPXMLModifier,
+        "delete_clips",
+        delete_with_nested_collateral,
+    )
+
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            DeleteClipsOperation(
+                kind="delete_clips",
+                clip_names=["Broll_Beach_Flash"],
+            )
+        ),
+    )
+
+    assert execution.disposition is CandidateDisposition.FAILED
+    assert execution.error_code is ErrorCode.OPERATION_FAILED
+    assert execution.candidate_bytes is None
+
+
+def test_reorder_rejects_collateral_nested_deletion(
+    sample_fcpxml_path, monkeypatch
+):
+    real_reorder = FCPXMLModifier.reorder_clips
+
+    def reorder_with_nested_collateral(modifier, clip_names):
+        result = real_reorder(modifier, clip_names)
+        beach = modifier._find_clip_by_name("Broll_Beach")
+        title = beach.find("title")
+        beach.remove(title)
+        return result
+
+    monkeypatch.setattr(
+        FCPXMLModifier,
+        "reorder_clips",
+        reorder_with_nested_collateral,
+    )
+
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            ReorderClipsOperation(
+                kind="reorder_clips",
+                clip_names=["Broll_City", "Interview_A"],
+            )
+        ),
+    )
+
+    assert execution.disposition is CandidateDisposition.FAILED
+    assert execution.error_code is ErrorCode.OPERATION_FAILED
+    assert execution.candidate_bytes is None
+
+
+def test_reorder_rejects_missing_expected_offset_after_modifier(
+    sample_fcpxml_path, monkeypatch
+):
+    real_reorder = FCPXMLModifier.reorder_clips
+
+    def reorder_with_missing_offset(modifier, clip_names):
+        result = real_reorder(modifier, clip_names)
+        del modifier.root.find(".//spine")[0].attrib["offset"]
+        return result
+
+    monkeypatch.setattr(
+        FCPXMLModifier,
+        "reorder_clips",
+        reorder_with_missing_offset,
+    )
+
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            ReorderClipsOperation(
+                kind="reorder_clips",
+                clip_names=["Broll_City"],
+            )
+        ),
+    )
+
+    assert execution.disposition is CandidateDisposition.FAILED
+    assert execution.error_code is ErrorCode.OPERATION_FAILED
+    assert execution.candidate_bytes is None
+
+
 def test_single_transition_rejects_correct_attributes_at_wrong_position(
     sample_fcpxml_path, monkeypatch
 ):
@@ -773,6 +881,39 @@ def test_batch_role_all_noop_reports_zero_affected(sample_fcpxml_path):
     assert execution.receipts[0].affected_count == 0
     assert execution.receipts[0].affected_entities == ()
     assert "already" in execution.receipts[0].warnings[0]
+
+
+def test_batch_role_rejects_unmatched_collateral_role_mutation(
+    sample_fcpxml_path, monkeypatch
+):
+    real_batch = FCPXMLModifier.batch_assign_roles
+
+    def assign_with_collateral(modifier, rules):
+        result = real_batch(modifier, rules)
+        modifier._find_clip_by_name("Beach Scene").set("role", "Collateral")
+        return result
+
+    monkeypatch.setattr(
+        FCPXMLModifier,
+        "batch_assign_roles",
+        assign_with_collateral,
+    )
+
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            BatchAssignRolesOperation(
+                kind="batch_assign_roles",
+                rules=[
+                    BatchRoleAssignmentRule(match="Interview", role="Voice"),
+                ],
+            )
+        ),
+    )
+
+    assert execution.disposition is CandidateDisposition.FAILED
+    assert execution.error_code is ErrorCode.OPERATION_FAILED
+    assert execution.candidate_bytes is None
 
 
 def test_execution_stops_after_first_failure_and_does_not_serialize(
@@ -1000,6 +1141,325 @@ def test_transition_preflight_rejects_gap_separated_clips(sample_fcpxml_path):
     assert execution.disposition is CandidateDisposition.FAILED
     assert execution.error_code is ErrorCode.TARGET_NOT_FOUND
     assert execution.candidate_bytes is None
+
+
+def test_transition_rejects_gap_as_after_clip_target(sample_fcpxml_path):
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            AddTransitionOperation(
+                kind="add_transition",
+                after_clip_name="Gap",
+                duration="1001/30000s",
+                name="Cross Dissolve",
+                ref="r7",
+            )
+        ),
+    )
+
+    assert execution.disposition is CandidateDisposition.FAILED
+    assert execution.error_code is ErrorCode.TARGET_NOT_FOUND
+    assert execution.candidate_bytes is None
+
+
+def test_batch_transition_consistently_skips_gap_adjacencies(sample_fcpxml_path):
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            BatchApplyTransitionOperation(
+                kind="batch_apply_transition",
+                duration="1001/30000s",
+                name="Cross Dissolve",
+                ref="r7",
+            )
+        ),
+    )
+
+    root = _candidate_root(execution)
+    gap = _first_named(root, "Gap")
+    parent = next(parent for parent in root.iter() if gap in list(parent))
+    gap_index = list(parent).index(gap)
+    assert list(parent)[gap_index - 1].tag != "transition"
+    assert list(parent)[gap_index + 1].tag != "transition"
+
+
+def test_reorder_receipt_reports_offset_only_changes(sample_fcpxml_path):
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            ReorderClipsOperation(
+                kind="reorder_clips",
+                clip_names=["Interview_A"],
+            )
+        ),
+    )
+
+    root = _candidate_root(execution)
+    receipt = execution.receipts[0]
+    assert receipt.affected_count == 6
+    assert receipt.affected_entities == (
+        "Cross Dissolve",
+        "Broll_Beach",
+        "Gap",
+        "Broll_City",
+        "Broll_Beach_Flash",
+        "Interview_A_Outro",
+    )
+    offset_changes = [
+        change for change in receipt.changes if change.field.startswith("offset:")
+    ]
+    assert len(offset_changes) == 6
+    assert receipt.warnings == ()
+    assert _first_named(root, "Broll_City").get("offset") == "91091/10000s"
+
+
+def test_reorder_receipt_reports_missing_offset_normalization(
+    sample_fcpxml_path, tmp_path
+):
+    source = tmp_path / "missing-offset.fcpxml"
+    source.write_text(
+        sample_fcpxml_path.read_text().replace(
+            'name="Interview_A" offset="0s"',
+            'name="Interview_A"',
+        )
+    )
+
+    execution = execute_plan(
+        source,
+        _plan(
+            ReorderClipsOperation(
+                kind="reorder_clips",
+                clip_names=["Interview_A"],
+            )
+        ),
+    )
+
+    receipt = execution.receipts[0]
+    interview_change = next(
+        change
+        for change in receipt.changes
+        if change.field == "offset:Interview_A"
+    )
+    assert interview_change.before is None
+    assert interview_change.after == "0s"
+    assert receipt.affected_count == 7
+    assert receipt.warnings == ()
+
+
+def test_reorder_receipt_disambiguates_duplicate_affected_names(
+    sample_fcpxml_path, tmp_path
+):
+    source = tmp_path / "duplicate-names.fcpxml"
+    source.write_text(
+        sample_fcpxml_path.read_text()
+        .replace('name="Broll_Beach" offset=', 'name="Duplicate" offset=')
+        .replace('name="Broll_City" offset=', 'name="Duplicate" offset=')
+    )
+
+    execution = execute_plan(
+        source,
+        _plan(
+            ReorderClipsOperation(
+                kind="reorder_clips",
+                clip_names=["Interview_A"],
+            )
+        ),
+    )
+
+    receipt = execution.receipts[0]
+    duplicate_entities = [
+        entity
+        for entity in receipt.affected_entities
+        if entity.startswith("Duplicate")
+    ]
+    duplicate_changes = [
+        change
+        for change in receipt.changes
+        if change.field.startswith("offset:Duplicate")
+    ]
+    assert receipt.affected_count == 6
+    assert duplicate_entities == ["Duplicate [3]", "Duplicate [5]"]
+    assert [change.field for change in duplicate_changes] == [
+        "offset:Duplicate [3]",
+        "offset:Duplicate [5]",
+    ]
+
+
+def test_reorder_shadow_projects_normalized_offsets_for_later_split(
+    sample_fcpxml_path, tmp_path
+):
+    source = tmp_path / "stale-offset.fcpxml"
+    source.write_text(
+        sample_fcpxml_path.read_text().replace(
+            'name="Broll_City" offset="273273/30000s"',
+            'name="Broll_City" offset="9223372036854775807s"',
+        )
+    )
+    execution = execute_plan(
+        source,
+        WorkflowPlanV1(
+            operations=[
+                ReorderClipsOperation(
+                    kind="reorder_clips",
+                    clip_names=["Interview_A"],
+                ),
+                SplitClipOperation(
+                    kind="split_clip",
+                    clip_name="Broll_City",
+                    split_at="1s",
+                ),
+            ]
+        ),
+    )
+
+    root = _candidate_root(execution)
+    assert [receipt.operation_id for receipt in execution.receipts] == [
+        "op-001",
+        "op-002",
+    ]
+    assert _first_named(root, "Broll_City_split").get("offset") == "101091/10000s"
+
+
+def test_reorder_shadow_retains_and_normalizes_interleaved_transition(
+    sample_fcpxml_path, monkeypatch
+):
+    observed_inventories = []
+    real_preflight = operations_module._preflight_operation
+
+    def capture_second_preflight(operation, inventory):
+        if operation.kind == "assign_role":
+            observed_inventories.append(inventory)
+        return real_preflight(operation, inventory)
+
+    monkeypatch.setattr(
+        operations_module,
+        "_preflight_operation",
+        capture_second_preflight,
+    )
+    modifier = FCPXMLModifier(sample_fcpxml_path)
+    initial_inventory = build_source_inventory(modifier)
+    plan = WorkflowPlanV1(
+        operations=[
+            ReorderClipsOperation(
+                kind="reorder_clips",
+                clip_names=["Interview_A"],
+            ),
+            AssignRoleOperation(
+                kind="assign_role",
+                clip_name="Interview_A",
+                role="Voice",
+            ),
+        ]
+    )
+
+    normalize_plan(plan, initial_inventory)
+
+    projected = observed_inventories[0]
+    transition = next(
+        item for item in projected.spines[0].items if item.kind == "transition"
+    )
+    assert transition.offset == "1001/200s"
+    assert all(clip.kind != "transition" for clip in projected.clips)
+
+
+def test_fix_flash_noop_shadow_preserves_interleaved_transition_offset(
+    sample_fcpxml_path, monkeypatch
+):
+    observed_inventories = []
+    real_preflight = operations_module._preflight_operation
+
+    def capture_second_preflight(operation, inventory):
+        if operation.kind == "assign_role":
+            observed_inventories.append(inventory)
+        return real_preflight(operation, inventory)
+
+    monkeypatch.setattr(
+        operations_module,
+        "_preflight_operation",
+        capture_second_preflight,
+    )
+    initial_inventory = build_source_inventory(FCPXMLModifier(sample_fcpxml_path))
+    plan = WorkflowPlanV1(
+        operations=[
+            FixFlashFramesOperation(
+                kind="fix_flash_frames",
+                min_frames=1,
+                frame_duration="1001/30000s",
+            ),
+            AssignRoleOperation(
+                kind="assign_role",
+                clip_name="Interview_A",
+                role="Voice",
+            ),
+        ]
+    )
+
+    normalize_plan(plan, initial_inventory)
+
+    projected = observed_inventories[0]
+    transition = next(
+        item for item in projected.spines[0].items if item.kind == "transition"
+    )
+    assert transition.offset == "150150/30000s"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        ReorderClipsOperation(
+            kind="reorder_clips",
+            clip_names=["Cross Dissolve"],
+        ),
+        AddTransitionOperation(
+            kind="add_transition",
+            after_clip_name="Cross Dissolve",
+            duration="1001/30000s",
+            name="Cross Dissolve",
+            ref="r7",
+        ),
+    ],
+)
+def test_existing_transition_cannot_be_named_operation_target(
+    sample_fcpxml_path, operation
+):
+    execution = execute_plan(sample_fcpxml_path, _plan(operation))
+
+    assert execution.disposition is CandidateDisposition.FAILED
+    assert execution.error_code is ErrorCode.TARGET_NOT_FOUND
+    assert execution.candidate_bytes is None
+
+
+def test_reorder_does_not_select_same_named_transition(
+    sample_fcpxml_path, tmp_path
+):
+    source = tmp_path / "same-named-transition.fcpxml"
+    source.write_text(
+        sample_fcpxml_path.read_text().replace(
+            'name="Cross Dissolve" ref="r7"',
+            'name="Broll_City" ref="r7"',
+        )
+    )
+
+    execution = execute_plan(
+        source,
+        _plan(
+            ReorderClipsOperation(
+                kind="reorder_clips",
+                clip_names=["Broll_City"],
+            )
+        ),
+    )
+
+    root = _candidate_root(execution)
+    spine = root.find(".//spine")
+    assert len(spine.findall("transition")) == 1
+    assert len(
+        [
+            child
+            for child in spine
+            if child.tag != "transition" and child.get("name") == "Broll_City"
+        ]
+    ) == 1
 
 
 def test_transition_rejects_out_of_domain_result_time(

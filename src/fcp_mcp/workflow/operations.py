@@ -225,9 +225,10 @@ def build_source_inventory(modifier: FCPXMLModifier) -> SourceInventoryV1:
     clips: list[ClipInventoryV1] = []
     by_element: dict[int, ClipInventoryV1] = {}
     for element_index, element in enumerate(modifier.root.iter(), start=1):
-        if element.tag not in _CLIP_TAGS:
-            continue
         location = spine_locations.get(id(element))
+        is_spine_transition = element.tag == "transition" and location is not None
+        if element.tag not in _CLIP_TAGS and not is_spine_transition:
+            continue
         clip = ClipInventoryV1(
             identity=f"element-{element_index:06d}",
             kind=element.tag,
@@ -239,7 +240,8 @@ def build_source_inventory(modifier: FCPXMLModifier) -> SourceInventoryV1:
             spine_index=location[0] if location is not None else None,
             child_index=location[1] if location is not None else None,
         )
-        clips.append(clip)
+        if not is_spine_transition:
+            clips.append(clip)
         by_element[id(element)] = clip
 
     spines = tuple(
@@ -403,13 +405,20 @@ def _preflight_operation(
             primary = inventory.spines[0]
             current_offset = RationalTime.zero()
             for item in primary.items:
+                _validate_result_time(current_offset, nonnegative=True)
+                if item.kind == "transition":
+                    continue
                 duration = _parse_time(item.duration, nonnegative=True)
                 current_offset = _validate_result_time(
                     current_offset + duration,
                     nonnegative=True,
                 )
             for name in operation.clip_names:
-                matches = [item for item in primary.items if item.name == name]
+                matches = [
+                    item
+                    for item in primary.items
+                    if item.kind != "transition" and item.name == name
+                ]
                 if not matches:
                     raise _ExecutionError(
                         ErrorCode.TARGET_NOT_FOUND,
@@ -420,6 +429,11 @@ def _preflight_operation(
                 _parse_time(matches[0].duration, positive=True)
         elif isinstance(operation, AddTransitionOperation):
             target = _require_clip(inventory, operation.after_clip_name)
+            if target.kind == "gap":
+                raise _ExecutionError(
+                    ErrorCode.TARGET_NOT_FOUND,
+                    "requested transition adjacency was not found",
+                )
             _parse_time(operation.duration, positive=True)
             offset = _parse_time(target.offset)
             duration = _parse_time(target.duration, positive=True)
@@ -443,7 +457,11 @@ def _preflight_operation(
                 for index, item in enumerate(spine.items)
                 if item.identity == target.identity
             )
-            following = spine.items[target_position + 1 :]
+            following = tuple(
+                item
+                for item in spine.items[target_position + 1 :]
+                if item.kind != "transition"
+            )
             if not following or following[0].kind == "gap":
                 raise _ExecutionError(
                     ErrorCode.TARGET_NOT_FOUND,
@@ -484,6 +502,9 @@ def _preflight_operation(
             for spine in inventory.spines:
                 current_offset = RationalTime.zero()
                 for item in spine.items:
+                    _validate_result_time(current_offset, nonnegative=True)
+                    if item.kind == "transition":
+                        continue
                     duration = _parse_time(item.duration, nonnegative=True)
                     projected_duration = duration
                     if (
@@ -492,7 +513,6 @@ def _preflight_operation(
                         and not duration.is_zero
                     ):
                         projected_duration = minimum
-                    _validate_result_time(current_offset, nonnegative=True)
                     current_offset = _validate_result_time(
                         current_offset + projected_duration,
                         nonnegative=True,
@@ -528,9 +548,13 @@ def _map_inventory_clips(
     inventory: SourceInventoryV1,
     transform: Callable[[ClipInventoryV1], ClipInventoryV1],
 ) -> SourceInventoryV1:
+    source_items = {clip.identity: clip for clip in inventory.clips}
+    for spine in inventory.spines:
+        for item in spine.items:
+            source_items.setdefault(item.identity, item)
     transformed = {
-        clip.identity: transform(clip)
-        for clip in inventory.clips
+        identity: transform(clip)
+        for identity, clip in source_items.items()
     }
     return replace(
         inventory,
@@ -628,19 +652,40 @@ def _advance_inventory(
         by_name = {
             clip.name: clip
             for clip in primary.items
-            if clip.name in operation.clip_names
+            if clip.kind != "transition" and clip.name in operation.clip_names
         }
+        selected_identities = {clip.identity for clip in by_name.values()}
         projected = [
             clip
             for clip in primary.items
-            if clip.name not in operation.clip_names
+            if clip.identity not in selected_identities
         ]
         for insert_index, name in enumerate(operation.clip_names):
             projected.insert(insert_index, by_name[name])
+        current_offset = RationalTime.zero()
+        normalized_items: list[ClipInventoryV1] = []
+        for clip in projected:
+            normalized_items.append(
+                replace(clip, offset=current_offset.to_fcpxml())
+            )
+            if clip.kind == "transition":
+                continue
+            duration = _parse_time(clip.duration, nonnegative=True)
+            current_offset = _validate_result_time(
+                current_offset + duration,
+                nonnegative=True,
+            )
+        normalized_by_identity = {
+            clip.identity: clip for clip in normalized_items
+        }
         return replace(
             inventory,
+            clips=tuple(
+                normalized_by_identity.get(clip.identity, clip)
+                for clip in inventory.clips
+            ),
             spines=(
-                replace(primary, items=tuple(projected)),
+                replace(primary, items=tuple(normalized_items)),
                 *inventory.spines[1:],
             ),
         )
@@ -707,9 +752,16 @@ def _advance_inventory(
             * operation.min_frames
         )
         projected: dict[str, ClipInventoryV1] = {}
+        changed = False
         for spine in inventory.spines:
             current_offset = RationalTime.zero()
             for clip in spine.items:
+                if clip.kind == "transition":
+                    projected[clip.identity] = replace(
+                        clip,
+                        offset=current_offset.to_fcpxml(),
+                    )
+                    continue
                 duration = _parse_time(clip.duration, nonnegative=True)
                 projected_duration = duration
                 if (
@@ -718,6 +770,7 @@ def _advance_inventory(
                     and not duration.is_zero
                 ):
                     projected_duration = minimum
+                    changed = True
                 projected[clip.identity] = replace(
                     clip,
                     duration=(
@@ -728,6 +781,8 @@ def _advance_inventory(
                     offset=current_offset.to_fcpxml(),
                 )
                 current_offset = current_offset + projected_duration
+        if not changed:
+            return inventory
         return _map_inventory_clips(
             inventory,
             lambda clip: projected.get(clip.identity, clip),
@@ -791,6 +846,59 @@ def _editable_elements(modifier: FCPXMLModifier) -> list[ET.Element]:
 
 def _entity_name(element: ET.Element, index: int) -> str:
     return element.get("name") or f"element-{index:06d}"
+
+
+def _tree_state(
+    root: ET.Element,
+    *,
+    excluded_ids: frozenset[int] = frozenset(),
+    ignored_attributes: Mapping[int, frozenset[str]] | None = None,
+    ignored_children: frozenset[int] = frozenset(),
+) -> tuple[
+    tuple[
+        int,
+        str,
+        tuple[tuple[str, str], ...],
+        str | None,
+        str | None,
+        tuple[int, ...],
+    ],
+    ...,
+]:
+    """Snapshot live element identity and state with explicit allowed differences."""
+    ignored = ignored_attributes or {}
+    state = []
+    for element in root.iter():
+        identity = id(element)
+        if identity in excluded_ids:
+            continue
+        skipped_attributes = ignored.get(identity, frozenset())
+        children = (
+            ()
+            if identity in ignored_children
+            else tuple(
+                id(child)
+                for child in element
+                if id(child) not in excluded_ids
+            )
+        )
+        state.append(
+            (
+                identity,
+                element.tag,
+                tuple(
+                    sorted(
+                        (name, value)
+                        for name, value in element.attrib.items()
+                        if name not in skipped_attributes
+                    )
+                ),
+                element.text,
+                element.tail,
+                children,
+            )
+        )
+    return tuple(sorted(state, key=lambda record: record[0]))
 
 
 def _bounded_entities(names: list[str]) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -1026,8 +1134,7 @@ def _execute_delete_clips(
             ErrorCode.TARGET_NOT_FOUND,
             "requested named clip target was not found",
         )
-    parent_snapshots: dict[int, tuple[ET.Element, list[ET.Element]]] = {}
-    expected_children: dict[int, list[ET.Element]] = {}
+    removed_subtree_ids: set[int] = set()
     for target in targets:
         assert target is not None
         parent = modifier._find_parent(target)
@@ -1036,20 +1143,16 @@ def _execute_delete_clips(
                 ErrorCode.TARGET_NOT_FOUND,
                 "requested named clip parent was not found",
             )
-        parent_id = id(parent)
-        if parent_id not in parent_snapshots:
-            children = list(parent)
-            parent_snapshots[parent_id] = (parent, children)
-            expected_children[parent_id] = list(children)
-        expected_children[parent_id].remove(target)
+        removed_subtree_ids.update(id(element) for element in target.iter())
+    expected_tree = _tree_state(
+        modifier.root,
+        excluded_ids=frozenset(removed_subtree_ids),
+    )
     result = modifier.delete_clips(list(operation.clip_names))
     live_element_ids = {id(element) for element in modifier.root.iter()}
     if result != len(operation.clip_names) or any(
         id(target) in live_element_ids for target in targets
-    ) or any(
-        list(parent) != expected_children[parent_id]
-        for parent_id, (parent, _) in parent_snapshots.items()
-    ):
+    ) or _tree_state(modifier.root) != expected_tree:
         raise _ExecutionError(
             ErrorCode.OPERATION_FAILED,
             "delete operation count or membership did not match",
@@ -1075,38 +1178,116 @@ def _execute_reorder_clips(
         raise _ExecutionError(ErrorCode.OPERATION_FAILED, "preflight spine disappeared")
     selected = set(operation.clip_names)
     before_children = list(spine)
+    ignored_offsets = {
+        id(child): frozenset({"offset"}) for child in before_children
+    }
+    unchanged_tree = _tree_state(
+        modifier.root,
+        ignored_attributes=ignored_offsets,
+        ignored_children=frozenset({id(spine)}),
+    )
     selected_elements = {
         child.get("name", ""): child
         for child in before_children
-        if child.get("name", "") in selected
+        if child.tag != "transition" and child.get("name", "") in selected
     }
+    selected_ids = {id(element) for element in selected_elements.values()}
     expected_children = [
         child
         for child in before_children
-        if child.get("name", "") not in selected
+        if id(child) not in selected_ids
     ]
     for insert_index, name in enumerate(operation.clip_names):
         expected_children.insert(insert_index, selected_elements[name])
+    expected_offsets: dict[int, str] = {}
+    current_offset = RationalTime.zero()
+    for child in expected_children:
+        expected_offsets[id(child)] = current_offset.to_fcpxml()
+        if child.tag == "transition":
+            continue
+        duration = _parse_time(child.get("duration", "0s"), nonnegative=True)
+        current_offset = _validate_result_time(
+            current_offset + duration,
+            nonnegative=True,
+        )
+    before_offsets = {
+        id(child): child.get("offset") for child in before_children
+    }
     result = modifier.reorder_clips(list(operation.clip_names))
     after_children = list(spine)
-    if result is not True or after_children != expected_children:
+    if (
+        result is not True
+        or after_children != expected_children
+        or any(
+            child.get("offset") != expected_offsets[id(child)]
+            for child in after_children
+        )
+        or _tree_state(
+            modifier.root,
+            ignored_attributes=ignored_offsets,
+            ignored_children=frozenset({id(spine)}),
+        )
+        != unchanged_tree
+    ):
         raise _ExecutionError(
             ErrorCode.OPERATION_FAILED,
-            "reorder operation changed membership or order inconsistently",
+            "reorder operation changed tree state inconsistently",
         )
-    changed_names = [
-        name
+    order_changed_elements = [
+        element
         for name in operation.clip_names
         for element in (selected_elements[name],)
         if before_children.index(element) != after_children.index(element)
     ]
+    offset_changed_elements = [
+        child
+        for child in after_children
+        if before_offsets[id(child)] != expected_offsets[id(child)]
+    ]
+    changed_elements: list[ET.Element] = []
+    changed_ids: set[int] = set()
+    for child in [*order_changed_elements, *offset_changed_elements]:
+        if id(child) not in changed_ids:
+            changed_ids.add(id(child))
+            changed_elements.append(child)
+    base_labels = [
+        child.get("name") or _entity_name(child, index)
+        for index, child in enumerate(after_children, start=1)
+    ]
+    entity_labels = {
+        id(child): (
+            f"{label} [{index}]"
+            if base_labels.count(label) > 1
+            else label
+        )
+        for index, (child, label) in enumerate(
+            zip(after_children, base_labels, strict=True),
+            start=1,
+        )
+    }
+    changed_names = [entity_labels[id(child)] for child in changed_elements]
     before = [child.get("name") or child.tag for child in before_children]
     after = [child.get("name") or child.tag for child in after_children]
+    changes = []
+    if before_children != after_children:
+        changes.append(_change("order", ",".join(before), ",".join(after)))
+    changes.extend(
+        _change(
+            f"offset:{entity_labels[id(child)]}",
+            before_offsets[id(child)],
+            expected_offsets[id(child)],
+        )
+        for child in offset_changed_elements
+    )
     return _success_receipt(
         item,
         affected_entities=changed_names,
-        changes=[_change("order", ",".join(before), ",".join(after))],
-        warnings=("requested order was already satisfied",) if not changed_names else (),
+        changes=changes,
+        warnings=(
+            ("requested order and offsets were already satisfied",)
+            if not changed_names
+            else ()
+        ),
     )
 
 
@@ -1241,8 +1422,12 @@ def _execute_batch_assign_roles(
     item: NormalizedOperationV1,
 ) -> OperationReceiptV1:
     operation = cast(BatchAssignRolesOperation, item.operation)
+    editable_before = _editable_elements(modifier)
+    before_roles = {
+        id(element): element.get("role") for element in editable_before
+    }
     matches: list[tuple[ET.Element, str, str | None, str]] = []
-    for index, element in enumerate(_editable_elements(modifier), start=1):
+    for index, element in enumerate(editable_before, start=1):
         name = element.get("name", "")
         for rule in operation.rules:
             if rule.match.lower() in name.lower():
@@ -1251,7 +1436,19 @@ def _execute_batch_assign_roles(
     result = modifier.batch_assign_roles(
         [{"match": rule.match, "role": rule.role} for rule in operation.rules]
     )
-    if result != len(matches) or any(element.get("role") != role for element, _, _, role in matches):
+    expected_roles = dict(before_roles)
+    for element, _, _, role in matches:
+        expected_roles[id(element)] = role
+    editable_after = _editable_elements(modifier)
+    if (
+        result != len(matches)
+        or [id(element) for element in editable_after]
+        != [id(element) for element in editable_before]
+        or any(
+            element.get("role") != expected_roles[id(element)]
+            for element in editable_after
+        )
+    ):
         raise _ExecutionError(
             ErrorCode.OPERATION_FAILED,
             "batch role count or requested values did not match",
@@ -1529,24 +1726,23 @@ def _execute_batch_apply_transition(
 
 OperationExecutor = Callable[[FCPXMLModifier, NormalizedOperationV1], OperationReceiptV1]
 
-_OPERATION_EXECUTORS: dict[str, OperationExecutor] = {
-    "add_marker": _execute_add_marker,
-    "add_keyword": _execute_add_keyword,
-    "trim_clip": _execute_trim_clip,
-    "split_clip": _execute_split_clip,
-    "delete_clips": _execute_delete_clips,
-    "reorder_clips": _execute_reorder_clips,
-    "add_transition": _execute_add_transition,
-    "change_speed": _execute_change_speed,
-    "assign_role": _execute_assign_role,
-    "batch_assign_roles": _execute_batch_assign_roles,
-    "batch_rename_clips": _execute_batch_rename_clips,
-    "fill_gaps": _execute_fill_gaps,
-    "fix_flash_frames": _execute_fix_flash_frames,
-    "batch_apply_transition": _execute_batch_apply_transition,
-}
 OPERATION_EXECUTORS: Mapping[str, OperationExecutor] = MappingProxyType(
-    _OPERATION_EXECUTORS
+    {
+        "add_marker": _execute_add_marker,
+        "add_keyword": _execute_add_keyword,
+        "trim_clip": _execute_trim_clip,
+        "split_clip": _execute_split_clip,
+        "delete_clips": _execute_delete_clips,
+        "reorder_clips": _execute_reorder_clips,
+        "add_transition": _execute_add_transition,
+        "change_speed": _execute_change_speed,
+        "assign_role": _execute_assign_role,
+        "batch_assign_roles": _execute_batch_assign_roles,
+        "batch_rename_clips": _execute_batch_rename_clips,
+        "fill_gaps": _execute_fill_gaps,
+        "fix_flash_frames": _execute_fix_flash_frames,
+        "batch_apply_transition": _execute_batch_apply_transition,
+    }
 )
 
 
