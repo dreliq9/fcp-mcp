@@ -2,27 +2,55 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.dreliq9/fcp-mcp",
   "title": "fcp-mcp — Final Cut Pro MCP Server",
-  "description": "Final Cut Pro MCP — 88 tools: FCPXML engine, live FCP control, media analysis, puppets.",
+  "description": "Final Cut Pro MCP with 89 tools and 5 prompts for FCPXML, media analysis, puppets, and diagnostics.",
   "repository": {
     "url": "https://github.com/dreliq9/fcp-mcp",
     "source": "github"
   },
-  "version": "0.2.0",
+  "version": "0.2.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "fcp-mcp",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
-          "description": "Directory for modified FCPXML outputs (default: alongside input with _modified suffix)",
+          "description": "Canonical directory for relative and generated outputs (default: FCP_PROJECTS_DIR, then ~/Movies)",
           "isRequired": false,
           "format": "string",
           "isSecret": false,
           "name": "FCP_MCP_OUTPUT_DIR"
+        },
+        {
+          "description": "Legacy output-directory alias used only when FCP_MCP_OUTPUT_DIR is unset",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "FCP_PROJECTS_DIR"
+        },
+        {
+          "description": "Platform-path-separator-delimited roots allowed for user-supplied input paths (default: output directory only)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "FCP_MCP_ALLOWED_ROOTS"
+        },
+        {
+          "description": "Explicit opt-in for live FCP, Accessibility, and Compressor actions; accepts 1/0, true/false, yes/no, or on/off",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "FCP_MCP_ENABLE_LIVE_CONTROL"
+        },
+        {
+          "description": "Transaction and runtime event format: text or json",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "FCP_MCP_LOG_FORMAT"
         }
       ]
     }

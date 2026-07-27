@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Union
+from typing import ClassVar
 
 from ..utils.safe_xml import parse_fcpxml
 from .models import (
@@ -37,7 +37,7 @@ class FCPXMLParser:
     """Parse FCPXML files into FCPXMLDocument objects."""
 
     # Map XML tag names to ClipType
-    TAG_TO_CLIP_TYPE = {
+    TAG_TO_CLIP_TYPE: ClassVar[dict[str, ClipType]] = {
         "asset-clip": ClipType.ASSET_CLIP,
         "clip": ClipType.CLIP,
         "gap": ClipType.GAP,
@@ -52,9 +52,9 @@ class FCPXMLParser:
         "ref-clip": ClipType.REF_CLIP,
     }
 
-    CLIP_TAGS = set(TAG_TO_CLIP_TYPE.keys())
+    CLIP_TAGS: ClassVar[frozenset[str]] = frozenset(TAG_TO_CLIP_TYPE)
 
-    def parse(self, path: Union[str, Path]) -> FCPXMLDocument:
+    def parse(self, path: str | Path) -> FCPXMLDocument:
         """Parse an FCPXML file and return a document model."""
         tree = parse_fcpxml(path)
         root = tree.getroot()

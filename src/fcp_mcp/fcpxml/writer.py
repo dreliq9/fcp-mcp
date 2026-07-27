@@ -9,7 +9,6 @@ from __future__ import annotations
 import copy
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional, Union
 
 from ..utils.safe_xml import parse_fcpxml
 from .time_utils import RationalTime
@@ -19,14 +18,14 @@ from .transaction import commit_fcpxml
 class FCPXMLModifier:
     """Load and modify FCPXML files."""
 
-    def __init__(self, path: Union[str, Path]):
+    def __init__(self, path: str | Path):
         self.path = Path(path)
         self.tree = parse_fcpxml(self.path)
         self.root = self.tree.getroot()
 
     def save(
         self,
-        output_path: Optional[Union[str, Path]] = None,
+        output_path: str | Path | None = None,
         *,
         event_format: str = "text",
     ) -> Path:
@@ -89,7 +88,7 @@ class FCPXMLModifier:
                 count += 1
         return count
 
-    def delete_markers(self, clip_name: str, value_filter: Optional[str] = None) -> int:
+    def delete_markers(self, clip_name: str, value_filter: str | None = None) -> int:
         """Remove markers from a clip. If value_filter set, only remove matching."""
         clip_el = self._find_clip_by_name(clip_name)
         if clip_el is None:
@@ -105,7 +104,7 @@ class FCPXMLModifier:
     # --- Keywords ---
 
     def add_keyword(
-        self, clip_name: str, value: str, start: str = "0s", duration: Optional[str] = None,
+        self, clip_name: str, value: str, start: str = "0s", duration: str | None = None,
     ) -> bool:
         """Add a keyword to a clip."""
         clip_el = self._find_clip_by_name(clip_name)
@@ -123,8 +122,8 @@ class FCPXMLModifier:
     def trim_clip(
         self,
         clip_name: str,
-        new_start: Optional[str] = None,
-        new_duration: Optional[str] = None,
+        new_start: str | None = None,
+        new_duration: str | None = None,
     ) -> bool:
         """Trim a clip's source in/out points."""
         clip_el = self._find_clip_by_name(clip_name)
@@ -399,7 +398,7 @@ class FCPXMLModifier:
 
     # --- Helpers ---
 
-    def _find_clip_by_name(self, name: str) -> Optional[ET.Element]:
+    def _find_clip_by_name(self, name: str) -> ET.Element | None:
         """Find first clip element with matching name."""
         for el in self.root.iter():
             if el.get("name") == name and el.tag in (
@@ -410,7 +409,7 @@ class FCPXMLModifier:
                 return el
         return None
 
-    def _find_parent(self, target: ET.Element) -> Optional[ET.Element]:
+    def _find_parent(self, target: ET.Element) -> ET.Element | None:
         """Find parent of an element."""
         for parent in self.root.iter():
             for child in parent:

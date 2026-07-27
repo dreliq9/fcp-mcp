@@ -4,10 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
 
-from .parser import FCPXMLParser
 from .models import Clip, FCPXMLDocument
+from .parser import FCPXMLParser
 
 
 @dataclass
@@ -113,7 +112,7 @@ def diff_documents(doc_a: FCPXMLDocument, doc_b: FCPXMLDocument) -> list[DiffRes
     return results
 
 
-def diff_files(path_a: Union[str, Path], path_b: Union[str, Path]) -> list[DiffResult]:
+def diff_files(path_a: str | Path, path_b: str | Path) -> list[DiffResult]:
     """Compare two FCPXML files."""
     parser = FCPXMLParser()
     doc_a = parser.parse(path_a)

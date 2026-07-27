@@ -49,7 +49,7 @@ Don't pass raw floats like `30.0` — they may silently quantize wrong.
 {"name":"fcpxml_qc_report","arguments":{"path":"show.fcpxml"}}
 ```
 
-Its sections cover schema validation, timeline statistics, gaps, flash
+Its sections cover structural validation, timeline statistics, gaps, flash
 frames, duplicate sources, and pacing. Media links, frame rates, audio
 levels, safe zones, and target duration are separate tools; do not claim
 that the aggregate report ran them.
@@ -220,26 +220,46 @@ The tool invokes Compressor's CLI and returns its captured submission
 output. v0.2.1 does not expose a normalized job ID or completion
 tracking.
 
-## Output directory
+## Runtime boundaries
 
-Override the default with `FCP_MCP_OUTPUT_DIR` in the MCP env block:
+Set the canonical directory for relative inputs and generated outputs
+with `FCP_MCP_OUTPUT_DIR`. Legacy `FCP_PROJECTS_DIR` is consulted only
+when the canonical variable is unset.
 
 ```json
 {
   "mcpServers": {
     "fcp": {
       "command": "fcp-mcp",
-      "env": { "FCP_MCP_OUTPUT_DIR": "/Users/you/fcp-exports" }
+      "env": {
+        "FCP_MCP_OUTPUT_DIR": "/Users/you/fcp-exports",
+        "FCP_MCP_ALLOWED_ROOTS": "/Users/you/Movies:/Volumes/Media",
+        "FCP_MCP_ENABLE_LIVE_CONTROL": "0",
+        "FCP_MCP_LOG_FORMAT": "json"
+      }
     }
   }
 }
 ```
 
+`FCP_MCP_ALLOWED_ROOTS` uses the platform path separator. Inputs are
+resolved after symlinks and must remain beneath one of these roots;
+external volumes are not implicitly available. Live FCP, Accessibility,
+and Compressor actions require an explicit true value for
+`FCP_MCP_ENABLE_LIVE_CONTROL`.
+
+Never ask an edit tool to write back to its source path: v0.2.1 returns
+`same_file_forbidden`. Existing destinations receive a sibling backup
+before atomic replacement. The built-in validator proves safe parsing
+and its implemented structural invariants, not complete Apple/FCP
+compatibility; use a disposable Final Cut Pro import as the
+authoritative gate for an important result.
+
 ## Failure modes and recovery
 
-- **"FCPXML schema error"** — input isn't 1.10+. Run `fcpxml_validate`
-  first for the specific error. Common cause: user exported from FCP 10.5
-  or earlier.
+- **`validation_failed`** — run `fcpxml_validate` for the implemented
+  structural checks. Treat a disposable Final Cut Pro import as the
+  authoritative compatibility test.
 - **"Clip name not found"** — you didn't `fcpxml_list_clips` first.
 - **"ffmpeg not found"** — prompt user to `brew install ffmpeg`.
 - **"Final Cut Pro is not running"** — either ask the user to launch

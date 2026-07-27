@@ -5,10 +5,30 @@ startCommand:
     properties:
       FCP_MCP_OUTPUT_DIR:
         type: string
-        description: "Directory for modified FCPXML outputs (default: alongside input with _modified suffix)"
+        description: "Canonical directory for relative and generated outputs (default: FCP_PROJECTS_DIR, then ~/Movies)"
+      FCP_PROJECTS_DIR:
+        type: string
+        description: "Legacy output-directory alias, used only when FCP_MCP_OUTPUT_DIR is unset"
+      FCP_MCP_ALLOWED_ROOTS:
+        type: string
+        description: "Colon-separated input roots on Smithery's Linux runtime"
+      FCP_MCP_ENABLE_LIVE_CONTROL:
+        type: boolean
+        default: false
+        description: "Explicitly enable live FCP, Accessibility, and Compressor actions"
+      FCP_MCP_LOG_FORMAT:
+        type: string
+        enum: ["text", "json"]
+        default: "text"
+        description: "Transaction and runtime event format"
   commandFunction: |
-    (config) => ({
-      command: "fcp-mcp",
-      args: [],
-      env: config.FCP_MCP_OUTPUT_DIR ? { FCP_MCP_OUTPUT_DIR: config.FCP_MCP_OUTPUT_DIR } : {}
-    })
+    (config) => {
+      const env = {
+        FCP_MCP_ENABLE_LIVE_CONTROL: config.FCP_MCP_ENABLE_LIVE_CONTROL ? "1" : "0",
+        FCP_MCP_LOG_FORMAT: config.FCP_MCP_LOG_FORMAT || "text"
+      };
+      if (config.FCP_MCP_OUTPUT_DIR) env.FCP_MCP_OUTPUT_DIR = config.FCP_MCP_OUTPUT_DIR;
+      if (config.FCP_PROJECTS_DIR) env.FCP_PROJECTS_DIR = config.FCP_PROJECTS_DIR;
+      if (config.FCP_MCP_ALLOWED_ROOTS) env.FCP_MCP_ALLOWED_ROOTS = config.FCP_MCP_ALLOWED_ROOTS;
+      return { command: "fcp-mcp", args: [], env };
+    }

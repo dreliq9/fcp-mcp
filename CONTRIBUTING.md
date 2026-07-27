@@ -21,9 +21,9 @@ brew install ffmpeg             # or apt install ffmpeg on Linux
 
 ## Adding a new tool
 
-Every tool is defined in `src/fcp_mcp/server.py` with the FastMCP
-`@mcp.tool()` decorator. The tool body is thin — it calls out to
-a helper module under `src/fcp_mcp/`.
+Every tool is registered in `src/fcp_mcp/server.py` with an explicit
+annotation preset from `tool_metadata.py`. The handler should delegate
+policy and side effects to the focused modules under `src/fcp_mcp/`.
 
 1. **Pick the right module.** If the tool extends an existing category,
    extend the existing module (`fcpxml/analysis.py`,
@@ -40,30 +40,48 @@ a helper module under `src/fcp_mcp/`.
 3. **Write the handler.** The handler in `server.py` should:
    - Accept string/int/float/bool/JSON-string parameters (the MCP surface
      is JSON-RPC — don't take complex Python types)
+   - Resolve user paths through the shared `PathPolicy`
    - Parse the input via the helper modules (never inline XML parsing)
-   - Return a `str` result — usually a one-line OK/FAIL status plus
+   - Return a `str` success result — usually a one-line status plus
      structured JSON. Return `json.dumps(..., indent=2)` for structured
      output
-   - Guard destructive operations behind a validator call
+   - Raise `FCPMCPError` with a stable code for known failures; do not
+     return failure-shaped success text
+   - Commit FCPXML through the transaction layer and other outputs
+     through the atomic writer
+   - Keep live actions behind `FCP_MCP_ENABLE_LIVE_CONTROL`
+   - Pass dynamic AppleScript/JXA values through argv, never source
+     interpolation
 
-4. **Write a test.** Add a test in the matching file under `tests/`. If
+4. **Classify the tool.** Use one of `OFFLINE_READ`, `OFFLINE_WRITE`,
+   `LIVE_READ`, `LIVE_WRITE`, `STATEFUL_WRITE`, or `DIAGNOSTIC`.
+   Annotations describe behavior to clients; deterministic code still
+   enforces path, live-control, and write policy.
+
+5. **Write a test.** Add a test in the matching file under `tests/`. If
    the tool writes a file, add a fixture under `tests/fixtures/` and
-   use `tmp_path` for output. Don't mock `lxml` or `defusedxml` — run
-   them for real.
+   use `tmp_path` for output. Include the relevant failure path and
+   verify no partial output is created. Don't mock `lxml` or
+   `defusedxml` — run them for real.
 
-5. **Update docs.** Add the tool to the `README.md` category table, the
-   `CHANGELOG.md` under the next version, and (if its invocation is
-   non-obvious to an LLM) a note in `LLM_GUIDE.md`.
+6. **Update executable contracts.** Add the tool to
+   `tests/test_tool_catalog.py`, the `CHANGELOG.md`, and the README
+   category table. Put every operational Markdown example in a
+   `tool-call` fence so `scripts/check_contracts.py` validates it
+   against the live input schema.
 
 ## Running tests
 
 ```bash
 source .venv/bin/activate
-pytest tests/ -v
+ruff check src tests scripts
+python scripts/check_contracts.py
+pytest -v
 ```
 
-Tests run against real parsers — no mock XML, no fake ffmpeg. If a test
-needs ffmpeg, guard it with `@pytest.mark.skipif(not shutil.which("ffmpeg"))`.
+The complete suite runs against real parsers. If a test needs an
+optional host dependency, guard it explicitly and keep the deterministic
+command-construction and error paths covered everywhere.
 
 ## Style
 
@@ -76,7 +94,9 @@ needs ffmpeg, guard it with `@pytest.mark.skipif(not shutil.which("ffmpeg"))`.
 ## Submitting
 
 1. Fork + feature branch
-2. `pytest` must pass (107+ tests)
+2. Ruff, documentation contracts, the complete test suite, coverage
+   gates, dependency audit, build checks, and installed-wheel smoke must
+   pass
 3. Open a PR referencing the issue you're addressing; include the
    before/after output of at least one tool invocation in the
    description

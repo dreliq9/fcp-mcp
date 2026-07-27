@@ -1,4 +1,6 @@
+import json
 from importlib.metadata import metadata
+from pathlib import Path
 
 from packaging.requirements import Requirement
 from packaging.version import Version
@@ -6,6 +8,25 @@ from packaging.version import Version
 from fcp_mcp import __version__
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.version import distribution_version, package_version
+
+
+def test_release_manifests_are_0_2_1():
+    registry = json.loads(Path("server.json").read_text())
+    assert registry["version"] == "0.2.1"
+    assert registry["packages"][0]["version"] == "0.2.1"
+    assert "89 tools" in registry["description"]
+    assert len(registry["description"]) <= 100
+    assert {
+        variable["name"]
+        for variable in registry["packages"][0]["environmentVariables"]
+    } == {
+        "FCP_MCP_OUTPUT_DIR",
+        "FCP_PROJECTS_DIR",
+        "FCP_MCP_ALLOWED_ROOTS",
+        "FCP_MCP_ENABLE_LIVE_CONTROL",
+        "FCP_MCP_LOG_FORMAT",
+    }
+    assert "0.2.1" in Path("CHANGELOG.md").read_text()
 
 
 def test_package_and_module_versions_are_0_2_1():
@@ -35,3 +56,7 @@ def test_domain_error_has_stable_code_and_readable_text():
 
 def test_distribution_version_reports_installed_sdk():
     assert distribution_version("mcp").count(".") >= 1
+
+
+def test_distribution_version_reports_unknown_for_missing_package():
+    assert distribution_version("fcp-mcp-definitely-not-installed") == "unknown"

@@ -102,7 +102,7 @@ def analyze_timeline_stats(doc: FCPXMLDocument) -> list[TimelineStats]:
             marker_count=sum(len(c.markers) for c in clips),
             keyword_count=sum(len(c.keywords) for c in clips),
             connected_clip_count=sum(len(c.connected_clips) for c in clips),
-            roles_used=sorted(set(c.role for c in clips if c.role)),
+            roles_used=sorted({c.role for c in clips if c.role}),
             fps=fps,
             resolution=resolution,
             average_clip_duration_seconds=sum(durations) / len(durations) if durations else 0,

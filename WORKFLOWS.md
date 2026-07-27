@@ -10,13 +10,13 @@ with renders and narratives, see [`examples/GALLERY.md`](examples/GALLERY.md).
 
 ---
 
-## 1. Full QC pass on a locked cut
+## 1. Structural QC pass on a locked cut
 
 **When to use:** right before you bounce a master. Catches flash frames,
 gaps, media drift, level problems, and safe-zone breaches in one pass.
 
 ```
-You: "Run a full QC on hero.fcpxml and give me the summary."
+You: "Run the structural QC report on hero.fcpxml and give me the summary."
 ```
 
 **Tools (one call):**
@@ -25,7 +25,7 @@ You: "Run a full QC on hero.fcpxml and give me the summary."
 {"name":"fcpxml_qc_report","arguments":{"path":"hero.fcpxml"}}
 ```
 
-**What you get back:** a Markdown report containing schema validation,
+**What you get back:** a Markdown report containing structural validation,
 timeline statistics, gaps, flash frames, duplicate sources, and pacing.
 In v0.2.1 this aggregate tool does not include the separate media-link,
 frame-rate, audio-level, or safe-zone checks.
@@ -37,8 +37,8 @@ directly from the FCPXML document.
 
 ## 2. Heal pass after QC
 
-**When to use:** follow-up to recipe 1. Non-destructive automatic fixes
-for the most common QC hits.
+**When to use:** follow-up to recipe 1 for explicit timeline mutations
+that address flash frames and gap elements.
 
 ```
 You: "Fix the flash frames and close the gaps, then re-run QC."
@@ -114,8 +114,8 @@ them deterministically.
 
 ## 4. Beat-informed rough cut
 
-**When to use:** music video, promo, or any edit where cuts should
-land on musical beats.
+**When to use:** music video, promo, or any edit where shot cadence
+should approximate musical beat spacing.
 
 ```
 You: "Build a 60-second rough cut from shots_01–12, synced to song.mp3."

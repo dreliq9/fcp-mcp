@@ -2,36 +2,41 @@
 
 <!-- mcp-name: io.github.dreliq9/fcp-mcp -->
 
-**The most capable MCP server for Final Cut Pro** — 88 tools covering
-FCPXML editing, live FCP control, parametric puppets, and media analysis.
-One server, every layer.
+**A local MCP server for Final Cut Pro** — 89 tools and five prompts
+covering FCPXML editing, opt-in live FCP control, parametric puppets,
+media analysis, and runtime diagnostics.
 
 ```
 You: "Open the library, find flash frames in the hero timeline, fix them, and bounce to ProRes."
 Claude → fcp_open_library → fcpxml_detect_flash_frames → fcpxml_fix_flash_frames
        → fcp_import_xml → fcp_share → compressor_encode
-Result: fixed FCPXML + ProRes master, verified in-app
+Result: validated FCPXML plus an explicitly authorized live export path
 ```
 
-Where the competition stops at one layer, fcp-mcp covers three:
+Where many integrations stop at one layer, fcp-mcp covers the local
+editing stack:
 
 - **FCPXML engine** — parse, edit, QC, generate, cross-NLE export — 49 tools
 - **Live FCP control** — AppleScript-backed library/playback/menu/share — 20 tools
 - **Media analysis** — ffprobe-backed scene/loudness/frame tools — 10 tools
 - **Parametric puppets** — character animation presets in FCPXML — 7 tools
 - **Compressor** — dispatch encodes to Apple Compressor — 2 tools
+- **Runtime diagnostics** — structured offline/live readiness — 1 tool
 
-## Available Tools (88 across 12 categories)
+## Available Tools (89)
+
+The catalog contains 88 domain tools across 12 functional categories,
+plus `fcp_doctor`.
 
 | Category | Count | What it does |
 |---|---|---|
 | **inspect** | 8 | Parse, list clips/markers/effects/roles, analyze pacing, timeline stats, A/B diff |
-| **qc** | 10 | Flash frames, gaps, duplicates, media links, frame rates, audio levels, safe zones, duration, schema, full QC report |
+| **qc** | 10 | Flash frames, gaps, duplicates, media links, frame rates, audio levels, safe zones, duration, structural validation, aggregate QC report |
 | **edit** | 12 | Markers, keywords, titles, audio, transitions, trim, split, delete, reorder, speed, role assign, reformat |
 | **heal** | 3 | Fix flash frames, fill gaps, remove silence |
 | **batch** | 4 | Markers, rename, role assign, apply transition across many clips |
 | **generate** | 4 | New project/timeline, auto rough cut, montage from a shotlist |
-| **templates** | 3 | List, apply, save FCPXML templates (reusable title/audio/role bundles) |
+| **templates** | 3 | List and save FCPXML templates; `fcpxml_apply_template` is registered but returns `unsupported_contract` in v0.2.1 |
 | **io** | 5 | Import SRT/EDL, export EDL + DaVinci Resolve XML + Premiere FCP7 XMEML |
 | **live** | 20 | AppleScript-backed: library/events/projects, playback, menu/keyboard, share, discover effects & motion templates |
 | **puppet** | 7 | Parametric character rigs in FCPXML with motion presets (walk, talk, wave, multi-scene composition) |
@@ -44,26 +49,39 @@ Where the competition stops at one layer, fcp-mcp covers three:
 fcp-mcp/
 ├── src/fcp_mcp/
 │   ├── __init__.py
-│   ├── __main__.py              # python -m fcp_mcp.server
-│   ├── server.py                # FastMCP entry + all 88 tool handlers
+│   ├── __main__.py              # python -m fcp_mcp CLI
+│   ├── cli.py                   # serve, doctor, doctor --json, --version
+│   ├── config.py                # immutable environment configuration
+│   ├── contracts.py             # stable errors + structured diagnostics
+│   ├── diagnostics.py           # non-mutating runtime readiness checks
+│   ├── observability.py         # text/JSON transaction events
+│   ├── server.py                # FastMCP entry + all 89 tool handlers
+│   ├── tool_metadata.py         # MCP safety annotation presets
+│   ├── automation/
+│   │   └── osascript.py         # argv-isolated AppleScript/JXA runner
+│   ├── security/
+│   │   └── paths.py             # allowed-root and output policy
 │   ├── fcpxml/
 │   │   ├── parser.py            # FCPXML → Python object tree
-│   │   ├── writer.py            # object tree → FCPXML (lossless)
+│   │   ├── writer.py            # transactional XML mutation/writing
 │   │   ├── models.py            # TimeValue, Timecode, Clip, Timeline, etc.
 │   │   ├── time_utils.py        # rational-arithmetic timecode
 │   │   ├── analysis.py          # pacing, flash frames, gaps, duplicates
 │   │   ├── validator.py         # DTD-style structural validation
 │   │   ├── generator.py         # programmatic project/timeline creation
 │   │   ├── puppet.py            # character puppet system
-│   │   └── diff.py              # timeline A/B comparison
+│   │   ├── diff.py              # timeline A/B comparison
+│   │   └── transaction.py       # validated atomic FCPXML commits
 │   ├── fcp_control/             # AppleScript bridge for live FCP control
 │   ├── media/
 │   │   └── ffprobe.py           # ffprobe wrapper for media analysis
 │   ├── pipeline/                # multi-step workflows
 │   └── utils/
+│       ├── atomic_write.py       # backup, replace, rollback
 │       ├── safe_xml.py          # defusedxml hardening
-│       └── paths.py             # path resolution, expansion
-├── tests/                       # 107 tests
+│       └── paths.py             # trusted system path helpers
+├── tests/                       # complete unit + contract suite
+├── scripts/                     # docs, coverage, and wheel gates
 ├── examples/
 │   ├── quickstart.py            # install verification
 │   └── GALLERY.md               # workflow gallery with prompts
@@ -108,10 +126,16 @@ pip install -e ".[dev]"
 ### Verify
 
 ```bash
-source .venv/bin/activate
-python -c "import fcp_mcp; print(fcp_mcp.__version__)"
-pytest tests/ -v
+fcp-mcp --version
+fcp-mcp doctor
+fcp-mcp doctor --json
+python examples/quickstart.py
 ```
+
+`doctor` exits `0` when ready, `1` when offline service is usable but
+optional capabilities are degraded, and `2` when configuration blocks
+required runtime behavior. MCP clients can call the same structured
+surface through `fcp_doctor`.
 
 ### Connect to Claude Code
 
@@ -170,12 +194,19 @@ floats at display boundaries. Frame-accurate across 23.976 / 24 / 29.97 /
 59.94 / drop-frame — no rounding drift when splitting, trimming, or
 concatenating.
 
-### Hardened XML parsing
+### Scoped and transactional XML handling
 
 All `.fcpxml` reads go through `defusedxml` via `utils/safe_xml.py` —
-XXE, billion-laughs, and external-entity attacks blocked by default.
-Size and depth limits enforced. `validator.py` runs structural schema
-checks before any destructive operation.
+XXE, entity expansion, and external entities are blocked by default.
+v0.2.1 does not claim explicit XML size or depth limits.
+
+User paths are resolved beneath configured roots after symlink
+resolution. FCPXML writes are serialized to a secure temporary file
+beside the destination, structurally validated, backed up when replacing
+an existing destination, atomically committed, and validated again.
+The built-in validator checks the invariants it implements; it is not a
+complete Apple schema validator. Import into a disposable Final Cut Pro
+project is the authoritative compatibility gate for important outputs.
 
 ### Cross-NLE export
 
@@ -189,22 +220,22 @@ Same timeline out to three targets:
 
 `puppet_*` tools build animated character rigs entirely in FCPXML —
 no third-party motion templates required. Parts, keyframes, and
-presets (walk, talk, wave, multi-character compositions) emit
-standards-compliant XML that opens in any FCP.
+presets (walk, talk, wave, multi-character compositions) emit XML for
+structural validation followed by a disposable-project FCP import gate.
 
 ### QC before you cut
 
 ```
 fcpxml_qc_report("hero.fcpxml")
-  → flash frames (2 × 1-frame orphans at 00:12:03, 00:14:22)
-  → audio-level warnings (3 clips peaking above -3dBFS)
-  → offline media (1 stock clip missing)
-  → safe-zone violations (title at y=0.94, outside 90% action safe)
-  → frame-rate conflicts (none)
+  → Markdown validation summary and timeline statistics
+  → gaps and flash frames with timecodes
+  → duplicate sources
+  → pacing distribution
 ```
 
-One call, full catalog of issues with timecodes, before the edit leaves
-your machine.
+Media links, frame rates, audio levels, safe zones, and target duration
+are separate `fcpxml_check_*` tools. Run the specific checks you need
+instead of assuming the aggregate report includes them.
 
 ### Live FCP control
 
@@ -226,11 +257,38 @@ fcp_discover_effects()     → every installed effect/transition/title
 
 By default, modified FCPXMLs are written next to their input with a
 `_modified` suffix. Override per-call via the `output_path` parameter,
-or globally with:
+or set the canonical directory for relative and generated outputs:
 
 ```bash
 export FCP_MCP_OUTPUT_DIR=/your/path
 ```
+
+`FCP_PROJECTS_DIR` remains a legacy fallback when
+`FCP_MCP_OUTPUT_DIR` is unset. Relative input paths resolve beneath the
+output directory.
+
+Allow additional input roots with the platform path separator (`:` on
+macOS/Linux, `;` on Windows):
+
+```bash
+export FCP_MCP_ALLOWED_ROOTS="/Users/me/Movies:/Volumes/Media"
+```
+
+Absolute and symlink-resolved inputs outside those roots are rejected.
+For an input-backed operation, explicit outputs may be beneath the
+output directory or the input file's parent. Input and output resolving
+to the same file are always rejected. Replacing an existing destination
+creates a sibling backup named
+`<file>.bak.<UTC timestamp>.<transaction UUID>`.
+
+Live FCP, Accessibility, and Compressor actions are opt-in:
+
+```bash
+export FCP_MCP_ENABLE_LIVE_CONTROL=1
+```
+
+Leave it unset for offline-only use. Runtime and transaction events use
+text by default; set `FCP_MCP_LOG_FORMAT=json` for JSON lines.
 
 ---
 
@@ -239,7 +297,7 @@ export FCP_MCP_OUTPUT_DIR=/your/path
 See the [full gallery](examples/GALLERY.md) for tool sequences and
 workflow breakdowns. Sample prompts:
 
-- *"Run a full QC report on hero.fcpxml and fix every flash frame."*
+- *"Run the structural QC report on hero.fcpxml and fix every reported flash frame."*
 - *"Convert these .srt captions into FCPXML title clips on the V2 track."*
 - *"Take my assembly-edit XML and re-export it as a DaVinci Resolve XML for color."*
 - *"List every clip on the timeline, then batch-assign the 'dialogue' role to all interview clips."*
@@ -280,16 +338,28 @@ your PATH, or use the absolute path to the venv's `bin/fcp-mcp` in your MCP conf
 is not bundled.
 
 **`fcp_*` tools return "Final Cut Pro is not running"** — launch FCP first. Live
-tools require an active FCP process on macOS.
+tools require an active FCP process on macOS and
+`FCP_MCP_ENABLE_LIVE_CONTROL=1`.
 
 **`fcp_*` tools fail silently on newer FCP versions** — FCP's scripting surface is
 limited compared to pre-FCPX versions. Menu items and keyboard shortcuts are the
 reliable path; some JXA queries are gated behind Accessibility permissions
 (System Settings → Privacy & Security → Accessibility → Claude/Terminal).
 
-**`fcpxml_*` tools complain about schema** — Make sure your input is FCPXML 1.10+.
-Run `fcpxml_validate` first. For older exports, open and re-save the library in
-FCP 10.6+ before processing.
+**`fcpxml_*` tools report structural validation failures** — run
+`fcpxml_validate` for the implemented checks. Passing this validator is
+not proof of complete Apple/FCP compatibility; import an important
+result into a disposable Final Cut Pro project before relying on it.
+
+**`path_outside_scope`** — add the media location to
+`FCP_MCP_ALLOWED_ROOTS`. External volumes are not implicitly trusted.
+
+**`same_file_forbidden`** — choose a different output. v0.2.1 never
+overwrites its source path, even when the caller supplies it explicitly.
+
+**`unsupported_contract` from `fcpxml_apply_template`** — template
+listing and saving remain available, but clip substitution has no stable
+v0.2.1 schema and is intentionally unavailable.
 
 **Tests failing on import** — activate the venv and reinstall: `pip install -e ".[dev]"`.
 

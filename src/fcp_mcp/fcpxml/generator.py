@@ -7,10 +7,9 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional, Union
 from urllib.parse import quote as url_quote
 
-from .time_utils import RationalTime, FORMAT_FRAME_DURATIONS
+from .time_utils import FORMAT_FRAME_DURATIONS, RationalTime
 from .transaction import commit_fcpxml
 
 
@@ -68,11 +67,11 @@ class FCPXMLGenerator:
     def add_asset(
         self,
         src: str,
-        name: Optional[str] = None,
+        name: str | None = None,
         duration: str = "0s",
         has_video: bool = True,
         has_audio: bool = True,
-        format_ref: Optional[str] = None,
+        format_ref: str | None = None,
         audio_channels: int = 2,
     ) -> str:
         """Add an asset resource. Returns resource ID.
@@ -129,7 +128,7 @@ class FCPXMLGenerator:
     def create_project(
         self,
         name: str = "Untitled Project",
-        format_ref: Optional[str] = None,
+        format_ref: str | None = None,
         duration: str = "0s",
         tc_start: str = "0s",
         tc_format: str = "NDF",
@@ -170,7 +169,7 @@ class FCPXMLGenerator:
         start: str = "0s",
         duration: str = "0s",
         role: str = "",
-        offset: Optional[str] = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add an asset-clip to a spine. Auto-calculates offset if not provided."""
         if offset is None:
@@ -191,7 +190,7 @@ class FCPXMLGenerator:
         self,
         spine: ET.Element,
         duration: str,
-        offset: Optional[str] = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add a gap to a spine."""
         if offset is None:
@@ -209,8 +208,8 @@ class FCPXMLGenerator:
         effect_ref: str,
         name: str = "Title",
         duration: str = "150150/30000s",
-        text_params: Optional[dict[str, str]] = None,
-        offset: Optional[str] = None,
+        text_params: dict[str, str] | None = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add a title generator clip to a spine."""
         if offset is None:
@@ -262,7 +261,7 @@ class FCPXMLGenerator:
         duration: str = "30030/30000s",
         name: str = "Cross Dissolve",
         effect_ref: str = "",
-        offset: Optional[str] = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add a transition to the spine."""
         if offset is None:
@@ -363,7 +362,7 @@ class FCPXMLGenerator:
 
     def save(
         self,
-        path: Union[str, Path],
+        path: str | Path,
         *,
         event_format: str = "text",
     ) -> Path:

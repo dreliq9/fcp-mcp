@@ -4,9 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from fcp_mcp.fcpxml.parser import FCPXMLParser
 from fcp_mcp.fcpxml.models import FCPXMLDocument
-
+from fcp_mcp.fcpxml.parser import FCPXMLParser
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

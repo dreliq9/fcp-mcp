@@ -1,37 +1,48 @@
 # fcp-mcp Roadmap
 
-Status as of 2026-04-23: **88 tools across 12 categories.** First
-public release. Planned work below, grouped by priority.
+Status as of 2026-07-26: **89 tools across 12 functional categories
+plus runtime diagnostics, and five prompts.** v0.2.1 is the trust
+baseline release candidate. Planned work below is grouped by priority.
 
 ---
 
-## v0.2 — Prompts + CI
+## v0.2 — Prompts + trust baseline
 
-**Goal:** reduce boilerplate for common agent flows and guarantee green
-builds on every change.
+**Goal:** reduce boilerplate for common agent flows and establish a
+reproducible, bounded local execution plane.
 
-### 0.2.1 MCP Prompts (5)
+### 0.2.0 MCP Prompts (shipped)
 
 Pre-built prompts that wrap the most common tool sequences. The client
 sees them in the MCP prompt list and can invoke them by name.
 
 - **`qc-check`** — `fcpxml_qc_report` + interpretation guide for the LLM
-- **`rough-cut`** — `fcpxml_auto_rough_cut` with beat-sync scaffold
+- **`rough-cut`** — `fcpxml_auto_rough_cut` plus structural QC
 - **`cleanup`** — `fix_flash_frames` + `fill_gaps` + re-QC
 - **`youtube-chapters`** — extract markers, emit YouTube timestamp blob
-- **`beat-sync`** — `media_detect_beats` + `auto_rough_cut` at beats
+- **`beat-sync`** — `media_detect_beats` + `auto_rough_cut` using median
+  beat cadence; exact beat cut points are not supported
 
-### 0.2.2 GitHub Actions CI
+### 0.2.1 Trust baseline (release candidate)
 
-- Test matrix: Python 3.10 / 3.11 / 3.12 / 3.13
-- `pytest -v` gate on every PR
-- `ruff check` gate on every PR
-- Coverage badge via `pytest-cov`
+- Stable coded MCP failures and structured `fcp_doctor`
+- Allowed-root path policy and symlink containment
+- Validated atomic FCPXML writes with backups and rollback
+- Opt-in live FCP, Accessibility, and Compressor actions
+- AppleScript/JXA argv isolation
+- Explicit MCP annotations on all 89 tools
+- Executable documentation and prompt contracts
+- Python 3.10–3.13 CI, offline Windows coverage, dependency audit,
+  coverage floors, package checks, and installed-wheel smoke
+- FastMCP v1 bounded below v2, with package and wire versions disclosed
+  separately
 
-### 0.2.3 Release automation
+### Release automation
 
-- Tag-triggered workflow → build wheel + sdist → publish to PyPI
-- Post-publish hook → submit to MCP Registry via `mcp-registry` tool
+- Tag-triggered workflow verifies or rebuilds the same candidate before
+  PyPI upload
+- Tags, PyPI upload, GitHub Releases, and MCP Registry submission remain
+  separate maintainer-authorized actions
 
 ---
 
@@ -67,18 +78,16 @@ catalog.
 
 ---
 
-## v0.5 — Sandbox + hardening
+## v0.5 — Further policy hardening
 
 **Goal:** safe to run alongside untrusted clients.
 
-- Sandbox the live FCP tools behind an allowlist (opt-in via env var)
-- File-system jail for all `output_path` parameters to a configurable
-  root
+- Add capability profiles above the shipped live-control opt-in
+- Extend the shipped allowed-root policy with per-tool policy profiles
 - Rate-limit live FCP tools (AppleScript is slow; 1 call per 500ms
   naturally, but add an explicit cap)
-- Security posture doc — XXE, billion-laughs, path traversal test
-  matrix documented + `tests/test_security.py` added to the public
-  test surface
+- Publish a consolidated security posture and adversarial trajectory
+  matrix
 
 ---
 
@@ -86,7 +95,7 @@ catalog.
 
 **Goal:** tool names + signatures frozen. Additions only, no renames.
 
-- Freeze the 88 v0.x tools after one full major-version shakedown
+- Freeze the 89 v0.x tools after one full major-version shakedown
 - Commit to 12-month deprecation window for any future removals
 - Version the MCP Prompts too — existing prompt names become stable
 - Publish `docs/STABILITY.md` stating what's covered by the pact

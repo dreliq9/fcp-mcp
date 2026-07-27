@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Union
 
 
 @dataclass(frozen=True)
@@ -33,8 +32,7 @@ class RationalTime:
         if value is None:
             return cls(0, 1)
         value = value.strip()
-        if value.endswith("s"):
-            value = value[:-1]
+        value = value.removesuffix("s")
         if "/" in value:
             num, den = value.split("/")
             return cls(int(num), int(den))
@@ -130,12 +128,12 @@ class RationalTime:
         a, b, lcd = self._common_denominator(other)
         return RationalTime(a - b, lcd)._simplified()
 
-    def __mul__(self, factor: Union[int, float]) -> RationalTime:
+    def __mul__(self, factor: float) -> RationalTime:
         if isinstance(factor, int):
             return RationalTime(self.numerator * factor, self.denominator)._simplified()
         return RationalTime.from_seconds(self.to_seconds() * factor, self.denominator)
 
-    def __truediv__(self, other: Union[RationalTime, int, float]) -> Union[RationalTime, float]:
+    def __truediv__(self, other: RationalTime | float) -> RationalTime | float:
         if isinstance(other, RationalTime):
             # Returns a float ratio
             return (self.numerator * other.denominator) / (self.denominator * other.numerator)
