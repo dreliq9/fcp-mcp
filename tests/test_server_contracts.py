@@ -10,6 +10,7 @@ import fcp_mcp.automation.osascript as automation
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import FCPMCPError
+from fcp_mcp.version import distribution_version
 
 HOSTILE = 'x" & do shell script "touch /tmp/pwned" & "'
 
@@ -118,3 +119,28 @@ async def test_missing_media_is_wire_error_and_creates_no_output(tmp_path: Path)
 
     assert result.isError is True
     assert output.exists() is False
+
+
+@pytest.mark.asyncio
+async def test_wire_identity_and_doctor_versions_are_truthful(tmp_path: Path):
+    environment = os.environ.copy()
+    environment["FCP_MCP_OUTPUT_DIR"] = str(tmp_path)
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "fcp_mcp"],
+        env=environment,
+    )
+
+    async with (
+        stdio_client(parameters) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        initialized = await session.initialize()
+        result = await session.call_tool("fcp_doctor")
+
+    assert initialized.serverInfo.name == "fcp-mcp"
+    assert initialized.serverInfo.version == distribution_version("mcp")
+    assert result.isError is False
+    assert result.structuredContent["package_version"] == "0.2.1"
+    assert result.structuredContent["mcp_sdk_version"] == distribution_version("mcp")
+    assert result.structuredContent["wire_server_version"] == distribution_version("mcp")

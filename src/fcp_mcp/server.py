@@ -15,7 +15,8 @@ from mcp.server.fastmcp import FastMCP
 
 from .automation import osascript as automation
 from .config import RuntimeConfig
-from .contracts import ErrorCode, FCPMCPError
+from .contracts import DoctorReport, ErrorCode, FCPMCPError
+from .diagnostics import collect_doctor
 from .fcpxml.analysis import (
     analyze_pacing,
     analyze_timeline_stats,
@@ -27,9 +28,6 @@ from .fcpxml.diff import diff_files
 from .fcpxml.generator import FCPXMLGenerator
 from .fcpxml.models import FCPXMLDocument
 from .fcpxml.parser import FCPXMLParser
-from .fcpxml.validator import FCPXMLValidator
-from .fcpxml.writer import FCPXMLModifier
-from .fcpxml.time_utils import RationalTime
 from .fcpxml.puppet import (
     Keyframe,
     PartAnimation,
@@ -42,10 +40,16 @@ from .fcpxml.puppet import (
     rig_from_json,
     standard_humanoid_rig,
 )
+from .fcpxml.time_utils import RationalTime
+from .fcpxml.validator import FCPXMLValidator
+from .fcpxml.writer import FCPXMLModifier
 
 mcp = FastMCP(
     "fcp-mcp",
-    instructions="Final Cut Pro MCP Server — FCPXML engine + live FCP control + media analysis + puppet animation. 89 tools across 11 categories.",
+    instructions=(
+        "fcp-mcp v0.2.1 — FCPXML engine + live FCP control + media analysis "
+        "+ puppet animation. 89 tools across 12 categories and 5 prompts."
+    ),
 )
 
 CONFIG = RuntimeConfig.from_env()
@@ -78,6 +82,20 @@ def _serializable(obj: Any) -> Any:
             d[k] = v
         return d
     return obj
+
+
+# ============================================================================
+# Category 0: Runtime diagnostics (1 tool)
+# ============================================================================
+
+@mcp.tool()
+async def fcp_doctor() -> DoctorReport:
+    """Report structured runtime readiness without prompting or mutating user data."""
+
+    async def catalog() -> tuple[int, int]:
+        return len(await mcp.list_tools()), len(await mcp.list_prompts())
+
+    return await collect_doctor(CONFIG, catalog_provider=catalog)
 
 
 # ============================================================================

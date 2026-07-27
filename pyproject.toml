@@ -44,6 +44,7 @@ classifiers = [
 
 dependencies = [
     "mcp>=1.27,<2",
+    "pydantic>=2.11,<3",
     "defusedxml>=0.7.1",
     "lxml>=4.9.0",
 ]
@@ -67,7 +68,7 @@ Issues = "https://github.com/dreliq9/fcp-mcp/issues"
 Changelog = "https://github.com/dreliq9/fcp-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
-fcp-mcp = "fcp_mcp.server:main"
+fcp-mcp = "fcp_mcp.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
