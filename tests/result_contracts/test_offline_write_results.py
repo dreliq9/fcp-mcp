@@ -69,6 +69,33 @@ def _artifact_payload(
     }
 
 
+def _receipt_payload(
+    *,
+    source: str | None = "/tmp/source.fcpxml",
+) -> dict[str, object]:
+    return {
+        "transaction_id": "11111111-1111-4111-8111-111111111111",
+        "source": source,
+        "destination": "/tmp/destination.fcpxml",
+        "backup_path": None,
+        "input_sha256": "1" * 64 if source is not None else None,
+        "prior_sha256": None,
+        "output_sha256": "2" * 64,
+        "validation_warnings": [],
+        "elapsed_ms": 1,
+        "disposition": "committed",
+    }
+
+
+def _reference_payload() -> dict[str, object]:
+    return {
+        "path": "/tmp/destination.fcpxml",
+        "media_type": "application/vnd.apple.fcpxml+xml",
+        "sha256": "2" * 64,
+        "size_bytes": 1,
+    }
+
+
 def _copy_source(sample_fcpxml_path: Path, tmp_path: Path, stem: str) -> Path:
     source = tmp_path / f"{stem}-source.fcpxml"
     shutil.copy2(sample_fcpxml_path, source)
@@ -312,6 +339,61 @@ async def test_import_results_report_actual_cues_and_events(
     assert len(
         ET.parse(edl_destination).getroot().findall(".//spine/asset-clip")
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_subtitle_import_reports_delta_with_preexisting_subtitle(
+    sample_fcpxml_path: Path,
+    tmp_path: Path,
+) -> None:
+    source = _copy_source(sample_fcpxml_path, tmp_path, "existing-subtitle")
+    tree = ET.parse(source)
+    first_clip = tree.getroot().find(".//spine/asset-clip")
+    assert first_clip is not None
+    existing = ET.SubElement(
+        first_clip,
+        "title",
+        {
+            "ref": "r1",
+            "name": "Existing subtitle",
+            "offset": "0s",
+            "duration": "1s",
+            "lane": "1",
+            "role": "Titles.Subtitle",
+        },
+    )
+    ET.SubElement(
+        existing,
+        "param",
+        {"name": "Text", "key": "Text", "value": "Existing"},
+    )
+    tree.write(source, encoding="utf-8", xml_declaration=True)
+    srt = tmp_path / "delta.srt"
+    srt.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nAdded one\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\nAdded two\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "subtitle-delta.fcpxml"
+
+    result = await server.mcp.call_tool(
+        "fcpxml_import_srt",
+        {
+            "path": str(source),
+            "srt_path": str(srt),
+            "output_path": str(destination),
+        },
+    )
+
+    assert result.content[0].text == (
+        f"2 subtitles added. Saved to: {destination}"
+    )
+    assert result.structuredContent["cue_count"] == 2
+    assert len(
+        ET.parse(destination).getroot().findall(
+            ".//title[@role='Titles.Subtitle']"
+        )
+    ) == 3
 
 
 @pytest.mark.asyncio
@@ -581,6 +663,65 @@ async def test_template_result_binds_copy_to_source_hash_and_absolute_backup(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("declared_encoding", "line_ending", "project_bytes"),
+    (
+        ("UTF-8", b"\r\n", b"CRLF Project"),
+        ("ISO-8859-1", b"\n", b"Caf\xe9 Project"),
+    ),
+)
+async def test_template_save_preserves_declared_encoding_and_exact_bytes(
+    declared_encoding: str,
+    line_ending: bytes,
+    project_bytes: bytes,
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / f"encoded-{declared_encoding}.fcpxml"
+    source_bytes = line_ending.join(
+        (
+            (
+                f'<?xml version="1.0" encoding="{declared_encoding}"?>'
+            ).encode("ascii"),
+            b"<!DOCTYPE fcpxml>",
+            b'<fcpxml version="1.11">',
+            b"<resources />",
+            b'<event name="Encoded"><project name="'
+            + project_bytes
+            + b'"><sequence duration="0s"><spine /></sequence></project></event>',
+            b"</fcpxml>",
+            b"",
+        )
+    )
+    source.write_bytes(source_bytes)
+    template_name = f"bytes-{declared_encoding.lower()}"
+    destination = tmp_path / f"template_{template_name}.fcpxml"
+
+    result = await server.mcp.call_tool(
+        "fcpxml_save_template",
+        {
+            "path": str(source),
+            "template_name": template_name,
+            "output_dir": str(tmp_path),
+        },
+    )
+
+    assert result.content[0].text == f"Template saved: {destination}"
+    assert destination.read_bytes() == source_bytes
+    assert result.structuredContent["source_sha256"] == hashlib.sha256(
+        source_bytes
+    ).hexdigest()
+    assert result.structuredContent["template"]["sha256"] == hashlib.sha256(
+        source_bytes
+    ).hexdigest()
+    assert result.structuredContent["receipt"]["input_sha256"] == hashlib.sha256(
+        source_bytes
+    ).hexdigest()
+    assert result.structuredContent["receipt"]["output_sha256"] == hashlib.sha256(
+        source_bytes
+    ).hexdigest()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     ("tool_name", "export_format", "suffix", "media_type"),
     (
         (
@@ -620,20 +761,212 @@ async def test_exports_bind_source_and_each_actual_output_format(
         destination,
         media_type,
     )
+    receipt = result.structuredContent["receipt"]
+    assert receipt is not None
+    uuid.UUID(receipt["transaction_id"])
+    assert receipt["source"] == str(source.resolve())
+    assert receipt["destination"] == str(destination.resolve())
+    assert receipt["input_sha256"] == _sha256(source)
+    assert receipt["prior_sha256"] is None
+    assert receipt["backup_path"] is None
+    assert receipt["output_sha256"] == _sha256(destination)
+    assert receipt["elapsed_ms"] >= 0
+    assert receipt["disposition"] == "committed"
     if export_format == "resolve":
-        assert result.structuredContent["receipt"] is not None
-        assert result.structuredContent["receipt"]["source"] == str(
-            source.resolve()
-        )
         assert ET.parse(destination).getroot().get("version") == "1.9"
     else:
-        assert result.structuredContent["receipt"] is None
+        assert receipt["validation_warnings"] == []
         if export_format == "fcp7":
             assert ET.parse(destination).getroot().tag == "xmeml"
         else:
             assert destination.read_text(encoding="utf-8").startswith(
                 "TITLE: Travel Vlog v1\nFCM: NON-DROP FRAME\n"
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "suffix"),
+    (
+        ("fcpxml_export_fcp7", ".xml"),
+        ("fcpxml_export_edl", ".edl"),
+    ),
+)
+async def test_non_fcpxml_export_receipt_captures_overwrite_backup(
+    tool_name: str,
+    suffix: str,
+    sample_fcpxml_path: Path,
+    tmp_path: Path,
+) -> None:
+    source = _copy_source(sample_fcpxml_path, tmp_path, "export-overwrite")
+    destination = tmp_path / f"overwrite{suffix}"
+    prior_bytes = b"prior export bytes"
+    destination.write_bytes(prior_bytes)
+
+    result = await server.mcp.call_tool(
+        tool_name,
+        {"path": str(source), "output_path": str(destination)},
+    )
+
+    receipt = result.structuredContent["receipt"]
+    assert receipt is not None
+    assert receipt["source"] == str(source.resolve())
+    assert receipt["destination"] == str(destination.resolve())
+    assert receipt["input_sha256"] == _sha256(source)
+    assert receipt["prior_sha256"] == hashlib.sha256(prior_bytes).hexdigest()
+    assert receipt["output_sha256"] == _sha256(destination)
+    backup = Path(receipt["backup_path"])
+    assert backup.is_absolute()
+    assert backup.read_bytes() == prior_bytes
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "suffix", "has_prior"),
+    (
+        ("fcpxml_export_resolve", ".fcpxml", True),
+        ("fcpxml_export_fcp7", ".xml", False),
+        ("fcpxml_export_edl", ".edl", True),
+    ),
+)
+def test_malformed_export_candidate_preserves_destination_state(
+    tool_name: str,
+    suffix: str,
+    has_prior: bool,
+    sample_fcpxml_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fcp_mcp.fcpxml import transaction
+
+    source = _copy_source(sample_fcpxml_path, tmp_path, "malformed-export")
+    destination = tmp_path / f"malformed{suffix}"
+    prior_bytes = b"prior destination bytes"
+    if has_prior:
+        destination.write_bytes(prior_bytes)
+
+    if tool_name == "fcpxml_export_resolve":
+        real_atomic = transaction.atomic_replace_bytes
+
+        def corrupt_resolve(
+            output: str | Path,
+            payload: bytes,
+            **kwargs: object,
+        ) -> object:
+            corrupted = payload.replace(b'version="1.9"', b'version="1.8"')
+            return real_atomic(output, corrupted, **kwargs)
+
+        monkeypatch.setattr(
+            transaction,
+            "atomic_replace_bytes",
+            corrupt_resolve,
+        )
+    else:
+        real_atomic = server.atomic_replace_bytes
+
+        def corrupt_export(
+            output: str | Path,
+            payload: bytes,
+            **kwargs: object,
+        ) -> object:
+            corrupted = (
+                b"<malformed"
+                if tool_name == "fcpxml_export_fcp7"
+                else b"TITLE: Broken\nFCM: NON-DROP FRAME\n"
+            )
+            return real_atomic(output, corrupted, **kwargs)
+
+        monkeypatch.setattr(server, "atomic_replace_bytes", corrupt_export)
+
+    with pytest.raises(Exception) as caught:
+        getattr(server, tool_name)(
+            str(source),
+            output_path=str(destination),
+        )
+
+    if has_prior:
+        assert destination.read_bytes() == prior_bytes
+    else:
+        assert destination.exists() is False
+    assert list(tmp_path.glob(f"{destination.name}.bak.*")) == []
+    assert isinstance(caught.value, FCPMCPError)
+    assert caught.value.code is ErrorCode.VALIDATION_FAILED
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "before", "after", "destination_name"),
+    (
+        (
+            "fcpxml_reformat",
+            {
+                "target_width": 1080,
+                "target_height": 1920,
+                "target_format_name": "Vertical Candidate",
+            },
+            b'name="Vertical Candidate"',
+            b'name="Corrupt Candidate"',
+            "semantic-reformat.fcpxml",
+        ),
+        (
+            "fcpxml_batch_rename_clips",
+            {"pattern": "Broll", "replacement": "Scenic"},
+            b"Scenic",
+            b"Corrupt",
+            "semantic-rename.fcpxml",
+        ),
+        (
+            "fcpxml_save_template",
+            {"template_name": "atomic"},
+            b"Travel Vlog v1",
+            b"Travel Vlog v2",
+            "template_atomic.fcpxml",
+        ),
+    ),
+)
+def test_semantic_candidate_failure_preserves_prior_destination(
+    tool_name: str,
+    arguments: dict[str, object],
+    before: bytes,
+    after: bytes,
+    destination_name: str,
+    sample_fcpxml_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fcp_mcp.fcpxml import transaction
+
+    source = _copy_source(sample_fcpxml_path, tmp_path, "semantic-candidate")
+    destination = tmp_path / destination_name
+    prior_bytes = b"prior destination bytes"
+    destination.write_bytes(prior_bytes)
+    real_atomic = transaction.atomic_replace_bytes
+
+    def corrupt_candidate(
+        output: str | Path,
+        payload: bytes,
+        **kwargs: object,
+    ) -> object:
+        assert before in payload
+        return real_atomic(output, payload.replace(before, after), **kwargs)
+
+    monkeypatch.setattr(
+        transaction,
+        "atomic_replace_bytes",
+        corrupt_candidate,
+    )
+    call_arguments = dict(arguments)
+    if tool_name == "fcpxml_save_template":
+        call_arguments["output_dir"] = str(tmp_path)
+        positional = (str(source),)
+    else:
+        call_arguments["output_path"] = str(destination)
+        positional = (str(source),)
+
+    with pytest.raises(FCPMCPError) as caught:
+        getattr(server, tool_name)(*positional, **call_arguments)
+
+    assert caught.value.code is ErrorCode.VALIDATION_FAILED
+    assert destination.read_bytes() == prior_bytes
+    assert list(tmp_path.glob(f"{destination.name}.bak.*")) == []
 
 
 def test_generator_save_compatibility_and_overwrite_receipt(
@@ -669,6 +1002,7 @@ def test_offline_write_models_are_frozen_strict_and_opaque_free() -> None:
         model = getattr(models, name)
         assert model.model_config["frozen"] is True, name
         assert model.model_config["extra"] == "forbid", name
+        assert model.model_config["strict"] is True, name
         schema = model.model_json_schema()
         pending: list[object] = [schema]
         while pending:
@@ -680,6 +1014,198 @@ def test_offline_write_models_are_frozen_strict_and_opaque_free() -> None:
                 pending.extend(node.values())
             elif isinstance(node, list):
                 pending.extend(node)
+
+
+def test_task8_result_models_reject_wrong_scalar_types() -> None:
+    common = importlib.import_module("fcp_mcp.result_models.common")
+    fcpxml = importlib.import_module("fcp_mcp.result_models.fcpxml")
+    reference = _reference_payload()
+    receipt = _receipt_payload()
+    cases = (
+        (
+            fcpxml.FCPXMLGenerationResult,
+            {
+                "project": "Project",
+                "selected_clip_count": "2",
+                "target_duration_seconds": 2.0,
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+        (
+            fcpxml.SubtitleImportResult,
+            {
+                "cue_count": "2",
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+        (
+            fcpxml.EDLImportResult,
+            {
+                "event_count": "2",
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+        (
+            fcpxml.FCPXMLMutationResult,
+            {
+                "source_version": "1.11",
+                "target_version": "1.11",
+                "target_width": "1080",
+                "target_height": 1920,
+                "target_format_name": "Vertical",
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+        (
+            fcpxml.CleanupMutationResult,
+            {
+                "action": "fill_gaps",
+                "changed_count": "1",
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+        (
+            fcpxml.ClipBatchMutationResult,
+            {
+                "operation": "rename",
+                "changed_count": "1",
+                "pattern": "A",
+                "replacement": "B",
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+        (
+            fcpxml.RoleBatchMutationResult,
+            {
+                "rules": [{"match": "A", "role": "B"}],
+                "changed_count": "1",
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+        (
+            fcpxml.TransitionBatchMutationResult,
+            {
+                "name": "Dissolve",
+                "duration": "1s",
+                "changed_count": "1",
+                "destination": reference,
+                "receipt": receipt,
+            },
+        ),
+    )
+    for model, payload in cases:
+        with pytest.raises(ValueError):
+            model.model_validate(payload)
+
+    assert common.ArtifactReference.model_config["strict"] is True
+    with pytest.raises(ValueError):
+        common.ArtifactReference(
+            path="/tmp/artifact",
+            media_type="application/xml",
+            sha256="0" * 64,
+            size_bytes="1",
+        )
+    assert fcpxml.TransactionReceiptResult.model_config["strict"] is True
+    with pytest.raises(ValueError):
+        fcpxml.TransactionReceiptResult.model_validate(
+            {**receipt, "elapsed_ms": "1"}
+        )
+
+
+def test_export_result_requires_receipt() -> None:
+    models = importlib.import_module("fcp_mcp.result_models.fcpxml")
+    with pytest.raises(ValueError):
+        models.ExportResult(
+            format="fcp7",
+            source=_reference_payload(),
+            artifact={
+                **_reference_payload(),
+                "media_type": "application/xml",
+            },
+            receipt=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {
+            "operation": "rename",
+            "changed_count": 1,
+            "pattern": "A",
+        },
+        {
+            "operation": "rename",
+            "changed_count": 1,
+            "pattern": "A",
+            "replacement": "B",
+            "requested_names": ["A"],
+        },
+        {
+            "operation": "delete",
+            "changed_count": 1,
+            "requested_names": ["A"],
+            "deleted_names": ["A"],
+            "requested_order": [],
+            "resulting_order": [],
+        },
+        {
+            "operation": "delete",
+            "requested_count": 1,
+            "changed_count": 1,
+            "requested_names": ["A"],
+            "deleted_names": ["A"],
+            "requested_order": [],
+            "resulting_order": [],
+            "pattern": "A",
+        },
+        {
+            "operation": "delete",
+            "requested_count": 1,
+            "changed_count": 1,
+            "requested_names": ["A"],
+            "deleted_names": ["A"],
+            "requested_order": ["A"],
+            "resulting_order": [],
+        },
+        {
+            "operation": "reorder",
+            "requested_count": 1,
+            "changed_count": 1,
+            "requested_names": ["A"],
+            "deleted_names": [],
+            "requested_order": ["A"],
+        },
+        {
+            "operation": "reorder",
+            "requested_count": 1,
+            "changed_count": 1,
+            "requested_names": ["A"],
+            "deleted_names": ["A"],
+            "requested_order": ["A"],
+            "resulting_order": ["A"],
+        },
+    ),
+)
+def test_clip_batch_result_rejects_impossible_operation_fields(
+    payload: dict[str, object],
+) -> None:
+    models = importlib.import_module("fcp_mcp.result_models.fcpxml")
+    with pytest.raises(ValueError):
+        models.ClipBatchMutationResult.model_validate(
+            {
+                **payload,
+                "destination": _reference_payload(),
+                "receipt": _receipt_payload(),
+            }
+        )
 
 
 @pytest.mark.parametrize(

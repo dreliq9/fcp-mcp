@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .common import ArtifactReference
 
@@ -321,7 +321,7 @@ class MediaLinkCheckResult(BaseModel):
 
 
 class TransactionReceiptResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     transaction_id: str
     source: str | None
@@ -336,7 +336,7 @@ class TransactionReceiptResult(BaseModel):
 
 
 class FCPXMLGenerationResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     project: str
@@ -347,7 +347,7 @@ class FCPXMLGenerationResult(BaseModel):
 
 
 class SubtitleImportResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     cue_count: int
@@ -356,7 +356,7 @@ class SubtitleImportResult(BaseModel):
 
 
 class EDLImportResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     event_count: int
@@ -365,7 +365,7 @@ class EDLImportResult(BaseModel):
 
 
 class FCPXMLMutationResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     source_version: str
@@ -378,7 +378,7 @@ class FCPXMLMutationResult(BaseModel):
 
 
 class CleanupMutationResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     action: Literal[
@@ -474,7 +474,7 @@ class ClipMutationResult(BaseModel):
 
 
 class ClipBatchMutationResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     destination: ArtifactReference
@@ -510,16 +510,90 @@ class ClipBatchMutationResult(BaseModel):
         exclude_if=lambda value: value is None,
     )
 
+    @model_validator(mode="after")
+    def validate_operation_fields(self) -> Self:
+        if self.operation == "rename":
+            if self.pattern in {None, ""} or self.replacement is None:
+                raise ValueError("rename requires pattern and replacement")
+            if any(
+                value is not None
+                for value in (
+                    self.requested_count,
+                    self.requested_names,
+                    self.deleted_names,
+                    self.requested_order,
+                    self.resulting_order,
+                )
+            ):
+                raise ValueError(
+                    "rename forbids delete and reorder fields"
+                )
+            return self
+
+        required = (
+            self.requested_count,
+            self.requested_names,
+            self.deleted_names,
+            self.requested_order,
+            self.resulting_order,
+        )
+        if any(value is None for value in required):
+            raise ValueError(
+                f"{self.operation} requires all batch list fields"
+            )
+        if self.pattern is not None or self.replacement is not None:
+            raise ValueError(
+                f"{self.operation} forbids rename fields"
+            )
+        assert self.requested_count is not None
+        assert self.requested_names is not None
+        assert self.deleted_names is not None
+        assert self.requested_order is not None
+        assert self.resulting_order is not None
+        if self.requested_count != len(self.requested_names):
+            raise ValueError(
+                "requested_count must match requested_names"
+            )
+        if self.operation == "delete":
+            if self.requested_order:
+                raise ValueError("delete requires an empty requested_order")
+            if self.deleted_names != self.requested_names:
+                raise ValueError(
+                    "delete names must match requested names"
+                )
+            if self.changed_count != len(self.deleted_names):
+                raise ValueError(
+                    "delete changed_count must match deleted_names"
+                )
+        else:
+            if self.deleted_names:
+                raise ValueError("reorder requires empty deleted_names")
+            if self.requested_order != self.requested_names:
+                raise ValueError(
+                    "reorder requested fields must match"
+                )
+            if self.changed_count != len(self.requested_order):
+                raise ValueError(
+                    "reorder changed_count must match requested_order"
+                )
+            if self.resulting_order[: self.requested_count] != (
+                self.requested_order
+            ):
+                raise ValueError(
+                    "reorder result must begin with requested_order"
+                )
+        return self
+
 
 class RoleRuleRecord(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     match: str
     role: str
 
 
 class RoleBatchMutationResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     rules: list[RoleRuleRecord]
@@ -529,7 +603,7 @@ class RoleBatchMutationResult(BaseModel):
 
 
 class TransitionBatchMutationResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     name: str
@@ -714,7 +788,7 @@ class TemplateListResult(BaseModel):
 
 
 class UnsupportedToolResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     supported: Literal[False] = False
@@ -729,7 +803,7 @@ class UnsupportedToolResult(BaseModel):
 
 
 class TemplateSaveResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     template: ArtifactReference
@@ -740,13 +814,13 @@ class TemplateSaveResult(BaseModel):
 
 
 class ExportResult(BaseModel):
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     schema_version: Literal["1"] = "1"
     format: Literal["resolve", "fcp7", "edl"]
     source: ArtifactReference
     artifact: ArtifactReference
-    receipt: TransactionReceiptResult | None
+    receipt: TransactionReceiptResult
 
 
 __all__ = [

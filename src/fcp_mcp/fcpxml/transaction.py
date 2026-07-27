@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -64,6 +65,28 @@ def commit_fcpxml(
     destination: str | Path,
     xml_text: str,
     validator: FCPXMLValidator | None = None,
+    validate_candidate: Callable[[Path], None] | None = None,
+    event_format: str = "text",
+    operation: str = "fcpxml_commit",
+) -> FCPXMLTransactionReceipt:
+    return commit_fcpxml_bytes(
+        source=source,
+        destination=destination,
+        xml_bytes=xml_text.encode("utf-8"),
+        validator=validator,
+        validate_candidate=validate_candidate,
+        event_format=event_format,
+        operation=operation,
+    )
+
+
+def commit_fcpxml_bytes(
+    *,
+    source: str | Path | None,
+    destination: str | Path,
+    xml_bytes: bytes,
+    validator: FCPXMLValidator | None = None,
+    validate_candidate: Callable[[Path], None] | None = None,
     event_format: str = "text",
     operation: str = "fcpxml_commit",
 ) -> FCPXMLTransactionReceipt:
@@ -89,11 +112,13 @@ def commit_fcpxml(
     def validate(path: Path) -> None:
         nonlocal latest_validation
         latest_validation = _validate(path, active_validator)
+        if validate_candidate is not None:
+            validate_candidate(path)
 
     try:
         receipt = atomic_replace_bytes(
             destination_path,
-            xml_text.encode("utf-8"),
+            xml_bytes,
             validate=validate,
             event_format=event_format,
             transaction_id=transaction_id,

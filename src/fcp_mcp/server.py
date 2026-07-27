@@ -10,7 +10,7 @@ import json
 import logging
 import subprocess
 import xml.etree.ElementTree as ET
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import asdict
 from itertools import pairwise
 from math import isfinite
@@ -46,7 +46,11 @@ from .fcpxml.puppet import (
     standard_humanoid_rig,
 )
 from .fcpxml.time_utils import RationalTime
-from .fcpxml.transaction import FCPXMLTransactionReceipt, commit_fcpxml
+from .fcpxml.transaction import (
+    FCPXMLTransactionReceipt,
+    commit_fcpxml,
+    commit_fcpxml_bytes,
+)
 from .fcpxml.validator import FCPXMLValidator
 from .fcpxml.writer import FCPXMLModifier
 from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
@@ -151,7 +155,7 @@ from .tool_metadata import (
     OFFLINE_WRITE,
     STATEFUL_WRITE,
 )
-from .utils.atomic_write import atomic_replace_bytes
+from .utils.atomic_write import AtomicWriteReceipt, atomic_replace_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -214,15 +218,32 @@ def _save_modifier(modifier: FCPXMLModifier, output_path: str = "") -> Path:
 def _save_modifier_receipt(
     modifier: FCPXMLModifier,
     output_path: str = "",
+    *,
+    validate_candidate: Callable[[Path], None] | None = None,
 ) -> FCPXMLTransactionReceipt:
     destination = _resolve_output(
         output_path,
         input_path=modifier.path,
         suffixes={".fcpxml"},
     )
-    return modifier.save_with_receipt(
-        destination,
+    if validate_candidate is None:
+        return modifier.save_with_receipt(
+            destination,
+            event_format=CONFIG.log_format,
+        )
+    ET.indent(modifier.root, space="    ")
+    xml_text = ET.tostring(
+        modifier.root,
+        encoding="unicode",
+        xml_declaration=True,
+    )
+    return commit_fcpxml(
+        source=modifier.path,
+        destination=destination,
+        xml_text=xml_text,
+        validate_candidate=validate_candidate,
         event_format=CONFIG.log_format,
+        operation="modifier_save",
     )
 
 
@@ -245,6 +266,91 @@ def _receipt_result(
         elapsed_ms=receipt.elapsed_ms,
         disposition=receipt.disposition,
     )
+
+
+def _atomic_receipt_result(
+    receipt: AtomicWriteReceipt,
+    *,
+    source: ArtifactReference,
+) -> TransactionReceiptResult:
+    return TransactionReceiptResult(
+        transaction_id=receipt.transaction_id,
+        source=source.path,
+        destination=str(receipt.destination),
+        backup_path=(
+            str(receipt.backup_path)
+            if receipt.backup_path is not None
+            else None
+        ),
+        input_sha256=source.sha256,
+        prior_sha256=receipt.prior_sha256,
+        output_sha256=receipt.output_sha256,
+        validation_warnings=[],
+        elapsed_ms=receipt.elapsed_ms,
+        disposition="committed",
+    )
+
+
+def _raise_validation_failure(message: str) -> None:
+    raise FCPMCPError(ErrorCode.VALIDATION_FAILED, message)
+
+
+def _validate_resolve_export(path: Path) -> None:
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as error:
+        raise FCPMCPError(
+            ErrorCode.VALIDATION_FAILED,
+            "Resolve export is not valid XML",
+        ) from error
+    if root.tag != "fcpxml" or root.get("version") != "1.9":
+        _raise_validation_failure(
+            "Resolve export must be FCPXML version 1.9"
+        )
+
+
+def _validate_fcp7_export(path: Path) -> None:
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as error:
+        raise FCPMCPError(
+            ErrorCode.VALIDATION_FAILED,
+            "FCP7 export is not valid XML",
+        ) from error
+    if root.tag != "xmeml" or root.get("version") != "5":
+        _raise_validation_failure(
+            "FCP7 export must be XMEML version 5"
+        )
+
+
+def _validate_edl_export(
+    path: Path,
+    *,
+    expected_edit_count: int,
+) -> None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise FCPMCPError(
+            ErrorCode.VALIDATION_FAILED,
+            "EDL export is not valid UTF-8",
+        ) from error
+    if (
+        len(lines) < 2
+        or not lines[0].startswith("TITLE: ")
+        or not lines[1].startswith("FCM: ")
+    ):
+        _raise_validation_failure(
+            "EDL export is missing its required header"
+        )
+    edit_count = sum(
+        len(line) >= 3 and line[:3].isdigit()
+        for line in lines
+    )
+    if edit_count != expected_edit_count:
+        _raise_validation_failure(
+            "EDL export edit count is inconsistent"
+        )
 
 
 def _artifact_reference(
@@ -345,26 +451,31 @@ def _save_generator_receipt(
     output_path: str,
     *,
     default_name: str,
+    validate_candidate: Callable[[Path], None] | None = None,
 ) -> FCPXMLTransactionReceipt:
     destination = _resolve_output(
         output_path,
         default_name=default_name,
         suffixes={".fcpxml"},
     )
-    return generator.save_with_receipt(
-        destination,
+    return commit_fcpxml(
+        source=None,
+        destination=destination,
+        xml_text=f"{generator.to_string()}\n",
+        validate_candidate=validate_candidate,
         event_format=CONFIG.log_format,
+        operation="generator_save",
     )
 
 
-def _generation_result(
-    receipt: FCPXMLTransactionReceipt,
-) -> FCPXMLGenerationResult:
-    root = _committed_root(receipt)
+def _generation_evidence(path: Path) -> tuple[str, int, float]:
+    root = ET.parse(path).getroot()
     project = next(root.iter("project"), None)
     spine = root.find(".//spine")
     if project is None or spine is None:
-        raise RuntimeError("Committed FCPXML is missing generation evidence")
+        _raise_validation_failure(
+            "Generated FCPXML is missing project or timeline evidence"
+        )
     selected = [child for child in spine if child.tag != "transition"]
     duration_seconds = sum(
         RationalTime.from_fcpxml(
@@ -372,10 +483,32 @@ def _generation_result(
         ).to_seconds()
         for child in selected
     )
-    return FCPXMLGenerationResult(
-        project=project.get("name", ""),
-        selected_clip_count=len(selected),
-        target_duration_seconds=duration_seconds,
+    return project.get("name", ""), len(selected), duration_seconds
+
+
+def _save_generation_result(
+    generator: FCPXMLGenerator,
+    output_path: str,
+    *,
+    default_name: str,
+) -> tuple[FCPXMLTransactionReceipt, FCPXMLGenerationResult]:
+    evidence = ("", 0, 0.0)
+
+    def validate_generation(candidate: Path) -> None:
+        nonlocal evidence
+        evidence = _generation_evidence(candidate)
+
+    receipt = _save_generator_receipt(
+        generator,
+        output_path,
+        default_name=default_name,
+        validate_candidate=validate_generation,
+    )
+    project, selected_clip_count, target_duration_seconds = evidence
+    return receipt, FCPXMLGenerationResult(
+        project=project,
+        selected_clip_count=selected_clip_count,
+        target_duration_seconds=target_duration_seconds,
         destination=_artifact_reference(receipt),
         receipt=_receipt_result(receipt),
     )
@@ -2089,12 +2222,11 @@ def fcpxml_create_project(
                               frame_duration=frame_duration)
     gen.create_project(name=name, format_ref=fmt_ref, event_name=event_name)
 
-    receipt = _save_generator_receipt(
+    receipt, structured = _save_generation_result(
         gen,
         output_path,
         default_name=f"{name}.fcpxml",
     )
-    structured = _generation_result(receipt)
     return ToolOutcome(
         text=f"Project created: {receipt.destination}",
         structured=structured,
@@ -2128,12 +2260,11 @@ def fcpxml_create_timeline(
     gen = FCPXMLGenerator()
     gen.build_timeline_from_clips(clips, project_name=project_name,
                                    format_name=format_name, event_name=event_name)
-    receipt = _save_generator_receipt(
+    receipt, structured = _save_generation_result(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
     )
-    structured = _generation_result(receipt)
     return ToolOutcome(
         text=(
             f"Timeline created with {structured.selected_clip_count} clips: "
@@ -2225,12 +2356,11 @@ def fcpxml_auto_rough_cut(
 
         running_total = running_total + clip_dur
 
-    receipt = _save_generator_receipt(
+    receipt, structured = _save_generation_result(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
     )
-    structured = _generation_result(receipt)
     return ToolOutcome(
         text=(
             "Rough cut created "
@@ -2290,12 +2420,11 @@ def fcpxml_generate_montage(
             gen.add_transition(spine, duration=transition_duration,
                                 effect_ref=trans_ref)
 
-    receipt = _save_generator_receipt(
+    receipt, structured = _save_generation_result(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
     )
-    structured = _generation_result(receipt)
     return ToolOutcome(
         text=(
             f"Montage created ({structured.selected_clip_count} shots): "
@@ -2352,6 +2481,9 @@ def fcpxml_import_srt(
 
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     import xml.etree.ElementTree as ET
+    prior_subtitle_count = len(
+        mod.root.findall(".//title[@role='Titles.Subtitle']")
+    )
 
     # Find or create title effect
     title_ref = ""
@@ -2402,15 +2534,24 @@ def fcpxml_import_srt(
         param.set("key", "Text")
         param.set("value", sub["text"])
 
-    receipt = _save_modifier_receipt(mod, output_path)
-    root = _committed_root(receipt)
-    cue_count = len(
-        root.findall(".//title[@role='Titles.Subtitle']")
-    )
-    if cue_count != len(subtitles):
-        raise RuntimeError(
-            "Committed FCPXML subtitle count does not match the import"
+    cue_count = len(subtitles)
+
+    def validate_subtitle_delta(candidate: Path) -> None:
+        candidate_count = len(
+            ET.parse(candidate).getroot().findall(
+                ".//title[@role='Titles.Subtitle']"
+            )
         )
+        if candidate_count - prior_subtitle_count != cue_count:
+            _raise_validation_failure(
+                "Subtitle import count does not match its candidate output"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_subtitle_delta,
+    )
     return ToolOutcome(
         text=(
             f"{cue_count} subtitles added. Saved to: "
@@ -2487,17 +2628,26 @@ def fcpxml_import_edl(
             ErrorCode.INVALID_ARGUMENTS,
             "EDL contains no parseable edit events",
         )
+    event_count = 0
+
+    def validate_edl_import(candidate: Path) -> None:
+        nonlocal event_count
+        event_count = len(
+            ET.parse(candidate).getroot().findall(
+                ".//spine/asset-clip"
+            )
+        )
+        if event_count != clip_count:
+            _raise_validation_failure(
+                "EDL import event count does not match its candidate output"
+            )
+
     receipt = _save_generator_receipt(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
+        validate_candidate=validate_edl_import,
     )
-    root = _committed_root(receipt)
-    event_count = len(root.findall(".//spine/asset-clip"))
-    if event_count != clip_count:
-        raise RuntimeError(
-            "Committed FCPXML event count does not match the EDL import"
-        )
     return ToolOutcome(
         text=f"EDL imported ({event_count} clips): {receipt.destination}",
         structured=EDLImportResult(
@@ -2547,20 +2697,49 @@ def fcpxml_reformat(
         fmt_el.set("name", target_format_name)
         break
 
-    receipt = _save_modifier_receipt(mod, output_path)
-    root = _committed_root(receipt)
-    committed_format = next(root.iter("format"), None)
-    if committed_format is None:
-        raise RuntimeError("Committed FCPXML format resource is missing")
-    committed_width = int(committed_format.get("width", "0"))
-    committed_height = int(committed_format.get("height", "0"))
-    committed_name = committed_format.get("name", "")
-    if (
-        committed_width != target_width
-        or committed_height != target_height
-        or committed_name != target_format_name
-    ):
-        raise RuntimeError("Committed FCPXML format does not match reformat")
+    target_version = ""
+    committed_width = 0
+    committed_height = 0
+    committed_name = ""
+
+    def validate_reformat(candidate: Path) -> None:
+        nonlocal target_version
+        nonlocal committed_width
+        nonlocal committed_height
+        nonlocal committed_name
+        root = ET.parse(candidate).getroot()
+        candidate_format = next(root.iter("format"), None)
+        if candidate_format is None:
+            _raise_validation_failure(
+                "Reformat candidate is missing its format resource"
+            )
+        try:
+            candidate_width = int(candidate_format.get("width", "0"))
+            candidate_height = int(candidate_format.get("height", "0"))
+        except ValueError as error:
+            raise FCPMCPError(
+                ErrorCode.VALIDATION_FAILED,
+                "Reformat candidate dimensions are not integers",
+            ) from error
+        candidate_name = candidate_format.get("name", "")
+        if (
+            candidate_width != target_width
+            or candidate_height != target_height
+            or candidate_name != target_format_name
+        ):
+            _raise_validation_failure(
+                "Reformat candidate does not match the requested format"
+            )
+        target_version = root.get("version", "")
+        committed_width = candidate_width
+        committed_height = candidate_height
+        committed_name = candidate_name
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_reformat,
+    )
     return ToolOutcome(
         text=(
             f"Reformatted to {committed_width}x{committed_height}. "
@@ -2568,7 +2747,7 @@ def fcpxml_reformat(
         ),
         structured=FCPXMLMutationResult(
             source_version=source_version,
-            target_version=root.get("version", ""),
+            target_version=target_version,
             target_width=committed_width,
             target_height=committed_height,
             target_format_name=committed_name,
@@ -2604,23 +2783,32 @@ def fcpxml_fix_flash_frames(
     _parse_time(frame_duration, "frame_duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.fix_flash_frames(min_frames, frame_duration)
-    receipt = _save_modifier_receipt(mod, output_path)
-    root = _committed_root(receipt)
     minimum = RationalTime.from_fcpxml(frame_duration) * min_frames
-    remaining = [
-        element
-        for spine in root.iter("spine")
-        for element in spine
-        if element.tag not in {"gap", "transition"}
-        and not RationalTime.from_fcpxml(
-            element.get("duration", "0s")
-        ).is_zero
-        and RationalTime.from_fcpxml(
-            element.get("duration", "0s")
-        ) < minimum
-    ]
-    if remaining:
-        raise RuntimeError("Committed FCPXML still contains flash frames")
+
+    def validate_flash_fix(candidate: Path) -> None:
+        root = ET.parse(candidate).getroot()
+        remaining = [
+            element
+            for spine in root.iter("spine")
+            for element in spine
+            if element.tag not in {"gap", "transition"}
+            and not RationalTime.from_fcpxml(
+                element.get("duration", "0s")
+            ).is_zero
+            and RationalTime.from_fcpxml(
+                element.get("duration", "0s")
+            ) < minimum
+        ]
+        if remaining:
+            _raise_validation_failure(
+                "Flash-frame candidate still contains short clips"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_flash_fix,
+    )
     return ToolOutcome(
         text=(
             f"{count} flash frames fixed. Saved to: "
@@ -2668,14 +2856,23 @@ def fcpxml_fill_gaps(
         for spine in mod.root.iter("spine")
     )
     count = mod.fill_gaps(fill_asset_ref, fill_name)
-    receipt = _save_modifier_receipt(mod, output_path)
-    root = _committed_root(receipt)
-    committed_gap_count = sum(
-        len(spine.findall("gap"))
-        for spine in root.iter("spine")
+
+    def validate_gap_fill(candidate: Path) -> None:
+        root = ET.parse(candidate).getroot()
+        candidate_gap_count = sum(
+            len(spine.findall("gap"))
+            for spine in root.iter("spine")
+        )
+        if prior_gap_count - candidate_gap_count != count:
+            _raise_validation_failure(
+                "Gap-fill count does not match its candidate output"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_gap_fill,
     )
-    if prior_gap_count - committed_gap_count != count:
-        raise RuntimeError("Committed FCPXML gap count does not match fill")
     return ToolOutcome(
         text=f"{count} gaps filled. Saved to: {receipt.destination}",
         structured=CleanupMutationResult(
@@ -2723,16 +2920,23 @@ def fcpxml_remove_silence(
                 count += 1
         if count > 0:
             mod._recalculate_offsets(spine_el)
-    receipt = _save_modifier_receipt(mod, output_path)
-    root = _committed_root(receipt)
-    committed_gap_count = sum(
-        len(spine.findall("gap"))
-        for spine in root.iter("spine")
-    )
-    if prior_gap_count - committed_gap_count != count:
-        raise RuntimeError(
-            "Committed FCPXML gap count does not match silence removal"
+
+    def validate_silence_removal(candidate: Path) -> None:
+        root = ET.parse(candidate).getroot()
+        candidate_gap_count = sum(
+            len(spine.findall("gap"))
+            for spine in root.iter("spine")
         )
+        if prior_gap_count - candidate_gap_count != count:
+            _raise_validation_failure(
+                "Silence-removal count does not match its candidate output"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_silence_removal,
+    )
     return ToolOutcome(
         text=f"{count} gaps removed. Saved to: {receipt.destination}",
         structured=CleanupMutationResult(
@@ -2776,21 +2980,38 @@ def fcpxml_batch_rename_clips(
             ErrorCode.TARGET_NOT_FOUND,
             f"No clip name contains pattern '{pattern}'",
         )
-    receipt = _save_modifier_receipt(mod, output_path)
-    committed_names = [
+    expected_names = [
         element.get("name")
-        for element in _committed_root(receipt).iter()
+        for element in mod.root.iter()
     ]
-    verified_count = sum(
-        before != after
-        for before, after in zip(
-            prior_names,
-            committed_names,
-            strict=True,
+
+    def validate_batch_rename(candidate: Path) -> None:
+        candidate_names = [
+            element.get("name")
+            for element in ET.parse(candidate).getroot().iter()
+        ]
+        if candidate_names != expected_names:
+            _raise_validation_failure(
+                "Rename candidate does not match the requested names"
+            )
+        verified_count = sum(
+            before != after
+            for before, after in zip(
+                prior_names,
+                candidate_names,
+                strict=True,
+            )
         )
+        if verified_count != count:
+            _raise_validation_failure(
+                "Rename count does not match its candidate output"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_batch_rename,
     )
-    if verified_count != count:
-        raise RuntimeError("Committed FCPXML rename count is inconsistent")
     return ToolOutcome(
         text=f"{count} clips renamed. Saved to: {receipt.destination}",
         structured=ClipBatchMutationResult(
@@ -2837,34 +3058,68 @@ def fcpxml_batch_assign_roles(
             ErrorCode.TARGET_NOT_FOUND,
             "No clips matched the supplied role rules",
         )
-    receipt = _save_modifier_receipt(mod, output_path)
-    committed_matches = 0
-    for element in _committed_root(receipt).iter():
-        if element.tag not in {
+    role_tags = {
+        "asset-clip",
+        "clip",
+        "title",
+        "audio",
+        "video",
+    }
+    expected_roles = [
+        (element.tag, element.get("name"), element.get("role"))
+        for element in mod.root.iter()
+        if element.tag in role_tags
+    ]
+
+    def validate_role_assignment(candidate: Path) -> None:
+        candidate_elements = [
+            element
+            for element in ET.parse(candidate).getroot().iter()
+            if element.tag in role_tags
+        ]
+        candidate_roles = [
+            (element.tag, element.get("name"), element.get("role"))
+            for element in candidate_elements
+        ]
+        if candidate_roles != expected_roles:
+            _raise_validation_failure(
+                "Role-assignment candidate does not match requested roles"
+            )
+        candidate_matches = 0
+        for element in candidate_elements:
+            if element.tag not in {
             "asset-clip",
             "clip",
             "title",
             "audio",
             "video",
-        }:
-            continue
-        element_name = element.get("name", "")
-        matching_rule = next(
-            (
-                rule
-                for rule in rules
-                if rule["match"].lower() in element_name.lower()
-            ),
-            None,
-        )
-        if matching_rule is not None:
-            if element.get("role") != matching_rule["role"]:
-                raise RuntimeError(
-                    "Committed FCPXML role does not match assignment"
-                )
-            committed_matches += 1
-    if committed_matches != count:
-        raise RuntimeError("Committed FCPXML role count is inconsistent")
+            }:
+                continue
+            element_name = element.get("name", "")
+            matching_rule = next(
+                (
+                    rule
+                    for rule in rules
+                    if rule["match"].lower() in element_name.lower()
+                ),
+                None,
+            )
+            if matching_rule is not None:
+                if element.get("role") != matching_rule["role"]:
+                    _raise_validation_failure(
+                        "Role-assignment candidate contains a wrong role"
+                    )
+                candidate_matches += 1
+        if candidate_matches != count:
+            _raise_validation_failure(
+                "Role-assignment count does not match candidate output"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_role_assignment,
+    )
     return ToolOutcome(
         text=f"{count} roles assigned. Saved to: {receipt.destination}",
         structured=RoleBatchMutationResult(
@@ -2914,16 +3169,46 @@ def fcpxml_batch_apply_transition(
             ErrorCode.TARGET_NOT_FOUND,
             "No adjacent clips were available for transitions",
         )
-    receipt = _save_modifier_receipt(mod, output_path)
-    committed_matching = sum(
-        element.get("name") == name
-        and element.get("duration") == duration
-        for element in _committed_root(receipt).iter("transition")
-    )
-    if committed_matching - prior_matching != count:
-        raise RuntimeError(
-            "Committed FCPXML transition count is inconsistent"
+    expected_transitions = [
+        (
+            element.get("name"),
+            element.get("duration"),
+            element.get("offset"),
+            element.get("ref"),
         )
+        for element in mod.root.iter("transition")
+    ]
+
+    def validate_transition_batch(candidate: Path) -> None:
+        root = ET.parse(candidate).getroot()
+        candidate_transitions = [
+            (
+                element.get("name"),
+                element.get("duration"),
+                element.get("offset"),
+                element.get("ref"),
+            )
+            for element in root.iter("transition")
+        ]
+        if candidate_transitions != expected_transitions:
+            _raise_validation_failure(
+                "Transition candidate does not match requested transitions"
+            )
+        candidate_matching = sum(
+            element.get("name") == name
+            and element.get("duration") == duration
+            for element in root.iter("transition")
+        )
+        if candidate_matching - prior_matching != count:
+            _raise_validation_failure(
+                "Transition count does not match its candidate output"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_transition_batch,
+    )
     return ToolOutcome(
         text=(
             f"{count} transitions added. Saved to: "
@@ -3573,16 +3858,23 @@ def fcpxml_save_template(
         suffixes={".fcpxml"},
     )
     source_reference = _artifact_reference_for_path(src)
-    receipt = commit_fcpxml(
+
+    def validate_template_copy(candidate: Path) -> None:
+        candidate_reference = _artifact_reference_for_path(candidate)
+        if candidate_reference.sha256 != source_reference.sha256:
+            _raise_validation_failure(
+                "Template candidate does not match its source bytes"
+            )
+
+    receipt = commit_fcpxml_bytes(
         source=src,
         destination=dest,
-        xml_text=src.read_text(encoding="utf-8"),
+        xml_bytes=src.read_bytes(),
+        validate_candidate=validate_template_copy,
         event_format=CONFIG.log_format,
         operation="save_template",
     )
-    template_reference = _artifact_reference_for_path(receipt.destination)
-    if template_reference.sha256 != source_reference.sha256:
-        raise RuntimeError("Committed template does not match its source")
+    template_reference = _artifact_reference(receipt)
     return ToolOutcome(
         text=f"Template saved: {receipt.destination}",
         structured=TemplateSaveResult(
@@ -4035,10 +4327,11 @@ def fcpxml_export_resolve(
         output_path = str(
             mod.path.parent / f"{mod.path.stem}_resolve.fcpxml"
         )
-    receipt = _save_modifier_receipt(mod, output_path)
-    committed_root = _committed_root(receipt)
-    if committed_root.get("version") != "1.9":
-        raise RuntimeError("Committed Resolve export has the wrong version")
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=_validate_resolve_export,
+    )
     return ToolOutcome(
         text=(
             "Resolve-compatible FCPXML saved: "
@@ -4147,10 +4440,9 @@ def fcpxml_export_fcp7(
     write_receipt = atomic_replace_bytes(
         destination,
         f"{xml_text}\n".encode(),
+        validate=_validate_fcp7_export,
         event_format=CONFIG.log_format,
     )
-    if ET.parse(write_receipt.destination).getroot().tag != "xmeml":
-        raise RuntimeError("Committed FCP7 export is not XMEML")
     return ToolOutcome(
         text=f"FCP7 XML saved: {write_receipt.destination}",
         structured=ExportResult(
@@ -4160,7 +4452,10 @@ def fcpxml_export_fcp7(
                 write_receipt.destination,
                 media_type="application/xml",
             ),
-            receipt=None,
+            receipt=_atomic_receipt_result(
+                write_receipt,
+                source=source_reference,
+            ),
         ),
     )
 
@@ -4221,17 +4516,13 @@ def fcpxml_export_edl(
     write_receipt = atomic_replace_bytes(
         destination,
         edl_content.encode(),
+        validate=lambda candidate: _validate_edl_export(
+            candidate,
+            expected_edit_count=edit_num - 1,
+        ),
         event_format=CONFIG.log_format,
     )
-    committed_lines = write_receipt.destination.read_text(
-        encoding="utf-8"
-    ).splitlines()
-    committed_edit_count = sum(
-        len(line) >= 3 and line[:3].isdigit()
-        for line in committed_lines
-    )
-    if committed_edit_count != edit_num - 1:
-        raise RuntimeError("Committed EDL edit count is inconsistent")
+    committed_edit_count = edit_num - 1
     return ToolOutcome(
         text=(
             f"EDL exported ({committed_edit_count} edits): "
@@ -4244,7 +4535,10 @@ def fcpxml_export_edl(
                 write_receipt.destination,
                 media_type="text/x-cmx3600",
             ),
-            receipt=None,
+            receipt=_atomic_receipt_result(
+                write_receipt,
+                source=source_reference,
+            ),
         ),
     )
 

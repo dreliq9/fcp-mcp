@@ -34,7 +34,7 @@ class LegacyTextResult(BaseModel):
 class ArtifactReference(BaseModel):
     """A committed artifact whose identity is bound to its bytes."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
 
     path: str
     media_type: MediaType
