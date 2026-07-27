@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-BoundedText = Annotated[
-    str,
-    StringConstraints(strict=True, min_length=1, max_length=2000),
-]
 WarningText = Annotated[
     str,
     StringConstraints(strict=True, min_length=1, max_length=1000),
@@ -24,6 +21,34 @@ Identifier = Annotated[
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]*$",
     ),
 ]
+NonnegativeFiniteNumber = Annotated[
+    int | float,
+    Field(ge=0, allow_inf_nan=False),
+]
+PositiveInteger = Annotated[int, Field(gt=0)]
+
+_SHORTCUT_MODIFIER_ALIASES = {
+    "cmd": "command",
+    "command": "command",
+    "shift": "shift",
+    "opt": "option",
+    "option": "option",
+    "alt": "option",
+    "ctrl": "control",
+    "control": "control",
+}
+_SHORTCUT_SPECIAL_KEYS = frozenset(
+    {"space", "return", "escape", "left", "right", "up", "down"}
+)
+_COMPRESSOR_JOB_IDENTIFIER = re.compile(
+    r"Job ID: ([A-Za-z0-9][A-Za-z0-9._:-]{0,127})(?:\r?\n)?",
+)
+
+
+def parse_compressor_job_identifier(stdout: str) -> str | None:
+    """Parse one sanctioned identifier-only Compressor stdout response."""
+    match = _COMPRESSOR_JOB_IDENTIFIER.fullmatch(stdout)
+    return match.group(1) if match is not None else None
 
 
 class StrictFrozenModel(BaseModel):
@@ -104,12 +129,25 @@ class FCPCollectionResult(StrictFrozenModel):
                 and self.parent_filter.field != expected_filter
             ):
                 raise ValueError("parent_filter does not match collection_type")
+            if self.parent_filter is not None:
+                if self.collection_type == "events" and any(
+                    not isinstance(record, EventRecord)
+                    or record.library != self.parent_filter.value
+                    for record in self.records
+                ):
+                    raise ValueError("event records do not match parent_filter")
+                if self.collection_type == "projects" and any(
+                    not isinstance(record, ProjectRecord)
+                    or record.event != self.parent_filter.value
+                    for record in self.records
+                ):
+                    raise ValueError("project records do not match parent_filter")
         return self
 
 
 class FCPTimeObservation(StrictFrozenModel):
-    value: int | float
-    timescale: int | float
+    value: NonnegativeFiniteNumber
+    timescale: PositiveInteger
 
 
 class FCPTimelineSelectionRange(StrictFrozenModel):
@@ -129,13 +167,19 @@ class FCPTimelineInfoResult(StrictFrozenModel):
     selection_range: FCPTimelineSelectionRange | None
     warnings: Annotated[list[WarningText], Field(max_length=20)]
 
+    @model_validator(mode="after")
+    def validate_frame_duration(self) -> Self:
+        if self.frame_duration is not None and self.frame_duration.value <= 0:
+            raise ValueError("frame_duration value must be positive")
+        return self
+
 
 class FCPAppStateResult(StrictFrozenModel):
     schema_version: Literal["1"] = "1"
     name: str
     version: str
     frontmost: bool
-    library_count: int
+    library_count: Annotated[int, Field(ge=0)]
 
 
 class CompressorCustomSettingRecord(StrictFrozenModel):
@@ -242,6 +286,37 @@ class FCPKeyboardShortcutRequest(StrictFrozenModel):
     key: str
     modifiers: list[Literal["command", "shift", "option", "control"]]
 
+    @model_validator(mode="after")
+    def validate_canonical_shortcut(self) -> Self:
+        tokens = [token.strip().lower() for token in self.keys.split("+")]
+        if not self.keys.strip() or any(not token for token in tokens):
+            raise ValueError("keys must contain one key and optional modifiers")
+        expected_modifiers: list[str] = []
+        key_tokens: list[str] = []
+        for token in tokens:
+            modifier = _SHORTCUT_MODIFIER_ALIASES.get(token)
+            if modifier is None:
+                key_tokens.append(token)
+            elif modifier in expected_modifiers:
+                raise ValueError("keys contain a duplicate modifier")
+            else:
+                expected_modifiers.append(modifier)
+        if len(key_tokens) != 1:
+            raise ValueError("keys must contain exactly one key")
+        expected_key = key_tokens[0]
+        if not (
+            (
+                len(expected_key) == 1
+                and expected_key.isascii()
+                and expected_key.isalnum()
+            )
+            or expected_key in _SHORTCUT_SPECIAL_KEYS
+        ):
+            raise ValueError("keys contain an unsupported shortcut key")
+        if self.key != expected_key or self.modifiers != expected_modifiers:
+            raise ValueError("key and modifiers must be canonical for keys")
+        return self
+
 
 class FCPShareRequest(StrictFrozenModel):
     destination: str
@@ -252,21 +327,11 @@ class LiveActionResult(StrictFrozenModel):
     action: str
     request: StrictFrozenModel
     raw_response: str
-    verification_status: VerificationStatus
-    observed_outcome: BoundedText | None
-    warnings: Annotated[list[WarningText], Field(max_length=20)]
-
-    @model_validator(mode="after")
-    def validate_verification_evidence(self) -> Self:
-        if self.verification_status is VerificationStatus.UNVERIFIED:
-            if self.observed_outcome is not None:
-                raise ValueError("unverified actions cannot claim an observed outcome")
-            if not self.warnings:
-                raise ValueError("unverified actions require a warning")
-        elif self.verification_status is VerificationStatus.VERIFIED:
-            if self.observed_outcome is None:
-                raise ValueError("verified actions require an observed outcome")
-        return self
+    verification_status: Literal[
+        VerificationStatus.UNVERIFIED
+    ] = VerificationStatus.UNVERIFIED
+    observed_outcome: None = None
+    warnings: Annotated[list[WarningText], Field(min_length=1, max_length=20)]
 
 
 class FCPOpenLibraryResult(LiveActionResult):
@@ -348,6 +413,39 @@ class CompressorSubmissionResult(StrictFrozenModel):
     job_identifier: Identifier | None
     warnings: Annotated[list[WarningText], Field(min_length=1, max_length=20)]
 
+    @model_validator(mode="after")
+    def validate_command_evidence(self) -> Self:
+        if self.command.returncode != 0:
+            raise ValueError("command returncode must be zero")
+        if not self.command.argv:
+            raise ValueError("command argv must not be empty")
+        executable = self.command.argv[0]
+        if not executable:
+            raise ValueError("command executable must not be empty")
+        expected_argv = [
+            executable,
+            "-batchName",
+            self.request.batch_name,
+            "-jobpath",
+            self.request.source_path,
+        ]
+        if self.request.setting_path is not None:
+            expected_argv.extend(
+                ["-settingpath", self.request.setting_path]
+            )
+        if self.request.output_directory is not None:
+            expected_argv.extend(
+                ["-locationpath", self.request.output_directory]
+            )
+        if self.command.argv != expected_argv:
+            raise ValueError("command argv does not match request")
+        parsed_identifier = parse_compressor_job_identifier(
+            self.command.stdout
+        )
+        if self.job_identifier != parsed_identifier:
+            raise ValueError("job_identifier does not match command stdout")
+        return self
+
 
 __all__ = [
     "CompressorCLIInformationRecord",
@@ -385,4 +483,5 @@ __all__ = [
     "LibraryRecord",
     "ProjectRecord",
     "VerificationStatus",
+    "parse_compressor_job_identifier",
 ]

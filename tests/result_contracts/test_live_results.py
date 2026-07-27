@@ -7,6 +7,7 @@ import pytest
 from pydantic import ValidationError
 
 import fcp_mcp.automation.osascript as automation
+import fcp_mcp.result_models.live as live_models
 import fcp_mcp.utils.paths as utility_paths
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
@@ -665,3 +666,602 @@ async def test_registered_output_schema_titles_match_all_19_models():
         name: tools[name].outputSchema["title"]
         for name in EXPECTED_LIVE_RESULT_MODELS
     } == EXPECTED_LIVE_RESULT_MODELS
+
+
+ACTION_MODEL_CASES = [
+    (
+        live_models.FCPOpenLibraryResult,
+        live_models.FCPOpenLibraryRequest(library_path="/tmp/Library.fcpbundle"),
+    ),
+    (
+        live_models.FCPImportXMLResult,
+        live_models.FCPImportXMLRequest(fcpxml_path="/tmp/import.fcpxml"),
+    ),
+    (live_models.FCPExportXMLResult, live_models.EmptyActionRequest()),
+    (
+        live_models.FCPPlaybackResult,
+        live_models.FCPPlaybackRequest(playback_action="play", key="l"),
+    ),
+    (
+        live_models.FCPNavigateResult,
+        live_models.FCPNavigateRequest(
+            timecode="00:01:30:00",
+            normalized_timecode="00013000",
+        ),
+    ),
+    (
+        live_models.FCPSelectToolResult,
+        live_models.FCPSelectToolRequest(tool="blade", key="b"),
+    ),
+    (live_models.FCPUndoResult, live_models.EmptyActionRequest()),
+    (live_models.FCPRedoResult, live_models.EmptyActionRequest()),
+    (
+        live_models.FCPMenuCommandResult,
+        live_models.FCPMenuCommandRequest(
+            menu_path="File > Export XML...",
+            components=["File", "Export XML..."],
+        ),
+    ),
+    (
+        live_models.FCPKeyboardShortcutResult,
+        live_models.FCPKeyboardShortcutRequest(
+            keys="cmd+shift+e",
+            key="e",
+            modifiers=["command", "shift"],
+        ),
+    ),
+    (
+        live_models.FCPShareResult,
+        live_models.FCPShareRequest(destination="Apple Devices 4K"),
+    ),
+]
+
+
+@pytest.mark.parametrize(("result_model", "action_request"), ACTION_MODEL_CASES)
+@pytest.mark.parametrize(
+    ("status", "observed_outcome"),
+    [
+        (VerificationStatus.VERIFIED, "fabricated observation"),
+        (VerificationStatus.FAILED, None),
+    ],
+)
+def test_fcp_action_contracts_reject_non_unverified_statuses(
+    result_model,
+    action_request,
+    status,
+    observed_outcome,
+):
+    with pytest.raises(ValidationError):
+        result_model(
+            request=action_request,
+            raw_response="command returned",
+            verification_status=status,
+            observed_outcome=observed_outcome,
+            warnings=["No independent observation was made."],
+        )
+
+
+@pytest.mark.asyncio
+async def test_fcp_action_output_schemas_admit_only_unverified_evidence():
+    tools = {tool.name: tool for tool in await server.mcp.list_tools()}
+    action_names = [
+        name
+        for name in EXPECTED_LIVE_RESULT_MODELS
+        if name.startswith("fcp_")
+        and name
+        not in {
+            "fcp_is_running",
+            "fcp_get_libraries",
+            "fcp_get_events",
+            "fcp_get_projects",
+            "fcp_get_timeline_info",
+            "fcp_get_app_state",
+        }
+    ]
+
+    for name in action_names:
+        properties = tools[name].outputSchema["properties"]
+        assert properties["verification_status"] == {
+            "const": "unverified",
+            "default": "unverified",
+            "title": "Verification Status",
+            "type": "string",
+        }
+        assert properties["observed_outcome"]["type"] == "null"
+        assert properties["warnings"]["minItems"] == 1
+        serialized = json.dumps(tools[name].outputSchema, sort_keys=True)
+        assert '"verified"' not in serialized
+        assert '"failed"' not in serialized
+
+
+@pytest.mark.parametrize(
+    ("keys", "key", "modifiers"),
+    [
+        ("cmd+shift+e", "x", ["command", "shift"]),
+        ("cmd+shift+e", "e", ["shift", "command"]),
+        ("alt+space", "space", ["alt"]),
+        ("control+left", "left", []),
+    ],
+)
+def test_keyboard_shortcut_request_rejects_cross_field_mismatches(
+    keys,
+    key,
+    modifiers,
+):
+    with pytest.raises(ValidationError):
+        live_models.FCPKeyboardShortcutRequest(
+            keys=keys,
+            key=key,
+            modifiers=modifiers,
+        )
+
+
+@pytest.mark.parametrize(
+    ("keys", "key", "modifiers"),
+    [
+        ("shift+cmd+E", "e", ["shift", "command"]),
+        ("alt+space", "space", ["option"]),
+        ("ctrl+left", "left", ["control"]),
+    ],
+)
+def test_keyboard_shortcut_request_accepts_canonical_aliases_and_order(
+    keys,
+    key,
+    modifiers,
+):
+    request = live_models.FCPKeyboardShortcutRequest(
+        keys=keys,
+        key=key,
+        modifiers=modifiers,
+    )
+
+    assert request.key == key
+    assert request.modifiers == modifiers
+
+
+@pytest.mark.parametrize(
+    "raw_constant",
+    ["NaN", "Infinity", "-Infinity", "1e999"],
+)
+def test_timeline_handler_rejects_non_finite_json_numbers(
+    monkeypatch,
+    raw_constant,
+):
+    raw = (
+        '{"library":"Library","event":"Event","project":"Project",'
+        f'"duration":{{"value":{raw_constant},"timescale":30}},'
+        '"frameDuration":{"value":1,"timescale":30},"tcFormat":"NDF"}'
+    )
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    with pytest.raises(FCPMCPError, match="command_failed"):
+        server.fcp_get_timeline_info()
+
+
+@pytest.mark.parametrize("timescale", [0, -1, 29.97])
+def test_timeline_handler_rejects_nonpositive_or_fractional_timescale(
+    monkeypatch,
+    timescale,
+):
+    raw = (
+        '{"library":"Library","event":"Event","project":"Project",'
+        f'"duration":{{"value":0,"timescale":{timescale}}},'
+        '"frameDuration":{"value":1,"timescale":30},"tcFormat":"NDF"}'
+    )
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    with pytest.raises(FCPMCPError, match="command_failed"):
+        server.fcp_get_timeline_info()
+
+
+@pytest.mark.parametrize(
+    ("duration_value", "frame_value"),
+    [(-1, 1), (0, 0)],
+)
+def test_timeline_handler_rejects_negative_duration_or_zero_frame_duration(
+    monkeypatch,
+    duration_value,
+    frame_value,
+):
+    raw = (
+        '{"library":"Library","event":"Event","project":"Project",'
+        f'"duration":{{"value":{duration_value},"timescale":30}},'
+        f'"frameDuration":{{"value":{frame_value},"timescale":30}},'
+        '"tcFormat":"NDF"}'
+    )
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    with pytest.raises(FCPMCPError, match="command_failed"):
+        server.fcp_get_timeline_info()
+
+
+def test_timeline_numeric_boundary_values_are_valid(monkeypatch):
+    raw = (
+        '{"library":"Library","event":"Event","project":"Project",'
+        '"duration":{"value":0,"timescale":1},'
+        '"frameDuration":{"value":1,"timescale":1},"tcFormat":null}'
+    )
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    structured = server.fcp_get_timeline_info().structured
+
+    assert structured.duration == live_models.FCPTimeObservation(
+        value=0,
+        timescale=1,
+    )
+    assert structured.frame_duration == live_models.FCPTimeObservation(
+        value=1,
+        timescale=1,
+    )
+
+
+@pytest.mark.parametrize("library_count", [-1, "NaN"])
+def test_app_state_rejects_negative_or_nonstandard_library_count(
+    monkeypatch,
+    library_count,
+):
+    encoded_count = (
+        library_count if isinstance(library_count, str) else str(library_count)
+    )
+    raw = (
+        '{"name":"Final Cut Pro","version":"11.1","frontmost":true,'
+        f'"libraryCount":{encoded_count}}}'
+    )
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    with pytest.raises(FCPMCPError, match="command_failed"):
+        server.fcp_get_app_state()
+
+
+def test_app_state_accepts_zero_library_count(monkeypatch):
+    raw = (
+        '{"name":"Final Cut Pro","version":"11.1","frontmost":true,'
+        '"libraryCount":0}'
+    )
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    assert server.fcp_get_app_state().structured.library_count == 0
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "arguments", "raw"),
+    [
+        (
+            "fcp_get_libraries",
+            (),
+            '[{"kind":"library","name":"Library","id":"lib-1","file":"/tmp/L"}]',
+        ),
+        (
+            "fcp_get_libraries",
+            (),
+            '[{"name":"Library","id":"lib-1"}]',
+        ),
+        (
+            "fcp_get_events",
+            ("Library",),
+            (
+                '[{"library":"Library","name":"Event","id":"event-1",'
+                '"unexpected":true}]'
+            ),
+        ),
+        (
+            "fcp_get_projects",
+            ("Event",),
+            (
+                '[{"library":"Library","event":"Event","name":"Project",'
+                '"id":"project-1"}]'
+            ),
+        ),
+    ],
+)
+def test_collection_handler_rejects_nonexact_raw_record_keys(
+    monkeypatch,
+    handler_name,
+    arguments,
+    raw,
+):
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    with pytest.raises(FCPMCPError, match="command_failed"):
+        getattr(server, handler_name)(*arguments)
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "filter_value", "raw"),
+    [
+        (
+            "fcp_get_events",
+            "Requested Library",
+            '[{"library":"Other Library","name":"Event","id":"event-1"}]',
+        ),
+        (
+            "fcp_get_projects",
+            "Requested Event",
+            (
+                '[{"library":"Library","event":"Other Event","name":"Project",'
+                '"id":"project-1","duration":"1s"}]'
+            ),
+        ),
+    ],
+)
+def test_collection_handler_rejects_parent_filter_mismatch(
+    monkeypatch,
+    handler_name,
+    filter_value,
+    raw,
+):
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    with pytest.raises(FCPMCPError, match="command_failed"):
+        getattr(server, handler_name)(filter_value)
+
+
+def test_collection_model_rejects_parent_filter_mismatch():
+    with pytest.raises(ValidationError):
+        live_models.FCPCollectionResult(
+            collection_type="events",
+            parent_filter=live_models.CollectionParentFilter(
+                field="library_name",
+                value="Requested Library",
+            ),
+            names=["Event"],
+            records=[
+                live_models.EventRecord(
+                    library="Other Library",
+                    name="Event",
+                    id="event-1",
+                )
+            ],
+        )
+    with pytest.raises(ValidationError):
+        live_models.FCPCollectionResult(
+            collection_type="projects",
+            parent_filter=live_models.CollectionParentFilter(
+                field="event_name",
+                value="Requested Event",
+            ),
+            names=["Project"],
+            records=[
+                live_models.ProjectRecord(
+                    library="Library",
+                    event="Other Event",
+                    name="Project",
+                    id="project-1",
+                    duration="1s",
+                )
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    ("handler_name", "filter_value", "raw", "expected_filter"),
+    [
+        ("fcp_get_events", "", "[]", None),
+        (
+            "fcp_get_events",
+            "Library",
+            '[{"library":"Library","name":"Event","id":"event-1"}]',
+            {"field": "library_name", "value": "Library"},
+        ),
+        ("fcp_get_projects", "Event", "[]", {"field": "event_name", "value": "Event"}),
+        (
+            "fcp_get_projects",
+            "",
+            (
+                '[{"library":"Library","event":"Any Event","name":"Project",'
+                '"id":"project-1","duration":"1s"}]'
+            ),
+            None,
+        ),
+    ],
+)
+def test_collection_handler_accepts_truthful_filtered_and_unfiltered_results(
+    monkeypatch,
+    handler_name,
+    filter_value,
+    raw,
+    expected_filter,
+):
+    monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+
+    structured = getattr(server, handler_name)(filter_value).structured
+
+    dumped_filter = (
+        structured.parent_filter.model_dump()
+        if structured.parent_filter is not None
+        else None
+    )
+    assert dumped_filter == expected_filter
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "diagnostic\nJob ID: JOB-123\n",
+        "Job ID: JOB-123\ntrailing diagnostic\n",
+        "Job ID: JOB-123\nJob ID: JOB-456\n",
+        "Job Identifier: JOB-123\nJob Identifier: JOB-123\n",
+        "Job Identifier: JOB-123\n",
+        "job id: JOB-123\n",
+    ],
+)
+def test_compressor_handler_requires_one_entire_stdout_identifier_shape(
+    monkeypatch,
+    live_config,
+    tmp_path: Path,
+    stdout,
+):
+    compressor = tmp_path / "Compressor"
+    compressor.write_text("binary", encoding="utf-8")
+    source = tmp_path / "source.mov"
+    source.write_bytes(b"media")
+    monkeypatch.setattr(utility_paths, "compressor_binary", lambda: compressor)
+    monkeypatch.setattr(
+        ffprobe,
+        "_run_checked",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            0,
+            stdout,
+            "",
+        ),
+    )
+
+    assert server.compressor_encode(str(source)).structured.job_identifier is None
+
+
+def _valid_submission_payload():
+    request = live_models.CompressorSubmissionRequest(
+        source_path="/tmp/source.mov",
+        setting_path="/tmp/setting.cmprstng",
+        output_directory="/tmp/output",
+        batch_name="MCP Encode",
+    )
+    command = live_models.CompressorCommandResult(
+        argv=[
+            "/Applications/Compressor",
+            "-batchName",
+            "MCP Encode",
+            "-jobpath",
+            "/tmp/source.mov",
+            "-settingpath",
+            "/tmp/setting.cmprstng",
+            "-locationpath",
+            "/tmp/output",
+        ],
+        returncode=0,
+        stdout="Job ID: JOB-123\n",
+        stderr="",
+    )
+    return {
+        "request": request,
+        "command": command,
+        "verification_status": VerificationStatus.UNVERIFIED,
+        "observed_outcome": None,
+        "job_identifier": "JOB-123",
+        "warnings": ["Durable Compressor state was not observed."],
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("job_identifier", "FABRICATED"),
+        ("job_identifier", None),
+        (
+            "command",
+            live_models.CompressorCommandResult(
+                argv=["/Applications/Compressor", "--unknown", "value"],
+                returncode=0,
+                stdout="Job ID: JOB-123\n",
+                stderr="",
+            ),
+        ),
+        (
+            "command",
+            live_models.CompressorCommandResult(
+                argv=[
+                    "/Applications/Compressor",
+                    "-batchName",
+                    "MCP Encode",
+                    "-batchName",
+                    "Duplicate",
+                    "-jobpath",
+                    "/tmp/source.mov",
+                ],
+                returncode=0,
+                stdout="Job ID: JOB-123\n",
+                stderr="",
+            ),
+        ),
+        (
+            "command",
+            live_models.CompressorCommandResult(
+                argv=[
+                    "/Applications/Compressor",
+                    "-batchName",
+                    "Wrong Batch",
+                    "-jobpath",
+                    "/tmp/source.mov",
+                    "-settingpath",
+                    "/tmp/setting.cmprstng",
+                    "-locationpath",
+                    "/tmp/output",
+                ],
+                returncode=0,
+                stdout="Job ID: JOB-123\n",
+                stderr="",
+            ),
+        ),
+        (
+            "command",
+            live_models.CompressorCommandResult(
+                argv=[
+                    "/Applications/Compressor",
+                    "-batchName",
+                    "MCP Encode",
+                    "-jobpath",
+                    "/tmp/source.mov",
+                    "-settingpath",
+                    "/tmp/setting.cmprstng",
+                    "-locationpath",
+                    "/tmp/output",
+                ],
+                returncode=1,
+                stdout="Job ID: JOB-123\n",
+                stderr="failed",
+            ),
+        ),
+        (
+            "command",
+            live_models.CompressorCommandResult(
+                argv=[
+                    "/Applications/Compressor",
+                    "-batchName",
+                    "MCP Encode",
+                    "-jobpath",
+                    "/tmp/source.mov",
+                    "-settingpath",
+                    "/tmp/setting.cmprstng",
+                    "-locationpath",
+                    "/tmp/output",
+                ],
+                returncode=0,
+                stdout="Job ID: JOB-123\nJob ID: JOB-456\n",
+                stderr="",
+            ),
+        ),
+    ],
+)
+def test_compressor_submission_model_rejects_unbound_evidence(
+    field,
+    replacement,
+):
+    payload = _valid_submission_payload()
+    payload[field] = replacement
+
+    with pytest.raises(ValidationError):
+        live_models.CompressorSubmissionResult(**payload)
+
+
+def test_compressor_setting_symlink_preserves_legacy_text_spelling(
+    monkeypatch,
+    tmp_path: Path,
+):
+    settings = tmp_path / "Settings"
+    settings.mkdir()
+    target = tmp_path / "Resolved.cmprstng"
+    target.write_text("preset", encoding="utf-8")
+    link = settings / "Alias.cmprstng"
+    link.symlink_to(target)
+    monkeypatch.setattr(utility_paths, "compressor_settings_dir", lambda: settings)
+    monkeypatch.setattr(
+        utility_paths,
+        "compressor_binary",
+        lambda: tmp_path / "Missing Compressor",
+    )
+
+    outcome = server.compressor_list_settings()
+
+    assert json.loads(str(outcome))["custom_presets"] == [str(link)]
+    assert outcome.structured.custom_settings[0].path == str(target.resolve())

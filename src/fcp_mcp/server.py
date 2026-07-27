@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -164,6 +163,7 @@ from .result_models.live import (
     LibraryRecord,
     ProjectRecord,
     VerificationStatus,
+    parse_compressor_job_identifier,
 )
 from .result_models.media import (
     AudioStreamRecord,
@@ -4641,16 +4641,18 @@ _UNVERIFIED_COMPRESSOR_WARNING = (
     "Compressor accepted the command, but durable job state was not "
     "independently observed."
 )
-_COMPRESSOR_JOB_IDENTIFIER = re.compile(
-    r"(?im)^\s*job\s+(?:id|identifier):\s*"
-    r"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\s*$"
-)
 
 
 def _live_json(raw: str, context: str) -> object:
+    def reject_nonstandard_constant(value: str) -> None:
+        raise ValueError(f"nonstandard JSON constant: {value}")
+
     try:
-        return json.loads(raw)
-    except json.JSONDecodeError as error:
+        return json.loads(
+            raw,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except (json.JSONDecodeError, ValueError) as error:
         raise FCPMCPError(
             ErrorCode.COMMAND_FAILED,
             f"{context} returned malformed JSON",
@@ -4669,6 +4671,25 @@ def _collection_result(
         raise FCPMCPError(
             ErrorCode.COMMAND_FAILED,
             f"FCP {collection_type} query returned a non-list response",
+        )
+    expected_keys = {
+        "libraries": {"name", "id", "file"},
+        "events": {"library", "name", "id"},
+        "projects": {
+            "library",
+            "event",
+            "name",
+            "id",
+            "duration",
+        },
+    }[collection_type]
+    if any(
+        not isinstance(item, dict) or set(item) != expected_keys
+        for item in payload
+    ):
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"FCP {collection_type} query returned an invalid response shape",
         )
     try:
         records = [
@@ -4711,11 +4732,6 @@ def _time_observation(
             ErrorCode.COMMAND_FAILED,
             f"FCP timeline query returned an invalid {field}",
         ) from error
-
-
-def _compressor_job_identifier(stdout: str) -> str | None:
-    match = _COMPRESSOR_JOB_IDENTIFIER.search(stdout)
-    return match.group(1) if match is not None else None
 
 
 @TOOLS.tool(
@@ -5422,7 +5438,9 @@ def compressor_encode(
             ),
             verification_status=VerificationStatus.UNVERIFIED,
             observed_outcome=None,
-            job_identifier=_compressor_job_identifier(result.stdout or ""),
+            job_identifier=parse_compressor_job_identifier(
+                result.stdout or ""
+            ),
             warnings=[_UNVERIFIED_COMPRESSOR_WARNING],
         ),
     )
@@ -5441,9 +5459,11 @@ def compressor_list_settings() -> ToolOutcome[CompressorSettingsResult]:
     # Built-in settings from Compressor
     settings_dir = compressor_settings_dir()
     custom = []
+    resolved_custom = []
     if settings_dir.exists():
         for f in settings_dir.rglob("*.cmprstng"):
-            custom.append(str(f.resolve()))
+            custom.append(str(f))
+            resolved_custom.append(str(f.resolve()))
 
     # Also try listing via Compressor CLI
     comp = compressor_binary()
@@ -5475,7 +5495,7 @@ def compressor_list_settings() -> ToolOutcome[CompressorSettingsResult]:
         structured=CompressorSettingsResult(
             custom_settings=[
                 CompressorCustomSettingRecord(path=path)
-                for path in custom
+                for path in resolved_custom
             ],
             cli_information=[
                 CompressorCLIInformationRecord(raw_line=line)
