@@ -1,6 +1,10 @@
+import os
+import sys
 from pathlib import Path
 
 import pytest
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 import fcp_mcp.automation.osascript as automation
 from fcp_mcp import server
@@ -81,3 +85,36 @@ def test_disabled_open_library_runs_no_external_command(monkeypatch, tmp_path: P
     with pytest.raises(FCPMCPError, match="live_control_disabled"):
         server.fcp_open_library(str(tmp_path / "Library.fcpbundle"))
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_missing_media_is_wire_error_and_creates_no_output(tmp_path: Path):
+    output = tmp_path / "thumbnail.jpg"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "FCP_MCP_OUTPUT_DIR": str(tmp_path),
+            "FCP_MCP_ALLOWED_ROOTS": str(tmp_path),
+        }
+    )
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "fcp_mcp"],
+        env=environment,
+    )
+
+    async with (
+        stdio_client(parameters) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        await session.initialize()
+        result = await session.call_tool(
+            "media_extract_thumbnail",
+            {
+                "path": str(tmp_path / "missing.mov"),
+                "output_path": str(output),
+            },
+        )
+
+    assert result.isError is True
+    assert output.exists() is False

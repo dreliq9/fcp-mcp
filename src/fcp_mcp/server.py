@@ -1770,23 +1770,42 @@ def compressor_encode(
         batch_name: Batch name for Compressor
     """
     from .utils.paths import compressor_binary
+    from .media.ffprobe import _run_checked
 
     automation.require_live_control(CONFIG)
     comp = compressor_binary()
     if not comp.exists():
-        return f"Compressor not found at {comp}"
+        raise FCPMCPError(
+            ErrorCode.DEPENDENCY_MISSING,
+            f"Compressor not found at {comp}",
+        )
 
-    cmd = [str(comp), "-batchName", batch_name, "-jobpath", str(Path(input_path).resolve())]
+    source = Path(input_path).expanduser().resolve()
+    if not source.is_file():
+        raise FCPMCPError(
+            ErrorCode.SOURCE_NOT_FOUND,
+            f"Compressor input not found: {source}",
+        )
+    cmd = [str(comp), "-batchName", batch_name, "-jobpath", str(source)]
     if setting_path:
-        cmd.extend(["-settingpath", str(Path(setting_path).resolve())])
+        setting = Path(setting_path).expanduser().resolve()
+        if not setting.is_file():
+            raise FCPMCPError(
+                ErrorCode.SOURCE_NOT_FOUND,
+                f"Compressor setting not found: {setting}",
+            )
+        cmd.extend(["-settingpath", str(setting)])
     if output_dir:
-        cmd.extend(["-locationpath", str(Path(output_dir).resolve())])
+        destination = Path(output_dir).expanduser().resolve()
+        if not destination.is_dir():
+            raise FCPMCPError(
+                ErrorCode.INVALID_PATH,
+                f"Compressor output directory not found: {destination}",
+            )
+        cmd.extend(["-locationpath", str(destination)])
 
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        return f"Compressor encode started: {result.stdout or result.stderr}"
-    except Exception as e:
-        return f"Compressor error: {e}"
+    result = _run_checked(cmd, timeout=30)
+    return f"Compressor encode started: {result.stdout or result.stderr}"
 
 
 @mcp.tool()
@@ -1981,43 +2000,39 @@ def media_info(path: str) -> str:
         path: Path to media file
     """
     from .media.ffprobe import probe_file
-    try:
-        info = probe_file(path)
-        # Simplify for readability
-        fmt = info.get("format", {})
-        streams = info.get("streams", [])
-        summary = {
-            "filename": fmt.get("filename"),
-            "duration": f"{float(fmt.get('duration', 0)):.2f}s",
-            "size_mb": f"{int(fmt.get('size', 0)) / 1048576:.1f}",
-            "bitrate_kbps": f"{int(fmt.get('bit_rate', 0)) / 1000:.0f}",
-            "format": fmt.get("format_long_name"),
-            "streams": [],
+
+    info = probe_file(path)
+    # Simplify for readability
+    fmt = info.get("format", {})
+    streams = info.get("streams", [])
+    summary = {
+        "filename": fmt.get("filename"),
+        "duration": f"{float(fmt.get('duration', 0)):.2f}s",
+        "size_mb": f"{int(fmt.get('size', 0)) / 1048576:.1f}",
+        "bitrate_kbps": f"{int(fmt.get('bit_rate', 0)) / 1000:.0f}",
+        "format": fmt.get("format_long_name"),
+        "streams": [],
+    }
+    for stream in streams:
+        stream_info = {
+            "type": stream.get("codec_type"),
+            "codec": stream.get("codec_name"),
         }
-        for s in streams:
-            stream_info = {
-                "type": s.get("codec_type"),
-                "codec": s.get("codec_name"),
-            }
-            if s.get("codec_type") == "video":
-                stream_info.update({
-                    "width": s.get("width"),
-                    "height": s.get("height"),
-                    "fps": s.get("r_frame_rate"),
-                    "pix_fmt": s.get("pix_fmt"),
-                })
-            elif s.get("codec_type") == "audio":
-                stream_info.update({
-                    "sample_rate": s.get("sample_rate"),
-                    "channels": s.get("channels"),
-                    "channel_layout": s.get("channel_layout"),
-                })
-            summary["streams"].append(stream_info)
-        return json.dumps(summary, indent=2)
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error analyzing media: {e}"
+        if stream.get("codec_type") == "video":
+            stream_info.update({
+                "width": stream.get("width"),
+                "height": stream.get("height"),
+                "fps": stream.get("r_frame_rate"),
+                "pix_fmt": stream.get("pix_fmt"),
+            })
+        elif stream.get("codec_type") == "audio":
+            stream_info.update({
+                "sample_rate": stream.get("sample_rate"),
+                "channels": stream.get("channels"),
+                "channel_layout": stream.get("channel_layout"),
+            })
+        summary["streams"].append(stream_info)
+    return json.dumps(summary, indent=2)
 
 
 @mcp.tool()
@@ -2034,15 +2049,11 @@ def media_detect_silence(
         min_duration: Minimum silence duration in seconds
     """
     from .media.ffprobe import detect_silence
-    try:
-        silences = detect_silence(path, noise_threshold, min_duration)
-        if not silences:
-            return "No silent sections detected."
-        return json.dumps(silences, indent=2)
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {e}"
+
+    silences = detect_silence(path, noise_threshold, min_duration)
+    if not silences:
+        return "No silent sections detected."
+    return json.dumps(silences, indent=2)
 
 
 @mcp.tool()
@@ -2055,13 +2066,9 @@ def media_detect_beats(path: str) -> str:
         path: Path to audio/video file
     """
     from .media.ffprobe import detect_beats
-    try:
-        beats = detect_beats(path)
-        return json.dumps({"beat_count": len(beats), "beats": beats}, indent=2)
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {e}"
+
+    beats = detect_beats(path)
+    return json.dumps({"beat_count": len(beats), "beats": beats}, indent=2)
 
 
 @mcp.tool()
@@ -2074,15 +2081,14 @@ def media_loudness(path: str) -> str:
         path: Path to audio/video file
     """
     from .media.ffprobe import analyze_loudness
-    try:
-        result = analyze_loudness(path)
-        if not result:
-            return "Could not analyze loudness (file may have no audio)"
-        return json.dumps(result, indent=2)
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {e}"
+
+    result = analyze_loudness(path)
+    if not result:
+        raise FCPMCPError(
+            ErrorCode.OUTPUT_MISSING,
+            "FFmpeg returned no loudness summary; the file may have no audio",
+        )
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -2101,13 +2107,9 @@ def media_extract_thumbnail(
         width: Thumbnail width in pixels
     """
     from .media.ffprobe import extract_thumbnail
-    try:
-        out = extract_thumbnail(path, time, output_path or None, width)
-        return f"Thumbnail saved: {out}"
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {e}"
+
+    out = extract_thumbnail(path, time, output_path or None, width)
+    return f"Thumbnail saved: {out}"
 
 
 @mcp.tool()
@@ -2126,13 +2128,9 @@ def media_extract_thumbnails(
         width: Thumbnail width in pixels
     """
     from .media.ffprobe import extract_thumbnails
-    try:
-        thumbs = extract_thumbnails(path, interval, output_dir or None, width)
-        return json.dumps({"count": len(thumbs), "thumbnails": thumbs}, indent=2)
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {e}"
+
+    thumbs = extract_thumbnails(path, interval, output_dir or None, width)
+    return json.dumps({"count": len(thumbs), "thumbnails": thumbs}, indent=2)
 
 
 @mcp.tool()
@@ -2143,22 +2141,18 @@ def media_list_streams(path: str) -> str:
         path: Path to media file
     """
     from .media.ffprobe import get_streams
-    try:
-        streams = get_streams(path)
-        result = []
-        for i, s in enumerate(streams):
-            result.append({
-                "index": i,
-                "type": s.get("codec_type"),
-                "codec": s.get("codec_name"),
-                "language": s.get("tags", {}).get("language", ""),
-                "duration": s.get("duration"),
-            })
-        return json.dumps(result, indent=2)
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {e}"
+
+    streams = get_streams(path)
+    result = []
+    for index, stream in enumerate(streams):
+        result.append({
+            "index": index,
+            "type": stream.get("codec_type"),
+            "codec": stream.get("codec_name"),
+            "language": stream.get("tags", {}).get("language", ""),
+            "duration": stream.get("duration"),
+        })
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool()
@@ -2172,13 +2166,9 @@ def media_scene_detect(path: str, threshold: float = 0.3) -> str:
         threshold: Scene change sensitivity (0.0-1.0, lower = more sensitive)
     """
     from .media.ffprobe import detect_scenes
-    try:
-        scenes = detect_scenes(path, threshold)
-        return json.dumps({"scene_count": len(scenes), "scenes": scenes}, indent=2)
-    except FileNotFoundError as e:
-        return str(e)
-    except Exception as e:
-        return f"Error: {e}"
+
+    scenes = detect_scenes(path, threshold)
+    return json.dumps({"scene_count": len(scenes), "scenes": scenes}, indent=2)
 
 
 @mcp.tool()
@@ -2197,34 +2187,48 @@ def media_extract_audio(
         output_path: Where to save audio (default: same dir, .wav extension)
         format: Audio format: wav, mp3, flac (default: wav)
     """
-    import subprocess as sp
-    p = _resolve_path(path)
-    if not p.exists():
-        return f"File not found: {p}"
+    from .media.ffprobe import _find_ffmpeg, _run_checked
+
+    source = _resolve_path(path).expanduser().resolve()
+    if not source.is_file():
+        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"Media file not found: {source}")
+    if format not in {"wav", "mp3", "flac"}:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Unsupported audio format: {format}",
+        )
 
     if not output_path:
-        output_path = str(p.with_suffix(f".{format}"))
+        output = source.with_suffix(f".{format}")
+    else:
+        output = Path(output_path).expanduser().resolve()
+    if output == source:
+        raise FCPMCPError(
+            ErrorCode.SAME_FILE_FORBIDDEN,
+            "Input and output must be different files",
+        )
 
-    cmd = ["ffmpeg", "-y", "-i", str(p), "-vn"]
+    cmd = [_find_ffmpeg(), "-y", "-i", str(source), "-vn"]
     if format == "wav":
         cmd.extend(["-c:a", "pcm_s16le"])
     elif format == "mp3":
         cmd.extend(["-c:a", "libmp3lame", "-q:a", "2"])
     elif format == "flac":
         cmd.extend(["-c:a", "flac"])
-    cmd.append(output_path)
+    cmd.append(str(output))
 
-    result = sp.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        return f"FFmpeg error: {result.stderr[-300:]}"
+    _run_checked(
+        cmd,
+        timeout=300,
+        expected_outputs=[output],
+    )
 
-    from pathlib import Path as P
-    size_mb = P(output_path).stat().st_size / (1024 * 1024)
+    size_mb = output.stat().st_size / (1024 * 1024)
     return json.dumps({
-        "audio_file": output_path,
+        "audio_file": str(output),
         "format": format,
         "size_mb": f"{size_mb:.1f}",
-        "source": str(p),
+        "source": str(source),
     }, indent=2)
 
 
@@ -2244,35 +2248,52 @@ def media_audio_to_midi(
         path: Path to audio file (wav, mp3, flac) or video file
         output_path: Where to save MIDI (default: same dir, .mid extension)
     """
-    p = _resolve_path(path)
-    if not p.exists():
-        return f"File not found: {p}"
+    from .media.ffprobe import _find_ffmpeg, _run_checked
+
+    source = _resolve_path(path).expanduser().resolve()
+    if not source.is_file():
+        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"Media file not found: {source}")
+    inference_source = source
 
     # If video, extract audio first
     video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
-    if p.suffix.lower() in video_exts:
-        import subprocess as sp
-        wav_path = str(p.with_suffix('.wav'))
-        result = sp.run(
-            ["ffmpeg", "-y", "-i", str(p), "-vn", "-c:a", "pcm_s16le", wav_path],
-            capture_output=True, text=True
+    if source.suffix.lower() in video_exts:
+        wav_path = source.with_suffix('.wav')
+        _run_checked(
+            [
+                _find_ffmpeg(),
+                "-y",
+                "-i",
+                str(source),
+                "-vn",
+                "-c:a",
+                "pcm_s16le",
+                str(wav_path),
+            ],
+            timeout=300,
+            expected_outputs=[wav_path],
         )
-        if result.returncode != 0:
-            return f"Audio extraction failed: {result.stderr[-300:]}"
-        p = Path(wav_path)
+        inference_source = wav_path
 
     try:
         from basic_pitch.inference import predict
         from basic_pitch import ICASSP_2022_MODEL_PATH
 
-        model_output, midi_data, note_events = predict(
-            str(p), model_or_model_path=ICASSP_2022_MODEL_PATH,
+        _model_output, midi_data, note_events = predict(
+            str(inference_source), model_or_model_path=ICASSP_2022_MODEL_PATH,
         )
 
         if not output_path:
-            output_path = str(p.with_suffix('.mid'))
+            output = inference_source.with_suffix('.mid')
+        else:
+            output = Path(output_path).expanduser().resolve()
 
-        midi_data.write(output_path)
+        midi_data.write(str(output))
+        if not output.is_file() or output.stat().st_size == 0:
+            raise FCPMCPError(
+                ErrorCode.OUTPUT_MISSING,
+                f"basic-pitch did not create a nonempty MIDI file: {output}",
+            )
 
         # Summarize what was detected
         note_count = len(note_events)
@@ -2285,17 +2306,25 @@ def media_audio_to_midi(
             total_dur = 0
 
         return json.dumps({
-            "midi_file": output_path,
+            "midi_file": str(output),
             "notes_detected": note_count,
             "pitch_range": f"MIDI {min_pitch}-{max_pitch}",
             "duration_seconds": f"{total_dur:.1f}",
-            "source": str(p),
+            "source": str(inference_source),
         }, indent=2)
 
-    except ImportError:
-        return "basic-pitch not installed. Run: pip install basic-pitch"
-    except Exception as e:
-        return f"Transcription error: {e}"
+    except ImportError as error:
+        raise FCPMCPError(
+            ErrorCode.DEPENDENCY_MISSING,
+            "basic-pitch not installed. Run: pip install basic-pitch",
+        ) from error
+    except FCPMCPError:
+        raise
+    except Exception as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"Audio transcription failed: {error}",
+        ) from error
 
 
 # ============================================================================
