@@ -39,8 +39,10 @@ sees them in the MCP prompt list and can invoke them by name.
 
 ### Release automation
 
-- Tag-triggered workflow verifies or rebuilds the same candidate before
-  PyPI upload
+- Tag-triggered workflow rebuilds and verifies the candidate, then hands its
+  artifact to an isolated PyPI Trusted Publishing job
+- The PyPI environment, required reviewers, trusted-publisher registration,
+  and protected `v*` tags must be configured before release
 - Tags, PyPI upload, GitHub Releases, and MCP Registry submission remain
   separate maintainer-authorized actions
 

@@ -31,6 +31,8 @@ responses while making the local execution boundary explicit and testable.
 - Live FCP and Compressor actions are disabled until
   `FCP_MCP_ENABLE_LIVE_CONTROL` is explicitly enabled.
 - All 89 tools carry public MCP safety annotations.
+- The tag workflow isolates verification from publication and uses PyPI
+  Trusted Publishing instead of a stored API token.
 
 ### Corrected contracts
 

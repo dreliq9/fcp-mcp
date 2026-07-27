@@ -102,6 +102,21 @@ command-construction and error paths covered everywhere.
    description
 4. Keep PRs focused — one tool or one bug per PR where possible
 
+## Release prerequisites
+
+The tag workflow uses PyPI Trusted Publishing. Before creating a `v*` tag,
+maintainers must:
+
+1. Register `dreliq9/fcp-mcp`, `.github/workflows/publish.yml`, and the
+   `pypi` environment as the trusted publisher for the `fcp-mcp` PyPI
+   project.
+2. Require a maintainer review on the GitHub `pypi` environment.
+3. Protect `v*` tags against unreviewed creation or replacement.
+
+The unprivileged workflow job repeats every release gate and uploads the
+verified distributions. Only the separate two-step publish job receives
+`id-token: write`. Do not add a long-lived PyPI token to the workflow.
+
 ## What not to contribute
 
 - Scripting escape hatches that run arbitrary Python in the server
