@@ -6,6 +6,7 @@ The most capable FCP MCP server: FCPXML engine + live FCP control + media analys
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from collections.abc import Collection
 from dataclasses import asdict
@@ -14,6 +15,8 @@ from typing import Any
 from urllib.parse import unquote as url_unquote
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from pydantic import ValidationError
 
 from .automation import osascript as automation
 from .config import RuntimeConfig
@@ -48,7 +51,40 @@ from .fcpxml.writer import FCPXMLModifier
 from .security.paths import PathPolicy
 from .utils.atomic_write import atomic_replace_bytes
 
-mcp = FastMCP(
+logger = logging.getLogger(__name__)
+
+
+class FCPFastMCP(FastMCP):
+    """FastMCP boundary that preserves domain codes and sanitizes defects."""
+
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> Any:
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as error:
+            cause = error.__cause__
+            if isinstance(cause, FCPMCPError):
+                raise
+            if isinstance(cause, ValidationError):
+                raise ToolError(
+                    f"Error executing tool {name}: "
+                    f"{ErrorCode.INVALID_ARGUMENTS.value}: "
+                    "Tool arguments did not match the schema"
+                ) from error
+            logger.exception(
+                "Unexpected failure while executing tool %s",
+                name,
+            )
+            raise ToolError(
+                f"Error executing tool {name}: "
+                f"{ErrorCode.INTERNAL_ERROR.value}: Unexpected internal failure"
+            ) from error
+
+
+mcp = FCPFastMCP(
     "fcp-mcp",
     instructions=(
         "fcp-mcp v0.2.1 — FCPXML engine + live FCP control + media analysis "
@@ -110,21 +146,106 @@ def _save_generator(
     return generator.save(destination, event_format=CONFIG.log_format)
 
 
+def _load_json(raw: str, label: str) -> Any:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must be valid JSON: {error.msg}",
+        ) from error
+
+
+def _load_json_list(raw: str, label: str) -> list[Any]:
+    value = _load_json(raw, label)
+    if not isinstance(value, list):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must be a JSON array",
+        )
+    return value
+
+
+def _load_json_object(raw: str, label: str) -> dict[str, Any]:
+    value = _load_json(raw, label)
+    if not isinstance(value, dict):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must be a JSON object",
+        )
+    return value
+
+
+def _parse_time(raw: str, label: str) -> RationalTime:
+    try:
+        return RationalTime.from_fcpxml(raw)
+    except (ValueError, ZeroDivisionError) as error:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must be a valid FCPXML time: {raw}",
+        ) from error
+
+
 def _resolve_clip_sources(
-    clips: list[dict[str, Any]],
+    clips: list[Any],
 ) -> list[dict[str, Any]]:
     resolved_clips = []
-    for clip in clips:
+    for index, clip in enumerate(clips):
+        if (
+            not isinstance(clip, dict)
+            or not isinstance(clip.get("src"), str)
+            or not isinstance(clip.get("duration"), str)
+        ):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                (
+                    f"clips_json[{index}] must be an object with string "
+                    "src and duration fields"
+                ),
+            )
         resolved = dict(clip)
         resolved["src"] = str(_resolve_input(str(clip["src"])))
+        _parse_time(resolved["duration"], "clip duration")
+        if "start" in resolved:
+            if not isinstance(resolved["start"], str):
+                raise FCPMCPError(
+                    ErrorCode.INVALID_ARGUMENTS,
+                    f"clips_json[{index}].start must be a string",
+                )
+            _parse_time(str(resolved["start"]), "clip start")
         resolved_clips.append(resolved)
     return resolved_clips
 
 
-def _resolve_rig_images(data: dict[str, Any]) -> dict[str, Any]:
+def _resolve_rig_images(data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict) or not isinstance(data.get("name"), str):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "Each rig must be an object with a string name",
+        )
     resolved = dict(data)
     resolved_parts = []
-    for part in data.get("parts", []):
+    parts = data.get("parts", [])
+    if not isinstance(parts, list):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "Rig parts must be a JSON array",
+        )
+    if not parts:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "Each rig must contain at least one part",
+        )
+    for index, part in enumerate(parts):
+        if (
+            not isinstance(part, dict)
+            or not isinstance(part.get("name"), str)
+            or not isinstance(part.get("image"), str)
+        ):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"parts[{index}] must contain string name and image fields",
+            )
         resolved_part = dict(part)
         resolved_part["image"] = str(
             _resolve_input(
@@ -135,6 +256,25 @@ def _resolve_rig_images(data: dict[str, Any]) -> dict[str, Any]:
         resolved_parts.append(resolved_part)
     resolved["parts"] = resolved_parts
     return resolved
+
+
+def _load_rigs(raw: str, label: str = "rigs_json") -> list[dict[str, Any]]:
+    value = _load_json(raw, label)
+    if isinstance(value, dict):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must be a JSON object or array",
+        )
+    if not values:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must contain at least one rig",
+        )
+    return [_resolve_rig_images(data) for data in values]
 
 
 def _parse_doc(path: str) -> FCPXMLDocument:
@@ -429,9 +569,18 @@ def fcpxml_add_marker(
         marker_type: "standard" or "chapter"
         output_path: Output file path (default: adds _modified suffix)
     """
+    _parse_time(start, "start")
+    if marker_type not in {"standard", "chapter"}:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "marker_type must be standard or chapter",
+        )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.add_marker(clip_name, start, value, note, marker_type):
-        return f"Clip '{clip_name}' not found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip '{clip_name}' not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"Marker added. Saved to: {out}"
 
@@ -445,9 +594,39 @@ def fcpxml_batch_add_markers(path: str, markers_json: str, output_path: str = ""
         markers_json: JSON array of markers, each: {"clip_name": str, "start": str, "value": str, "note"?: str, "type"?: str}
         output_path: Output file path (default: adds _modified suffix)
     """
-    markers = json.loads(markers_json)
+    markers = _load_json_list(markers_json, "markers_json")
+    if not markers:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "markers_json must contain at least one marker",
+        )
+    for index, marker in enumerate(markers):
+        if (
+            not isinstance(marker, dict)
+            or not isinstance(marker.get("clip_name"), str)
+            or not isinstance(marker.get("start"), str)
+            or not isinstance(marker.get("value"), str)
+        ):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                (
+                    f"markers_json[{index}] must contain string clip_name, "
+                    "start, and value fields"
+                ),
+            )
+        if marker.get("type", "standard") not in {"standard", "chapter"}:
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"markers_json[{index}].type must be standard or chapter",
+            )
+        _parse_time(marker["start"], f"markers_json[{index}].start")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_add_markers(markers)
+    if count != len(markers):
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"{len(markers) - count} marker target(s) were not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"{count}/{len(markers)} markers added. Saved to: {out}"
 
@@ -467,9 +646,15 @@ def fcpxml_add_keyword(
         duration: Duration of keyword range (optional)
         output_path: Output file path
     """
+    _parse_time(start, "start")
+    if duration:
+        _parse_time(duration, "duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.add_keyword(clip_name, value, start, duration or None):
-        return f"Clip '{clip_name}' not found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip '{clip_name}' not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"Keyword '{value}' added. Saved to: {out}"
 
@@ -489,9 +674,16 @@ def fcpxml_trim_clip(
         new_duration: New duration (optional)
         output_path: Output file path
     """
+    if new_start:
+        _parse_time(new_start, "new_start")
+    if new_duration:
+        _parse_time(new_duration, "new_duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.trim_clip(clip_name, new_start or None, new_duration or None):
-        return f"Clip '{clip_name}' not found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip '{clip_name}' not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"Clip trimmed. Saved to: {out}"
 
@@ -506,9 +698,18 @@ def fcpxml_split_clip(path: str, clip_name: str, split_at: str, output_path: str
         split_at: Offset within the clip to split at (FCPXML time)
         output_path: Output file path
     """
+    _parse_time(split_at, "split_at")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    if mod._find_clip_by_name(clip_name) is None:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip '{clip_name}' not found",
+        )
     if not mod.split_clip(clip_name, split_at):
-        return f"Could not split clip '{clip_name}' at {split_at}"
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"split_at must fall strictly inside clip '{clip_name}'",
+        )
     out = _save_modifier(mod, output_path)
     return f"Clip split. Saved to: {out}"
 
@@ -522,9 +723,19 @@ def fcpxml_delete_clips(path: str, clip_names_json: str, output_path: str = "") 
         clip_names_json: JSON array of clip names to delete
         output_path: Output file path
     """
-    names = json.loads(clip_names_json)
+    names = _load_json_list(clip_names_json, "clip_names_json")
+    if not names or not all(isinstance(name, str) for name in names):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "clip_names_json must be a nonempty array of strings",
+        )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.delete_clips(names)
+    if count != len(names):
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"{len(names) - count} clip target(s) were not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"{count}/{len(names)} clips deleted. Saved to: {out}"
 
@@ -538,10 +749,28 @@ def fcpxml_reorder_clips(path: str, clip_names_json: str, output_path: str = "")
         clip_names_json: JSON array of clip names in desired order
         output_path: Output file path
     """
-    names = json.loads(clip_names_json)
+    names = _load_json_list(clip_names_json, "clip_names_json")
+    if not names or not all(isinstance(name, str) for name in names):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "clip_names_json must be a nonempty array of strings",
+        )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    missing = [
+        name
+        for name in names
+        if mod._find_clip_by_name(name) is None
+    ]
+    if missing:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip target(s) not found: {', '.join(missing)}",
+        )
     if not mod.reorder_clips(names):
-        return "Could not reorder clips (no spine found)"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "Timeline spine not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"Clips reordered. Saved to: {out}"
 
@@ -561,9 +790,13 @@ def fcpxml_add_transition(
         name: Transition name
         output_path: Output file path
     """
+    _parse_time(duration, "duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.add_transition(after_clip_name, duration, name):
-        return f"Clip '{after_clip_name}' not found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip '{after_clip_name}' not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"Transition added. Saved to: {out}"
 
@@ -581,9 +814,17 @@ def fcpxml_change_speed(
         speed_factor: Speed multiplier (2.0 = 2x fast, 0.5 = half speed)
         output_path: Output file path
     """
+    if speed_factor <= 0:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "speed_factor must be greater than zero",
+        )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.change_speed(clip_name, speed_factor):
-        return f"Could not change speed of '{clip_name}'"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip '{clip_name}' not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"Speed changed to {speed_factor}x. Saved to: {out}"
 
@@ -602,7 +843,10 @@ def fcpxml_assign_role(
     """
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.assign_role(clip_name, role):
-        return f"Clip '{clip_name}' not found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Clip '{clip_name}' not found",
+        )
     out = _save_modifier(mod, output_path)
     return f"Role '{role}' assigned. Saved to: {out}"
 
@@ -624,6 +868,7 @@ def fcpxml_add_title(
         position: "start", "end", or clip name to insert after
         output_path: Output file path
     """
+    _parse_time(duration, "duration")
     # For titles we need to generate a title element referencing Basic Title
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
 
@@ -639,7 +884,10 @@ def fcpxml_add_title(
         import xml.etree.ElementTree as ET
         resources = mod.root.find("resources")
         if resources is None:
-            return "No resources element found"
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                "FCPXML resources element not found",
+            )
         effect = ET.SubElement(resources, "effect")
         title_ref = "r_title"
         effect.set("id", title_ref)
@@ -648,7 +896,10 @@ def fcpxml_add_title(
 
     spine = mod.root.find(".//spine")
     if spine is None:
-        return "No spine found in timeline"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "Timeline spine not found",
+        )
 
     import xml.etree.ElementTree as ET
     title_el = ET.Element("title")
@@ -669,12 +920,20 @@ def fcpxml_add_title(
         spine.append(title_el)
     else:
         clip_el = mod._find_clip_by_name(position)
-        if clip_el:
-            parent = mod._find_parent(clip_el)
-            if parent is not None:
-                children = list(parent)
-                idx = children.index(clip_el)
-                parent.insert(idx + 1, title_el)
+        if clip_el is None:
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                f"Clip '{position}' not found",
+            )
+        parent = mod._find_parent(clip_el)
+        if parent is None:
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                f"Parent for clip '{position}' not found",
+            )
+        children = list(parent)
+        idx = children.index(clip_el)
+        parent.insert(idx + 1, title_el)
 
     # Recalculate offsets
     mod._recalculate_offsets(spine)
@@ -706,12 +965,19 @@ def fcpxml_add_audio(
 
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     audio_path = _resolve_input(audio_src)
+    if duration:
+        _parse_time(duration, "duration")
 
     if not name:
         name = audio_path.stem
 
     # Add asset resource
     resources = mod.root.find("resources")
+    if resources is None:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "FCPXML resources element not found",
+        )
     asset_id = f"r_audio_{name.replace(' ', '_')}"
     asset = ET.SubElement(resources, "asset")
     asset.set("id", asset_id)
@@ -724,7 +990,10 @@ def fcpxml_add_audio(
 
     spine = mod.root.find(".//spine")
     if spine is None:
-        return "No spine found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "Timeline spine not found",
+        )
 
     clip = ET.Element("asset-clip")
     clip.set("ref", asset_id)
@@ -737,6 +1006,20 @@ def fcpxml_add_audio(
         spine.insert(0, clip)
     elif position == "end":
         spine.append(clip)
+    else:
+        target = mod._find_clip_by_name(position)
+        if target is None:
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                f"Clip '{position}' not found",
+            )
+        parent = mod._find_parent(target)
+        if parent is None:
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                f"Parent for clip '{position}' not found",
+            )
+        parent.insert(list(parent).index(target) + 1, clip)
 
     mod._recalculate_offsets(spine)
     out = _save_modifier(mod, output_path)
@@ -768,6 +1051,7 @@ def fcpxml_create_project(
         event_name: Event name
         output_path: Where to save (default: ~/Movies/<name>.fcpxml)
     """
+    _parse_time(frame_duration, "frame_duration")
     gen = FCPXMLGenerator()
     fmt_ref = gen.add_format(name=format_name, width=width, height=height,
                               frame_duration=frame_duration)
@@ -798,7 +1082,9 @@ def fcpxml_create_timeline(
         event_name: Event name
         output_path: Where to save
     """
-    clips = _resolve_clip_sources(json.loads(clips_json))
+    clips = _resolve_clip_sources(
+        _load_json_list(clips_json, "clips_json")
+    )
     gen = FCPXMLGenerator()
     gen.build_timeline_from_clips(clips, project_name=project_name,
                                    format_name=format_name, event_name=event_name)
@@ -829,12 +1115,22 @@ def fcpxml_auto_rough_cut(
         project_name: Project name
         output_path: Where to save
     """
-    clips = _resolve_clip_sources(json.loads(clips_json))
+    clips = _resolve_clip_sources(
+        _load_json_list(clips_json, "clips_json")
+    )
     gen = FCPXMLGenerator()
     fmt_ref = gen.add_format()
 
-    max_dur = RationalTime.from_fcpxml(max_clip_duration) if max_clip_duration else None
-    target = RationalTime.from_fcpxml(target_duration) if target_duration else None
+    max_dur = (
+        _parse_time(max_clip_duration, "max_clip_duration")
+        if max_clip_duration
+        else None
+    )
+    target = (
+        _parse_time(target_duration, "target_duration")
+        if target_duration
+        else None
+    )
 
     trans_ref = ""
     if transition_duration:
@@ -854,7 +1150,10 @@ def fcpxml_auto_rough_cut(
 
     running_total = RationalTime.zero()
     for clip_def in clips:
-        clip_dur = RationalTime.from_fcpxml(clip_def["duration"])
+        clip_dur = _parse_time(
+            str(clip_def["duration"]),
+            "clip duration",
+        )
         if max_dur and clip_dur > max_dur:
             clip_dur = max_dur
 
@@ -900,7 +1199,11 @@ def fcpxml_generate_montage(
         project_name: Project name
         output_path: Where to save
     """
-    clips = _resolve_clip_sources(json.loads(clips_json))
+    clips = _resolve_clip_sources(
+        _load_json_list(clips_json, "clips_json")
+    )
+    _parse_time(clip_duration, "clip_duration")
+    _parse_time(transition_duration, "transition_duration")
     gen = FCPXMLGenerator()
     fmt_ref = gen.add_format()
     trans_ref = gen.add_effect("Cross Dissolve")
@@ -968,7 +1271,10 @@ def fcpxml_import_srt(
         })
 
     if not subtitles:
-        return "No subtitles found in SRT file"
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "SRT file contains no parseable subtitles",
+        )
 
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     import xml.etree.ElementTree as ET
@@ -989,7 +1295,10 @@ def fcpxml_import_srt(
     # Add subtitle clips as connected clips to the first spine clip
     spine = mod.root.find(".//spine")
     if spine is None:
-        return "No spine found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "Timeline spine not found",
+        )
 
     first_clip = None
     for child in spine:
@@ -998,7 +1307,10 @@ def fcpxml_import_srt(
             break
 
     if first_clip is None:
-        return "No clips in spine"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "Timeline contains no clip to anchor subtitles",
+        )
 
     for sub in subtitles:
         title_el = ET.SubElement(first_clip, "title")
@@ -1072,6 +1384,11 @@ def fcpxml_import_edl(
                                    duration=duration)
             clip_count += 1
 
+    if clip_count == 0:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "EDL contains no parseable edit events",
+        )
     out = _save_generator(
         gen,
         output_path,
@@ -1101,7 +1418,13 @@ def fcpxml_reformat(
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
 
     # Update format
-    for fmt_el in mod.root.iter("format"):
+    format_element = next(mod.root.iter("format"), None)
+    if format_element is None:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "FCPXML format resource not found",
+        )
+    for fmt_el in (format_element,):
         fmt_el.set("width", str(target_width))
         fmt_el.set("height", str(target_height))
         fmt_el.set("name", target_format_name)
@@ -1130,6 +1453,7 @@ def fcpxml_fix_flash_frames(
         frame_duration: Frame duration for calculating frame count
         output_path: Output file path
     """
+    _parse_time(frame_duration, "frame_duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.fix_flash_frames(min_frames, frame_duration)
     out = _save_modifier(mod, output_path)
@@ -1152,6 +1476,14 @@ def fcpxml_fill_gaps(
         output_path: Output file path
     """
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    if not any(
+        element.get("id") == fill_asset_ref
+        for element in mod.root.findall("./resources/asset")
+    ):
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Asset resource '{fill_asset_ref}' not found",
+        )
     count = mod.fill_gaps(fill_asset_ref, fill_name)
     out = _save_modifier(mod, output_path)
     return f"{count} gaps filled. Saved to: {out}"
@@ -1170,6 +1502,11 @@ def fcpxml_remove_silence(
         silence_threshold_seconds: Minimum gap duration to remove (seconds)
         output_path: Output file path
     """
+    if silence_threshold_seconds < 0:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "silence_threshold_seconds must be nonnegative",
+        )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = 0
     for spine_el in mod.root.iter("spine"):
@@ -1196,8 +1533,18 @@ def fcpxml_batch_rename_clips(
         replacement: Text to replace with
         output_path: Output file path
     """
+    if not pattern:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "pattern must not be empty",
+        )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_rename_clips(pattern, replacement)
+    if count == 0:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"No clip name contains pattern '{pattern}'",
+        )
     out = _save_modifier(mod, output_path)
     return f"{count} clips renamed. Saved to: {out}"
 
@@ -1213,9 +1560,24 @@ def fcpxml_batch_assign_roles(
         rules_json: JSON array of rules: [{"match": "interview", "role": "Dialogue"}, ...]
         output_path: Output file path
     """
-    rules = json.loads(rules_json)
+    rules = _load_json_list(rules_json, "rules_json")
+    if not rules or not all(
+        isinstance(rule, dict)
+        and isinstance(rule.get("match"), str)
+        and isinstance(rule.get("role"), str)
+        for rule in rules
+    ):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "rules_json entries must contain string match and role fields",
+        )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_assign_roles(rules)
+    if count == 0:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "No clips matched the supplied role rules",
+        )
     out = _save_modifier(mod, output_path)
     return f"{count} roles assigned. Saved to: {out}"
 
@@ -1235,8 +1597,14 @@ def fcpxml_batch_apply_transition(
         name: Transition name
         output_path: Output file path
     """
+    _parse_time(duration, "duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_apply_transition(duration, name)
+    if count == 0:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            "No adjacent clips were available for transitions",
+        )
     out = _save_modifier(mod, output_path)
     return f"{count} transitions added. Saved to: {out}"
 
@@ -1416,6 +1784,11 @@ def fcpxml_check_duration(path: str, target_seconds: float) -> str:
         path: Path to .fcpxml file
         target_seconds: Target duration in seconds
     """
+    if target_seconds < 0:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "target_seconds must be nonnegative",
+        )
     doc = _parse_doc(path)
     for project in doc.all_projects:
         if not project.sequence:
@@ -1429,7 +1802,10 @@ def fcpxml_check_duration(path: str, target_seconds: float) -> str:
         return (f"Project '{project.name}': {actual:.1f}s / {target_seconds:.1f}s target "
                 f"({status}, diff: {diff:+.1f}s)")
 
-    return "No projects found"
+    raise FCPMCPError(
+        ErrorCode.TARGET_NOT_FOUND,
+        "No project with a sequence was found",
+    )
 
 
 # ============================================================================
@@ -1443,7 +1819,10 @@ def fcp_list_motion_templates() -> str:
 
     templates_dir = motion_templates_dir()
     if not templates_dir.exists():
-        return "Motion Templates directory not found"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Motion Templates directory not found: {templates_dir}",
+        )
 
     categories = {}
     for category_dir in templates_dir.iterdir():
@@ -1466,7 +1845,7 @@ def fcp_list_share_destinations() -> str:
 
     dest_dir = fcp_destinations_dir()
     if not dest_dir.exists():
-        return "No share destinations directory found"
+        return json.dumps({"destinations": []}, indent=2)
 
     destinations = []
     for f in dest_dir.glob("*.fcpdestination"):
@@ -1534,7 +1913,7 @@ def fcpxml_apply_template(
 ) -> str:
     """Apply an FCPXML template to a set of clips.
 
-    Replaces placeholder clips in the template with provided clips.
+    Clip substitution is intentionally unavailable until a stable schema exists.
 
     Args:
         template_path: Path to template .fcpxml file
@@ -1542,16 +1921,13 @@ def fcpxml_apply_template(
         project_name: New project name
         output_path: Where to save
     """
-    clips = json.loads(clips_json)
-    mod = FCPXMLModifier(_resolve_input(template_path, suffixes={".fcpxml"}))
-
-    # Update project name
-    for project_el in mod.root.iter("project"):
-        project_el.set("name", project_name)
-        break
-
-    out = _save_modifier(mod, output_path)
-    return f"Template applied. Saved to: {out}"
+    raise FCPMCPError(
+        ErrorCode.UNSUPPORTED_CONTRACT,
+        (
+            "Template clip replacement has no stable clip substitution "
+            "schema in v0.2.1"
+        ),
+    )
 
 
 @mcp.tool()
@@ -1593,12 +1969,45 @@ def fcp_is_running() -> str:
     try:
         result = subprocess.run(
             ["osascript", "-e", 'tell application "System Events" to (name of processes) contains "Final Cut Pro"'],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
         )
-        is_running = "true" in result.stdout.lower()
-        return json.dumps({"running": is_running})
-    except Exception as e:
-        return json.dumps({"running": False, "error": str(e)})
+    except FileNotFoundError as error:
+        raise FCPMCPError(
+            ErrorCode.DEPENDENCY_MISSING,
+            "osascript executable was not found",
+        ) from error
+    except PermissionError as error:
+        raise FCPMCPError(
+            ErrorCode.PERMISSION_DENIED,
+            f"Could not execute osascript: {error}",
+        ) from error
+    except subprocess.TimeoutExpired as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "Final Cut Pro process probe timed out",
+        ) from error
+    except OSError as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"Final Cut Pro process probe failed: {error}",
+        ) from error
+
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "no command output").strip()
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"Final Cut Pro process probe exited with status {result.returncode}: {detail}",
+        )
+    state = result.stdout.strip().lower()
+    if state not in {"true", "false"}:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "Final Cut Pro process probe returned an unexpected response",
+        )
+    return json.dumps({"running": state == "true"})
 
 
 @mcp.tool()
@@ -1641,10 +2050,20 @@ def fcp_get_projects(event_name: str = "") -> str:
 @mcp.tool()
 def fcp_get_timeline_info() -> str:
     """Get info about the current/first timeline in FCP."""
-    return automation.run_osascript(
+    result = automation.run_osascript(
         automation.FCP_TIMELINE_INFO,
         config=CONFIG,
     )
+    try:
+        payload = json.loads(result)
+    except json.JSONDecodeError:
+        return result
+    if isinstance(payload, dict) and payload.get("error"):
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Timeline unavailable: {payload['error']}",
+        )
+    return result
 
 
 @mcp.tool()
@@ -1919,6 +2338,7 @@ def compressor_encode(
 @mcp.tool()
 def compressor_list_settings() -> str:
     """List available Compressor encoding presets."""
+    from .media.ffprobe import _run_checked
     from .utils.paths import compressor_binary, compressor_settings_dir
 
     # Built-in settings from Compressor
@@ -1932,11 +2352,12 @@ def compressor_list_settings() -> str:
     comp = compressor_binary()
     built_in = []
     if comp.exists():
-        try:
-            result = subprocess.run([str(comp), "-info"], capture_output=True, text=True, timeout=10)
-            built_in = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        except Exception:
-            pass
+        result = _run_checked([str(comp), "-info"], timeout=10)
+        built_in = [
+            line.strip()
+            for line in result.stdout.splitlines()
+            if line.strip()
+        ]
 
     return json.dumps({"custom_presets": custom, "cli_info": built_in}, indent=2)
 
@@ -2475,9 +2896,10 @@ def media_audio_to_midi(
     except FCPMCPError:
         raise
     except Exception as error:
+        logger.exception("Audio transcription failed")
         raise FCPMCPError(
             ErrorCode.COMMAND_FAILED,
-            f"Audio transcription failed: {error}",
+            "Audio transcription failed",
         ) from error
 
 
@@ -2519,7 +2941,7 @@ def puppet_create_rig(
     Returns:
         JSON summary of the rig (use this to verify before building a scene).
     """
-    data = _resolve_rig_images(json.loads(rig_json))
+    data = _resolve_rig_images(_load_json_object(rig_json, "rig_json"))
     rig = rig_from_json(data)
     return json.dumps({
         "name": rig.name,
@@ -2570,7 +2992,14 @@ def puppet_create_humanoid_rig(
         scale=scale,
     )
     if not rig.parts:
-        return f"No part images found in {image_dir}. Expected: head.png, body.png, left_arm.png, right_arm.png, left_leg.png, right_leg.png"
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            (
+                f"No humanoid part images found in {resolved_image_dir}; "
+                "expected head.png, body.png, left_arm.png, right_arm.png, "
+                "left_leg.png, or right_leg.png"
+            ),
+        )
     found = [p.name for p in rig.parts]
     missing = [n for n in ["head", "body", "left_arm", "right_arm", "left_leg", "right_leg"] if n not in found]
     result = {
@@ -2602,10 +3031,8 @@ def puppet_build_scene(
         project_name: Project name
         output_path: Where to save (default: ~/Movies/<project_name>.fcpxml)
     """
-    rigs_data = json.loads(rigs_json)
-    if isinstance(rigs_data, dict):
-        rigs_data = [rigs_data]  # Single rig passed as object
-    rigs_data = [_resolve_rig_images(data) for data in rigs_data]
+    _parse_time(duration, "duration")
+    rigs_data = _load_rigs(rigs_json)
 
     builder = PuppetSceneBuilder(duration=duration)
 
@@ -2670,23 +3097,102 @@ def puppet_animate(
         project_name: Project name
         output_path: Where to save
     """
-    rigs_data = json.loads(rigs_json)
-    if isinstance(rigs_data, dict):
-        rigs_data = [rigs_data]
-    rigs_data = [_resolve_rig_images(data) for data in rigs_data]
-    anims_data = json.loads(animations_json)
+    _parse_time(duration, "duration")
+    rigs_data = _load_rigs(rigs_json)
+    anims_data = _load_json_list(animations_json, "animations_json")
+    if not anims_data:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "animations_json must contain at least one animation",
+        )
 
     builder = PuppetSceneBuilder(duration=duration)
 
     for rd in rigs_data:
         rig = rig_from_json(rd)
         builder.add_rig(rig)
+    part_names = {
+        part["name"]
+        for rig_data in rigs_data
+        for part in rig_data["parts"]
+    }
 
     # Parse animations
-    for ad in anims_data:
+    for index, ad in enumerate(anims_data):
+        if (
+            not isinstance(ad, dict)
+            or not isinstance(ad.get("part"), str)
+            or ad.get("property") not in {"position", "rotation", "scale"}
+            or not isinstance(ad.get("keyframes"), list)
+            or not ad["keyframes"]
+        ):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                (
+                    f"animations_json[{index}] must contain part, a supported "
+                    "property, and a keyframes array"
+                ),
+            )
+        if ad["part"] not in part_names:
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                f"Animation part '{ad['part']}' not found in any rig",
+            )
         keyframes = []
-        for kf in ad["keyframes"]:
+        for keyframe_index, kf in enumerate(ad["keyframes"]):
+            if (
+                not isinstance(kf, dict)
+                or "time" not in kf
+                or "value" not in kf
+            ):
+                raise FCPMCPError(
+                    ErrorCode.INVALID_ARGUMENTS,
+                    (
+                        f"animations_json[{index}].keyframes"
+                        f"[{keyframe_index}] must contain time and value"
+                    ),
+                )
+            _parse_time(
+                str(kf["time"]),
+                (
+                    f"animations_json[{index}].keyframes"
+                    f"[{keyframe_index}].time"
+                ),
+            )
             val = kf["value"]
+            if ad["property"] == "rotation":
+                if not isinstance(val, (int, float)) or isinstance(val, bool):
+                    raise FCPMCPError(
+                        ErrorCode.INVALID_ARGUMENTS,
+                        (
+                            f"animations_json[{index}].keyframes"
+                            f"[{keyframe_index}].value must be numeric"
+                        ),
+                    )
+            elif not (
+                isinstance(val, list)
+                and len(val) == 2
+                and all(
+                    isinstance(item, (int, float))
+                    and not isinstance(item, bool)
+                    for item in val
+                )
+            ):
+                raise FCPMCPError(
+                    ErrorCode.INVALID_ARGUMENTS,
+                    (
+                        f"animations_json[{index}].keyframes"
+                        f"[{keyframe_index}].value must be a two-number array"
+                    ),
+                )
+            if kf.get("interp", "smooth2") not in {"smooth2", "linear", "hold"}:
+                raise FCPMCPError(
+                    ErrorCode.INVALID_ARGUMENTS,
+                    (
+                        f"animations_json[{index}].keyframes"
+                        f"[{keyframe_index}].interp is unsupported"
+                    ),
+                )
             if isinstance(val, list):
                 val = tuple(val)
             keyframes.append(Keyframe(
@@ -2745,7 +3251,15 @@ def puppet_preset_motion(
         cycles: Number of motion cycles (more = faster movement)
         intensity: Scale factor for motion amplitude (0.5 = subtle, 2.0 = exaggerated)
     """
-    rig_data = _resolve_rig_images(json.loads(rig_json))
+    _parse_time(duration, "duration")
+    if cycles <= 0 or intensity <= 0:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "cycles and intensity must be greater than zero",
+        )
+    rig_data = _resolve_rig_images(
+        _load_json_object(rig_json, "rig_json")
+    )
     rig = rig_from_json(rig_data)
 
     builder = PuppetSceneBuilder(duration=duration)
@@ -2773,8 +3287,19 @@ def puppet_preset_motion(
         arm = rig.get_part("left_arm") or rig.get_part("right_arm")
         anims = [preset_wave(arm, duration, angle_range=45.0 * intensity, cycles=cycles)] if arm else []
     else:
-        return json.dumps({"error": f"Unknown preset: {preset}. Available: idle, bounce, walk, talk, wave"})
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            (
+                f"Unknown preset: {preset}. "
+                "Available: idle, bounce, walk, talk, wave"
+            ),
+        )
 
+    if not anims:
+        raise FCPMCPError(
+            ErrorCode.TARGET_NOT_FOUND,
+            f"Preset '{preset}' has no compatible parts in rig '{rig.name}'",
+        )
     for anim in anims:
         builder.add_animation(anim)
 
@@ -2818,11 +3343,30 @@ def puppet_multi_scene(
         project_name: Base project name (scenes get suffixed)
         output_path: Output directory (default: ~/Movies/)
     """
-    rigs_data = json.loads(rigs_json)
-    if isinstance(rigs_data, dict):
-        rigs_data = [rigs_data]
-    rigs_data = [_resolve_rig_images(data) for data in rigs_data]
-    scenes_data = json.loads(scenes_json)
+    rigs_data = _load_rigs(rigs_json)
+    scenes_data = _load_json_list(scenes_json, "scenes_json")
+    if not scenes_data:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "scenes_json must contain at least one scene",
+        )
+    supported_presets = {"idle", "walk", "talk", "wave", "bounce"}
+    for index, scene in enumerate(scenes_data):
+        if not isinstance(scene, dict):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"scenes_json[{index}] must be an object",
+            )
+        _parse_time(
+            str(scene.get("duration", "300300/30000s")),
+            f"scenes_json[{index}].duration",
+        )
+        preset = scene.get("preset", "idle")
+        if not isinstance(preset, str) or preset not in supported_presets:
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"Unknown scene preset: {preset}",
+            )
 
     out_dir = _resolve_output(output_path or str(CONFIG.output_dir))
     if not out_dir.is_dir():
