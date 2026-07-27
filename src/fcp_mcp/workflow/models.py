@@ -39,7 +39,7 @@ _UUID_PATTERN = re.compile(
 _UTC_PATTERN = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$"
 )
-_OPERATION_ID_PATTERN = re.compile(r"^op-[0-9]{3,6}$")
+_OPERATION_ID_PATTERN = re.compile(r"^op-(?:00[1-9]|0[1-9][0-9]|[1-9][0-9]{2}|1000)$")
 
 
 def _canonical_uuid(value: str) -> str:
@@ -65,8 +65,12 @@ def _canonical_utc_timestamp(value: str) -> str:
 
 def _operation_id(value: str) -> str:
     if not _OPERATION_ID_PATTERN.fullmatch(value):
-        raise ValueError("operation_id must use op-NNN spelling")
+        raise ValueError("operation_id must use canonical op-001 through op-1000 spelling")
     return value
+
+
+def _utc_datetime(value: UtcTimestamp) -> datetime:
+    return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
 
 
 StrictNonEmptyStr: TypeAlias = Annotated[
@@ -438,8 +442,8 @@ class ApprovalSource(str, Enum):
 
 
 class ApprovalStrength(str, Enum):
-    STRONG = "strong"
-    WEAK = "weak"
+    CLI_VERIFIED_HUMAN = "cli_verified_human"
+    CLIENT_UNVERIFIED_HUMAN = "client_unverified_human"
 
 
 class ArtifactState(str, Enum):
@@ -636,6 +640,19 @@ class WorkflowPreviewV1(_FrozenStrictModel):
     def _consistent_preview(self) -> WorkflowPreviewV1:
         if self.state is not WorkflowState.AWAITING_APPROVAL:
             raise ValueError("a workflow preview must be awaiting approval")
+        if not self.validation.valid:
+            raise ValueError("an awaiting-approval preview requires successful validation")
+        if any(
+            receipt.disposition is not OperationDisposition.SUCCEEDED
+            for receipt in self.operation_receipts
+        ):
+            raise ValueError("an awaiting-approval preview requires successful receipts")
+        expected_ids = tuple(
+            f"op-{index:03d}" for index in range(1, len(self.operation_receipts) + 1)
+        )
+        actual_ids = tuple(receipt.operation_id for receipt in self.operation_receipts)
+        if actual_ids != expected_ids:
+            raise ValueError("operation receipt IDs must be unique, contiguous, and ordered")
         if self.prior_destination_state is PriorDestinationState.ABSENT:
             if self.prior_destination_sha256 is not None:
                 raise ValueError("absent prior destination cannot carry a hash")
@@ -660,12 +677,12 @@ class WorkflowStatusV1(_FrozenStrictModel):
     state: WorkflowState
     source_path: PathText
     destination_path: PathText
-    source_sha256: Sha256
-    prior_destination_state: PriorDestinationState
+    source_sha256: Sha256 | None = None
+    prior_destination_state: PriorDestinationState | None = None
     prior_destination_sha256: Sha256 | None = None
-    plan_sha256: Sha256
-    candidate_sha256: Sha256
-    diff_sha256: Sha256
+    plan_sha256: Sha256 | None = None
+    candidate_sha256: Sha256 | None = None
+    diff_sha256: Sha256 | None = None
     revision: PositiveInt
     approval_decision: ApprovalDecision | None = None
     approval_source: ApprovalSource | None = None
@@ -691,11 +708,87 @@ class WorkflowStatusV1(_FrozenStrictModel):
 
     @model_validator(mode="after")
     def _consistent_status(self) -> WorkflowStatusV1:
-        if self.prior_destination_state is PriorDestinationState.ABSENT:
+        if self.prior_destination_state is None:
+            if self.prior_destination_sha256 is not None:
+                raise ValueError("prior destination hash requires an observed state")
+        elif self.source_sha256 is None:
+            raise ValueError("prior destination evidence requires source evidence")
+        elif self.prior_destination_state is PriorDestinationState.ABSENT:
             if self.prior_destination_sha256 is not None:
                 raise ValueError("absent prior destination cannot carry a hash")
         elif self.prior_destination_sha256 is None:
             raise ValueError("present prior destination requires a hash")
+        if self.plan_sha256 is not None and (
+            self.source_sha256 is None or self.prior_destination_state is None
+        ):
+            raise ValueError("plan evidence requires completed source inspection")
+        if self.candidate_sha256 is not None and self.plan_sha256 is None:
+            raise ValueError("candidate evidence requires plan evidence")
+        if self.diff_sha256 is not None and self.candidate_sha256 is None:
+            raise ValueError("diff evidence requires candidate evidence")
+
+        terminal_states = {
+            WorkflowState.COMMITTED,
+            WorkflowState.FAILED,
+            WorkflowState.REJECTED,
+            WorkflowState.CANCELLED,
+            WorkflowState.EXPIRED,
+            WorkflowState.STALE,
+            WorkflowState.ROLLED_BACK,
+            WorkflowState.RECOVERY_REQUIRED,
+        }
+        for label, digest, artifact in (
+            ("candidate", self.candidate_sha256, self.candidate_artifact),
+            ("diff", self.diff_sha256, self.diff_artifact),
+        ):
+            if digest is None:
+                if artifact.state is not ArtifactState.ABSENT:
+                    raise ValueError(f"{label} artifact exists without milestone hash")
+                continue
+            if artifact.state is ArtifactState.ABSENT:
+                raise ValueError(f"{label} milestone hash requires explicit artifact evidence")
+            if artifact.sha256 != digest:
+                raise ValueError(f"{label} milestone and artifact hashes must match")
+            if (
+                self.state not in terminal_states
+                and artifact.state is not ArtifactState.PRESENT
+            ):
+                raise ValueError(f"preterminal {label} artifact body must be present")
+
+        prepared_states = {
+            WorkflowState.AWAITING_APPROVAL,
+            WorkflowState.APPROVED,
+            WorkflowState.COMMITTING,
+            WorkflowState.COMMITTED,
+            WorkflowState.REJECTED,
+            WorkflowState.EXPIRED,
+            WorkflowState.STALE,
+            WorkflowState.ROLLED_BACK,
+            WorkflowState.RECOVERY_REQUIRED,
+        }
+        prepared_evidence = (
+            self.source_sha256,
+            self.prior_destination_state,
+            self.plan_sha256,
+            self.candidate_sha256,
+            self.diff_sha256,
+        )
+        approval_history_present = any(
+            field is not None
+            for field in (
+                self.approval_decision,
+                self.approval_source,
+                self.approved_at,
+            )
+        )
+        requires_prepared_evidence = self.state in prepared_states or (
+            self.state is WorkflowState.CANCELLED and approval_history_present
+        )
+        if requires_prepared_evidence and any(
+            evidence is None for evidence in prepared_evidence
+        ):
+            raise ValueError("workflow state requires complete successful-prepare evidence")
+
         expected_uris = (
             f"fcp-workflow://runs/{self.run_id}",
             f"fcp-workflow://runs/{self.run_id}/events",
@@ -704,23 +797,35 @@ class WorkflowStatusV1(_FrozenStrictModel):
         if (self.run_uri, self.events_uri, self.diff_uri) != expected_uris:
             raise ValueError("workflow resource URIs must bind the same run ID")
 
-        approved_states = {
+        required_approval_states = {
             WorkflowState.APPROVED,
             WorkflowState.COMMITTING,
             WorkflowState.COMMITTED,
+            WorkflowState.STALE,
+            WorkflowState.ROLLED_BACK,
+            WorkflowState.RECOVERY_REQUIRED,
         }
         approval_fields = (
             self.approval_decision,
             self.approval_source,
             self.approved_at,
         )
-        if self.state in approved_states:
+        approval_triplet_complete = all(field is not None for field in approval_fields)
+        approval_triplet_absent = all(field is None for field in approval_fields)
+        if self.state in required_approval_states:
             if (
                 self.approval_decision is not ApprovalDecision.APPROVED
-                or self.approval_source is None
-                or self.approved_at is None
+                or not approval_triplet_complete
             ):
                 raise ValueError("approved workflow state requires approval evidence")
+        elif self.state in {WorkflowState.CANCELLED, WorkflowState.EXPIRED}:
+            if not approval_triplet_absent and (
+                not approval_triplet_complete
+                or self.approval_decision is not ApprovalDecision.APPROVED
+            ):
+                raise ValueError(
+                    "cancelled or expired state requires absent or complete approval evidence"
+                )
         elif self.state is WorkflowState.REJECTED:
             if (
                 self.approval_decision is not ApprovalDecision.REJECTED
@@ -728,7 +833,7 @@ class WorkflowStatusV1(_FrozenStrictModel):
                 or self.approved_at is not None
             ):
                 raise ValueError("rejected state requires rejection evidence")
-        elif any(field is not None for field in approval_fields):
+        elif not approval_triplet_absent:
             raise ValueError("workflow state cannot carry approval evidence")
 
         if self.state is WorkflowState.COMMITTED:
@@ -736,8 +841,11 @@ class WorkflowStatusV1(_FrozenStrictModel):
                 raise ValueError("committed state requires committed_at")
             if self.receipt_artifact.state is not ArtifactState.PRESENT:
                 raise ValueError("committed state requires a present receipt")
-        elif self.committed_at is not None:
-            raise ValueError("non-committed state cannot carry committed_at")
+        else:
+            if self.committed_at is not None:
+                raise ValueError("non-committed state cannot carry committed_at")
+            if self.receipt_artifact.state is not ArtifactState.ABSENT:
+                raise ValueError("non-committed state cannot carry a receipt artifact")
 
         error_states = {
             WorkflowState.FAILED,
@@ -758,12 +866,50 @@ class WorkflowStatusV1(_FrozenStrictModel):
             and self.expires_at is None
         ):
             raise ValueError("approval-bearing state requires expires_at")
-        if self.updated_at < self.created_at:
+        if self.state is WorkflowState.EXPIRED and self.expires_at is None:
+            raise ValueError("expired state requires expires_at")
+
+        created_at = _utc_datetime(self.created_at)
+        updated_at = _utc_datetime(self.updated_at)
+        approved_at = (
+            _utc_datetime(self.approved_at) if self.approved_at is not None else None
+        )
+        committed_at = (
+            _utc_datetime(self.committed_at) if self.committed_at is not None else None
+        )
+        expires_at = (
+            _utc_datetime(self.expires_at) if self.expires_at is not None else None
+        )
+        if updated_at < created_at:
             raise ValueError("updated_at cannot precede created_at")
-        if self.approved_at is not None and self.approved_at < self.created_at:
+        if expires_at is not None and expires_at < created_at:
+            raise ValueError("expires_at cannot precede created_at")
+        if approved_at is not None and approved_at < created_at:
             raise ValueError("approved_at cannot precede created_at")
-        if self.committed_at is not None and self.committed_at < self.created_at:
+        if approved_at is not None and approved_at > updated_at:
+            raise ValueError("updated_at cannot precede approved_at")
+        if (
+            approved_at is not None
+            and expires_at is not None
+            and approved_at > expires_at
+        ):
+            raise ValueError("approval cannot occur after expiry")
+        if committed_at is not None and committed_at < created_at:
             raise ValueError("committed_at cannot precede created_at")
+        if committed_at is not None and committed_at > updated_at:
+            raise ValueError("updated_at cannot precede committed_at")
+        if (
+            committed_at is not None
+            and approved_at is not None
+            and committed_at < approved_at
+        ):
+            raise ValueError("commit cannot precede approval")
+        if (
+            self.state is WorkflowState.EXPIRED
+            and expires_at is not None
+            and updated_at < expires_at
+        ):
+            raise ValueError("expired state cannot update before expiry")
         return self
 
 
@@ -798,9 +944,9 @@ class WorkflowCommitReceiptV1(_FrozenStrictModel):
         if (self.prior_destination_sha256 is None) != (self.backup_path is None):
             raise ValueError("backup path must exist exactly when a prior destination existed")
         expected_strength = (
-            ApprovalStrength.STRONG
+            ApprovalStrength.CLI_VERIFIED_HUMAN
             if self.approval_source is ApprovalSource.CLI
-            else ApprovalStrength.WEAK
+            else ApprovalStrength.CLIENT_UNVERIFIED_HUMAN
         )
         if self.approval_strength is not expected_strength:
             raise ValueError("approval strength contradicts approval source")

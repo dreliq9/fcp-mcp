@@ -68,6 +68,9 @@ HASH_D = "d" * 64
 UTC_1 = "2026-07-27T01:02:03Z"
 UTC_2 = "2026-07-27T02:02:03Z"
 UTC_3 = "2026-07-27T03:02:03Z"
+UTC_4 = "2026-07-27T04:02:03Z"
+UTC_FRACTION_LATE = "2026-07-27T01:02:03.900000Z"
+UTC_WHOLE_EARLY = "2026-07-27T01:02:03Z"
 
 
 def _operation_payloads() -> list[dict[str, object]]:
@@ -109,6 +112,26 @@ def _receipt() -> OperationReceiptV1:
         disposition=OperationDisposition.SUCCEEDED,
         affected_count=1,
         affected_entities=("Interview_A",),
+    )
+
+
+def _receipt_with_id(operation_id: str) -> OperationReceiptV1:
+    return OperationReceiptV1(
+        operation_id=operation_id,
+        kind="add_marker",
+        disposition=OperationDisposition.SUCCEEDED,
+        affected_count=1,
+    )
+
+
+def _failed_receipt(operation_id: str = "op-001") -> OperationReceiptV1:
+    return OperationReceiptV1(
+        operation_id=operation_id,
+        kind="add_marker",
+        disposition=OperationDisposition.FAILED,
+        affected_count=0,
+        error_code=ErrorCode.OPERATION_FAILED,
+        error_summary="operation failed",
     )
 
 
@@ -452,6 +475,54 @@ def test_preview_rejects_invalid_bounds_and_contradictions(changes):
         _preview(**changes)
 
 
+def test_preview_requires_successful_validation_and_receipts():
+    invalid = ValidationResultV1(
+        valid=False,
+        issues=(
+            ValidationIssueV1(
+                severity=FindingDisposition.FAIL,
+                code="invalid_reference",
+                summary="missing reference",
+            ),
+        ),
+    )
+    with pytest.raises(ValidationError):
+        _preview(validation=invalid)
+    with pytest.raises(ValidationError):
+        _preview(operation_receipts=(_failed_receipt(),))
+
+
+@pytest.mark.parametrize(
+    "operation_ids",
+    [
+        ("op-002",),
+        ("op-001", "op-001"),
+        ("op-001", "op-003"),
+        ("op-002", "op-001"),
+    ],
+)
+def test_preview_requires_unique_contiguous_ordered_operation_ids(operation_ids):
+    with pytest.raises(ValidationError):
+        _preview(
+            operation_receipts=tuple(
+                _receipt_with_id(operation_id) for operation_id in operation_ids
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "operation_id",
+    ["op-000", "op-01000", "op-1001", "op-999999"],
+)
+def test_operation_ids_reject_zero_noncanonical_and_over_limit_values(operation_id):
+    with pytest.raises(ValidationError):
+        _receipt_with_id(operation_id)
+
+
+def test_operation_id_accepts_configured_hard_ceiling():
+    assert _receipt_with_id("op-1000").operation_id == "op-1000"
+
+
 def test_artifact_availability_rejects_contradictory_state_and_metadata():
     with pytest.raises(ValidationError):
         ArtifactAvailabilityV1(state=ArtifactState.ABSENT, sha256=HASH_A)
@@ -463,7 +534,176 @@ def test_artifact_availability_rejects_contradictory_state_and_metadata():
         )
 
 
-def test_status_enforces_state_specific_approval_commit_and_error_fields():
+def _absent_artifact() -> ArtifactAvailabilityV1:
+    return ArtifactAvailabilityV1(state=ArtifactState.ABSENT)
+
+
+def _terminal_error() -> WorkflowTerminalErrorV1:
+    return WorkflowTerminalErrorV1(
+        code=ErrorCode.OPERATION_FAILED,
+        summary="operation failed",
+    )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {
+            "source_sha256": None,
+            "prior_destination_state": None,
+            "prior_destination_sha256": None,
+            "plan_sha256": None,
+            "candidate_sha256": None,
+            "diff_sha256": None,
+            "candidate_artifact": _absent_artifact(),
+            "diff_artifact": _absent_artifact(),
+        },
+        {
+            "prior_destination_state": PriorDestinationState.ABSENT,
+            "plan_sha256": None,
+            "candidate_sha256": None,
+            "diff_sha256": None,
+            "candidate_artifact": _absent_artifact(),
+            "diff_artifact": _absent_artifact(),
+        },
+        {
+            "candidate_sha256": None,
+            "diff_sha256": None,
+            "candidate_artifact": _absent_artifact(),
+            "diff_artifact": _absent_artifact(),
+        },
+        {
+            "diff_sha256": None,
+            "diff_artifact": _absent_artifact(),
+        },
+        {},
+    ],
+)
+def test_preparing_status_accepts_valid_evidence_prefixes(changes):
+    _status(state=WorkflowState.PREPARING, expires_at=None, **changes)
+
+
+def test_early_failed_and_cancelled_statuses_require_no_fabricated_evidence():
+    absent_evidence = {
+        "source_sha256": None,
+        "prior_destination_state": None,
+        "prior_destination_sha256": None,
+        "plan_sha256": None,
+        "candidate_sha256": None,
+        "diff_sha256": None,
+        "candidate_artifact": _absent_artifact(),
+        "diff_artifact": _absent_artifact(),
+        "receipt_artifact": _absent_artifact(),
+        "expires_at": None,
+    }
+    _status(
+        state=WorkflowState.FAILED,
+        terminal_error=_terminal_error(),
+        **absent_evidence,
+    )
+    _status(state=WorkflowState.CANCELLED, **absent_evidence)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {
+            "candidate_artifact": ArtifactAvailabilityV1(
+                state=ArtifactState.PRESENT,
+                sha256=HASH_A,
+                size_bytes=1024,
+            )
+        },
+        {
+            "diff_artifact": ArtifactAvailabilityV1(
+                state=ArtifactState.PRESENT,
+                sha256=HASH_A,
+                size_bytes=256,
+            )
+        },
+        {
+            "candidate_sha256": None,
+        },
+        {
+            "prior_destination_state": None,
+            "prior_destination_sha256": HASH_A,
+        },
+        {
+            "source_sha256": None,
+            "prior_destination_state": None,
+            "plan_sha256": HASH_B,
+            "candidate_sha256": None,
+            "diff_sha256": None,
+            "candidate_artifact": _absent_artifact(),
+            "diff_artifact": _absent_artifact(),
+        },
+        {
+            "plan_sha256": None,
+            "candidate_sha256": HASH_C,
+            "diff_sha256": None,
+            "diff_artifact": _absent_artifact(),
+        },
+    ],
+)
+def test_status_rejects_mismatched_or_unpaired_milestone_evidence(changes):
+    with pytest.raises(ValidationError):
+        _status(**changes)
+
+
+@pytest.mark.parametrize("artifact_field", ["candidate_artifact", "diff_artifact"])
+def test_awaiting_approval_requires_present_candidate_and_diff_bodies(artifact_field):
+    with pytest.raises(ValidationError):
+        _status(**{artifact_field: _absent_artifact()})
+
+
+def test_receipt_artifact_is_absent_before_commit_and_present_for_commit():
+    premature_receipt = ArtifactAvailabilityV1(
+        state=ArtifactState.PRESENT,
+        sha256=HASH_A,
+        size_bytes=512,
+    )
+    with pytest.raises(ValidationError):
+        _status(receipt_artifact=premature_receipt)
+    with pytest.raises(ValidationError):
+        _status(
+            state=WorkflowState.APPROVED,
+            approval_decision=ApprovalDecision.APPROVED,
+            approval_source=ApprovalSource.CLI,
+            approved_at=UTC_2,
+            receipt_artifact=premature_receipt,
+        )
+    with pytest.raises(ValidationError):
+        _status(
+            state=WorkflowState.COMMITTED,
+            approval_decision=ApprovalDecision.APPROVED,
+            approval_source=ApprovalSource.CLI,
+            approved_at=UTC_2,
+            committed_at=UTC_3,
+            updated_at=UTC_4,
+            expires_at=None,
+            receipt_artifact=_absent_artifact(),
+        )
+
+
+@pytest.mark.parametrize("artifact_state", [ArtifactState.PRUNED, ArtifactState.CORRUPT])
+def test_terminal_status_retains_hashes_for_explicit_artifact_state(artifact_state):
+    _status(
+        state=WorkflowState.CANCELLED,
+        expires_at=None,
+        candidate_artifact=ArtifactAvailabilityV1(
+            state=artifact_state,
+            sha256=HASH_C,
+            size_bytes=1024,
+        ),
+        diff_artifact=ArtifactAvailabilityV1(
+            state=artifact_state,
+            sha256=HASH_D,
+            size_bytes=256,
+        ),
+    )
+
+
+def test_status_enforces_state_specific_commit_and_error_fields():
     _status()
     _status(
         state=WorkflowState.COMMITTED,
@@ -507,6 +747,190 @@ def test_status_enforces_state_specific_approval_commit_and_error_fields():
         _status(diff_uri=f"fcp-workflow://runs/{ATTEMPT_ID}/diff")
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkflowState.APPROVED,
+        WorkflowState.COMMITTING,
+        WorkflowState.COMMITTED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+        WorkflowState.RECOVERY_REQUIRED,
+    ],
+)
+def test_post_approval_states_preserve_complete_approval_history(state):
+    changes: dict[str, object] = {
+        "state": state,
+        "approval_decision": ApprovalDecision.APPROVED,
+        "approval_source": ApprovalSource.CLI,
+        "approved_at": UTC_2,
+        "updated_at": UTC_3,
+    }
+    if state is WorkflowState.COMMITTED:
+        changes.update(
+            committed_at=UTC_3,
+            updated_at=UTC_4,
+            expires_at=None,
+            receipt_artifact=ArtifactAvailabilityV1(
+                state=ArtifactState.PRESENT,
+                sha256=HASH_A,
+                size_bytes=512,
+            ),
+        )
+    if state is WorkflowState.RECOVERY_REQUIRED:
+        changes["terminal_error"] = _terminal_error()
+    _status(**changes)
+
+
+@pytest.mark.parametrize("state", [WorkflowState.CANCELLED, WorkflowState.EXPIRED])
+def test_cancelled_and_expired_accept_no_or_complete_approval_history(state):
+    changes: dict[str, object] = {"state": state}
+    if state is WorkflowState.CANCELLED:
+        changes["expires_at"] = None
+    else:
+        changes["updated_at"] = UTC_3
+    _status(**changes)
+    _status(
+        **{
+            **changes,
+            "approval_decision": ApprovalDecision.APPROVED,
+            "approval_source": ApprovalSource.CLIENT,
+            "approved_at": UTC_2,
+            "updated_at": UTC_3,
+        }
+    )
+
+
+def test_post_approval_cancelled_state_requires_successful_prepare_evidence():
+    with pytest.raises(ValidationError):
+        _status(
+            state=WorkflowState.CANCELLED,
+            source_sha256=None,
+            prior_destination_state=None,
+            plan_sha256=None,
+            candidate_sha256=None,
+            diff_sha256=None,
+            candidate_artifact=_absent_artifact(),
+            diff_artifact=_absent_artifact(),
+            expires_at=None,
+            approval_decision=ApprovalDecision.APPROVED,
+            approval_source=ApprovalSource.CLI,
+            approved_at=UTC_2,
+            updated_at=UTC_3,
+        )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkflowState.PREPARING,
+        WorkflowState.AWAITING_APPROVAL,
+        WorkflowState.FAILED,
+    ],
+)
+def test_preapproval_states_forbid_approval_history(state):
+    changes: dict[str, object] = {
+        "state": state,
+        "approval_decision": ApprovalDecision.APPROVED,
+        "approval_source": ApprovalSource.CLI,
+        "approved_at": UTC_2,
+    }
+    if state is WorkflowState.PREPARING:
+        changes["expires_at"] = None
+    if state is WorkflowState.FAILED:
+        changes.update(expires_at=None, terminal_error=_terminal_error())
+    with pytest.raises(ValidationError):
+        _status(**changes)
+
+
+def test_rejected_state_requires_rejection_evidence_without_approval_timestamp():
+    _status(
+        state=WorkflowState.REJECTED,
+        approval_decision=ApprovalDecision.REJECTED,
+        approval_source=ApprovalSource.CLI,
+        approved_at=None,
+    )
+    with pytest.raises(ValidationError):
+        _status(state=WorkflowState.REJECTED)
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["approval_decision", "approval_source", "approved_at"],
+)
+def test_post_approval_states_reject_incomplete_approval_triplets(missing):
+    changes: dict[str, object] = {
+        "state": WorkflowState.APPROVED,
+        "approval_decision": ApprovalDecision.APPROVED,
+        "approval_source": ApprovalSource.CLI,
+        "approved_at": UTC_2,
+    }
+    changes[missing] = None
+    with pytest.raises(ValidationError):
+        _status(**changes)
+
+
+def test_status_chronology_compares_instants_not_canonical_text():
+    with pytest.raises(ValidationError):
+        _status(
+            state=WorkflowState.PREPARING,
+            expires_at=None,
+            created_at=UTC_FRACTION_LATE,
+            updated_at=UTC_WHOLE_EARLY,
+        )
+    with pytest.raises(ValidationError):
+        _status(
+            state=WorkflowState.COMMITTED,
+            approval_decision=ApprovalDecision.APPROVED,
+            approval_source=ApprovalSource.CLI,
+            approved_at=UTC_FRACTION_LATE,
+            committed_at=UTC_WHOLE_EARLY,
+            updated_at=UTC_2,
+            expires_at=None,
+            receipt_artifact=ArtifactAvailabilityV1(
+                state=ArtifactState.PRESENT,
+                sha256=HASH_A,
+                size_bytes=512,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {
+            "state": WorkflowState.APPROVED,
+            "approval_decision": ApprovalDecision.APPROVED,
+            "approval_source": ApprovalSource.CLI,
+            "approved_at": UTC_3,
+            "updated_at": UTC_2,
+        },
+        {
+            "state": WorkflowState.APPROVED,
+            "approval_decision": ApprovalDecision.APPROVED,
+            "approval_source": ApprovalSource.CLI,
+            "approved_at": UTC_3,
+            "expires_at": UTC_2,
+            "updated_at": UTC_3,
+        },
+        {
+            "state": WorkflowState.EXPIRED,
+            "expires_at": UTC_3,
+            "updated_at": UTC_2,
+        },
+        {
+            "state": WorkflowState.AWAITING_APPROVAL,
+            "created_at": UTC_3,
+            "expires_at": UTC_2,
+            "updated_at": UTC_3,
+        },
+    ],
+)
+def test_status_rejects_causally_impossible_timestamps(changes):
+    with pytest.raises(ValidationError):
+        _status(**changes)
+
+
 def test_commit_receipt_binds_success_hashes_backup_and_approval_strength():
     receipt = WorkflowCommitReceiptV1(
         run_id=RUN_ID,
@@ -519,7 +943,7 @@ def test_commit_receipt_binds_success_hashes_backup_and_approval_strength():
         backup_path="/tmp/output.fcpxml.backup",
         validation_warnings=(),
         approval_source=ApprovalSource.CLI,
-        approval_strength=ApprovalStrength.STRONG,
+        approval_strength=ApprovalStrength.CLI_VERIFIED_HUMAN,
         approval_binding_sha256=HASH_D,
         committed_at=UTC_3,
         receipt_sha256=HASH_B,
@@ -545,9 +969,25 @@ def test_commit_receipt_binds_success_hashes_backup_and_approval_strength():
             **{
                 **receipt.model_dump(),
                 "approval_source": ApprovalSource.CLIENT,
-                "approval_strength": ApprovalStrength.STRONG,
+                "approval_strength": ApprovalStrength.CLI_VERIFIED_HUMAN,
             }
         )
+
+    client_receipt = WorkflowCommitReceiptV1(
+        **{
+            **receipt.model_dump(),
+            "approval_source": ApprovalSource.CLIENT,
+            "approval_strength": ApprovalStrength.CLIENT_UNVERIFIED_HUMAN,
+        }
+    )
+    assert client_receipt.approval_strength.value == "client_unverified_human"
+
+
+def test_approval_strength_public_values_are_exact():
+    assert {strength.value for strength in ApprovalStrength} == {
+        "cli_verified_human",
+        "client_unverified_human",
+    }
 
 
 def test_recovery_assessment_is_data_only_and_deeply_immutable():
