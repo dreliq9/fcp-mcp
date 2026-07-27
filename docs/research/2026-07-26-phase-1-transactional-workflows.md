@@ -5,6 +5,9 @@
 **Repository snapshot:** `0e41c29c5c94605bb39c0b07b2ce18ff6534f3fb`
 **Research status:** Complete for design; mandatory revalidation before the
 MCP SDK v2 migration and before release
+**Platform amendment:** The 2026-07-27 macOS-only decision supersedes the
+cross-platform premise in this historical research. See
+[`docs/superpowers/specs/2026-07-27-macos-only-runtime-design.md`](../superpowers/specs/2026-07-27-macos-only-runtime-design.md).
 
 ## Question
 
@@ -90,8 +93,8 @@ framework?
 4. [platformdirs on PyPI](https://pypi.org/project/platformdirs/)
    - `4.11.0` is the current production/stable release and supports Python
      3.10 and later.
-   - Its `user_state_dir` abstraction covers the supported macOS, Windows, and
-     Linux platforms without embedding home-directory conventions in the server.
+   - The amended design uses its macOS Application Support resolution without
+     making Windows or Linux supported product runtimes.
 5. [Hypothesis on PyPI](https://pypi.org/project/hypothesis/)
    - `6.161.5` is the current production/stable release and supports Python
      3.10 and later.
