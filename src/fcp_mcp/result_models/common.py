@@ -30,7 +30,7 @@ class ArtifactReference(BaseModel):
     size_bytes: int
 
 
-@dataclass(frozen=True, eq=False)
+@dataclass(frozen=True)
 class ToolOutcome(Generic[ResultT]):
     """One tool result represented on both MCP output channels."""
 
@@ -40,13 +40,3 @@ class ToolOutcome(Generic[ResultT]):
     def __str__(self) -> str:
         """Preserve the direct-call text view while carrying structured data."""
         return self.text
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, str):
-            return self.text == other
-        if isinstance(other, ToolOutcome):
-            return (
-                self.text == other.text
-                and self.structured == other.structured
-            )
-        return NotImplemented

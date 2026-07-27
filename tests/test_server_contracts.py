@@ -13,6 +13,7 @@ import fcp_mcp.automation.osascript as automation
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import FCPMCPError
+from fcp_mcp.result_models.common import LegacyTextResult, ToolOutcome
 from fcp_mcp.security.paths import PathPolicy
 from fcp_mcp.version import distribution_version
 
@@ -126,7 +127,23 @@ def test_add_marker_success_text_stays_compatible(
         output_path=str(output),
     )
 
-    assert result == f"Marker added. Saved to: {output}"
+    assert result.text == f"Marker added. Saved to: {output}"
+
+
+def test_tool_outcome_equality_preserves_structured_payload_identity():
+    left = ToolOutcome(
+        text="same text",
+        structured=LegacyTextResult(result="left"),
+    )
+    right = ToolOutcome(
+        text="same text",
+        structured=LegacyTextResult(result="right"),
+    )
+
+    assert str(left) == "same text"
+    assert left != "same text"
+    assert "same text" != left
+    assert left != right
 
 
 def test_handler_rejects_same_file_output(

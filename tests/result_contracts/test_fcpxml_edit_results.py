@@ -538,7 +538,19 @@ def _assert_committed_entity(
     elif tool_name == "fcpxml_change_speed":
         clip = _find_named(root, "asset-clip", "Broll_Beach")
         assert clip.get("duration") == "60060/30000s"
-        assert len(clip.findall("./timeMap/timept")) == 2
+        time_points = clip.findall("./timeMap/timept")
+        assert [point.attrib for point in time_points] == [
+            {
+                "time": "0s",
+                "value": "0s",
+                "interp": "smooth2",
+            },
+            {
+                "time": "60060/30000s",
+                "value": "120120/30000s",
+                "interp": "smooth2",
+            },
+        ]
     elif tool_name == "fcpxml_assign_role":
         clip = _find_named(root, "asset-clip", "Interview_A")
         assert clip.get("role") == "Narration"
@@ -601,7 +613,12 @@ async def test_core_edits_publish_exact_text_real_receipts_and_verified_entities
     )
     prior_bytes: bytes | None = None
     if tool_name == "fcpxml_add_keyword":
-        prior_bytes = sample_fcpxml_path.read_bytes()
+        prior_bytes = sample_fcpxml_path.read_bytes().replace(
+            b'Travel Vlog v1',
+            b'Prior Destination',
+        )
+        assert prior_bytes != source.read_bytes()
+        assert ET.fromstring(prior_bytes).tag == "fcpxml"
         destination.write_bytes(prior_bytes)
 
     result = await server.mcp.call_tool(
@@ -645,8 +662,17 @@ async def test_core_edits_publish_exact_text_real_receipts_and_verified_entities
         assert receipt["backup_path"] is None
     else:
         prior_sha256 = hashlib.sha256(prior_bytes).hexdigest()
+        assert input_sha256 != prior_sha256
+        assert receipt["output_sha256"] not in {
+            input_sha256,
+            prior_sha256,
+        }
         assert receipt["prior_sha256"] == prior_sha256
         backup = Path(receipt["backup_path"])
+        assert backup.resolve() not in {
+            source.resolve(),
+            destination.resolve(),
+        }
         assert backup.resolve().parent == destination.resolve().parent
         assert receipt["transaction_id"] in backup.name
         assert backup.read_bytes() == prior_bytes
@@ -692,6 +718,52 @@ async def test_trim_with_no_requested_changes_reports_no_changed_fields(
     assert result.structuredContent["clip"]["start"] == "30030/30000s"
     assert result.structuredContent["clip"]["duration"] == "150150/30000s"
     assert _sha256(destination) == result.structuredContent["receipt"]["output_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_one_x_speed_has_no_duration_change_and_verified_identity_map(
+    sample_fcpxml_path: Path,
+    tmp_path: Path,
+    edit_path_policy: None,
+) -> None:
+    source = tmp_path / "one-x-source.fcpxml"
+    shutil.copy2(sample_fcpxml_path, source)
+    destination = tmp_path / "one-x-output.fcpxml"
+
+    result = await server.mcp.call_tool(
+        "fcpxml_change_speed",
+        {
+            "path": str(source),
+            "clip_name": "Broll_Beach",
+            "speed_factor": 1.0,
+            "output_path": str(destination),
+        },
+    )
+
+    assert result.isError is False
+    assert result.content[0].text == (
+        f"Speed changed to 1.0x. Saved to: {destination}"
+    )
+    assert result.structuredContent["changed_fields"] == []
+    assert result.structuredContent["clip"]["duration"] == "120120/30000s"
+    assert result.structuredContent["speed_factor"] == 1.0
+    clip = _find_named(
+        ET.parse(destination).getroot(),
+        "asset-clip",
+        "Broll_Beach",
+    )
+    assert [point.attrib for point in clip.findall("./timeMap/timept")] == [
+        {
+            "time": "0s",
+            "value": "0s",
+            "interp": "smooth2",
+        },
+        {
+            "time": "120120/30000s",
+            "value": "120120/30000s",
+            "interp": "smooth2",
+        },
+    ]
 
 
 @pytest.mark.parametrize(

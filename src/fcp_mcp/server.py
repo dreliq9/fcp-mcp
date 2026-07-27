@@ -1587,11 +1587,44 @@ def fcpxml_change_speed(
         name=clip_name,
         tags={"asset-clip", "clip", "title", "audio", "video"},
     )
-    if len(committed.findall("./timeMap/timept")) != 2:
+    original_duration = RationalTime.from_fcpxml(
+        before_duration or "0s"
+    )
+    expected_duration = RationalTime(
+        round(original_duration.numerator / speed_factor),
+        original_duration.denominator,
+    ).to_fcpxml()
+    expected_time_points = [
+        {
+            "time": "0s",
+            "value": "0s",
+            "interp": "smooth2",
+        },
+        {
+            "time": expected_duration,
+            "value": original_duration.to_fcpxml(),
+            "interp": "smooth2",
+        },
+    ]
+    time_points = committed.findall("./timeMap/timept")
+    if (
+        committed.get("duration") != expected_duration
+        or [point.attrib for point in time_points] != expected_time_points
+    ):
         raise RuntimeError(
-            "Committed FCPXML is missing the speed time map"
+            "Committed FCPXML speed time map does not encode "
+            "the requested factor"
         )
     after_duration = committed.get("duration", "")
+    changes = []
+    if before_duration != after_duration:
+        changes.append(
+            ClipFieldMutationRecord(
+                field="duration",
+                before=before_duration,
+                after=after_duration,
+            )
+        )
     text = (
         f"Speed changed to {speed_factor}x. "
         f"Saved to: {receipt.destination}"
@@ -1604,13 +1637,7 @@ def fcpxml_change_speed(
             operation="change_speed",
             clip=_clip_mutation_record(committed),
             created_clip=None,
-            changed_fields=[
-                ClipFieldMutationRecord(
-                    field="duration",
-                    before=before_duration,
-                    after=after_duration,
-                )
-            ],
+            changed_fields=changes,
             speed_factor=speed_factor,
         ),
     )
