@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, model_validator
+
+from .common import ArtifactReference
 
 RawSummary = Annotated[str, Field(max_length=2000)]
 BoundedText = Annotated[str, Field(max_length=2000)]
@@ -161,3 +163,34 @@ class SceneDetectionResult(BaseModel):
     scene_changes: list[SceneChangeRecord]
     warnings: list[ParserWarningRecord]
     raw_summary: RawSummary | None = None
+
+
+class MediaArtifactResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    schema_version: Literal["1"] = "1"
+    operation: Literal[
+        "extract_thumbnail",
+        "extract_audio",
+        "audio_to_midi",
+    ]
+    source: ArtifactReference
+    artifact: ArtifactReference
+
+
+class MediaArtifactListResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    schema_version: Literal["1"] = "1"
+    operation: Literal["extract_thumbnails"]
+    source: ArtifactReference
+    requested_count: int
+    artifacts: list[ArtifactReference]
+
+    @model_validator(mode="after")
+    def requested_count_matches_artifacts(self) -> Self:
+        if self.requested_count != len(self.artifacts):
+            raise ValueError(
+                "requested_count must match the verified artifact count"
+            )
+        return self

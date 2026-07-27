@@ -15,7 +15,7 @@ from dataclasses import asdict
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from urllib.parse import unquote as url_unquote
 
 from .automation import osascript as automation
@@ -36,6 +36,8 @@ from .fcpxml.parser import FCPXMLParser
 from .fcpxml.puppet import (
     Keyframe,
     PartAnimation,
+    PuppetPart,
+    PuppetRig,
     PuppetSceneBuilder,
     preset_bounce,
     preset_idle,
@@ -129,6 +131,8 @@ from .result_models.media import (
     BeatDetectionResult,
     BeatRecord,
     LoudnessResult,
+    MediaArtifactListResult,
+    MediaArtifactResult,
     MediaInfoResult,
     ParserWarningRecord,
     SceneChangeRecord,
@@ -142,9 +146,17 @@ from .result_models.media import (
     VideoStreamRecord,
 )
 from .result_models.puppet import (
+    PuppetAnimationRecord,
+    PuppetBuildResult,
+    PuppetKeyframeRecord,
+    PuppetMultiSceneResult,
+    PuppetPartRecord,
     PuppetPresetListResult,
     PuppetPresetParameterRecord,
     PuppetPresetRecord,
+    PuppetRigRecord,
+    PuppetRigResult,
+    PuppetSceneArtifactRecord,
 )
 from .security.paths import PathPolicy
 from .tool_metadata import (
@@ -166,6 +178,17 @@ PROMPTS = PromptRegistry()
 
 _parser = FCPXMLParser()
 _validator = FCPXMLValidator()
+
+
+class _TextToolOutcome(str, ToolOutcome):
+    """A typed outcome that remains accepted by legacy string consumers."""
+
+    def __new__(
+        cls,
+        text: str,
+        structured: object,
+    ) -> Self:
+        return str.__new__(cls, text)
 
 
 def catalog_expectations(
@@ -382,6 +405,41 @@ def _artifact_reference_for_path(
     )
 
 
+_MEDIA_TYPES_BY_SUFFIX = {
+    ".avi": "video/x-msvideo",
+    ".flac": "audio/flac",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".mid": "audio/midi",
+    ".midi": "audio/midi",
+    ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".mp4": "video/mp4",
+    ".png": "image/png",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".wav": "audio/wav",
+    ".webm": "video/webm",
+}
+
+
+def _media_artifact_reference(path: Path) -> ArtifactReference:
+    resolved = path.resolve()
+    if not resolved.is_file() or resolved.stat().st_size == 0:
+        raise FCPMCPError(
+            ErrorCode.OUTPUT_MISSING,
+            f"Media artifact is missing or empty: {resolved}",
+        )
+    return _artifact_reference_for_path(
+        resolved,
+        media_type=_MEDIA_TYPES_BY_SUFFIX.get(
+            resolved.suffix.lower(),
+            "application/octet-stream",
+        ),
+    )
+
+
 def _committed_root(
     receipt: FCPXMLTransactionReceipt,
 ) -> ET.Element:
@@ -514,6 +572,50 @@ def _save_generation_result(
     )
 
 
+def _save_puppet_generation(
+    generator: FCPXMLGenerator,
+    output_path: str,
+    *,
+    default_name: str,
+    expected_project: str,
+    rigs: list[PuppetRig],
+    animations: list[PartAnimation],
+) -> tuple[FCPXMLTransactionReceipt, str]:
+    committed_project = ""
+    expected_part_count = sum(len(rig.parts) for rig in rigs)
+
+    def validate_puppet_generation(candidate: Path) -> None:
+        nonlocal committed_project
+        root = ET.parse(candidate).getroot()
+        project = next(root.iter("project"), None)
+        if project is None:
+            _raise_validation_failure(
+                "Puppet candidate is missing its project"
+            )
+        committed_project = project.get("name", "")
+        if committed_project != expected_project:
+            _raise_validation_failure(
+                "Puppet candidate project does not match the request"
+            )
+        parts = root.findall(".//gap/asset-clip")
+        if len(parts) != expected_part_count:
+            _raise_validation_failure(
+                "Puppet candidate part count does not match its rigs"
+            )
+        if len(list(root.iter("param"))) < len(animations):
+            _raise_validation_failure(
+                "Puppet candidate is missing requested animations"
+            )
+
+    receipt = _save_generator_receipt(
+        generator,
+        output_path,
+        default_name=default_name,
+        validate_candidate=validate_puppet_generation,
+    )
+    return receipt, committed_project
+
+
 def _load_json(raw: str, label: str) -> Any:
     try:
         return json.loads(raw)
@@ -643,6 +745,88 @@ def _load_rigs(raw: str, label: str = "rigs_json") -> list[dict[str, Any]]:
             f"{label} must contain at least one rig",
         )
     return [_resolve_rig_images(data) for data in values]
+
+
+def _puppet_part_record(part: PuppetPart) -> PuppetPartRecord:
+    return PuppetPartRecord(
+        name=part.name,
+        image=part.image_path,
+        position=[float(part.position[0]), float(part.position[1])],
+        scale=float(part.scale),
+        rotation=float(part.rotation),
+        anchor=[float(part.anchor[0]), float(part.anchor[1])],
+        z_order=part.z_order,
+        width=part.width,
+        height=part.height,
+    )
+
+
+def _puppet_rig_record(rig: PuppetRig) -> PuppetRigRecord:
+    return PuppetRigRecord(
+        name=rig.name,
+        position=[float(rig.position[0]), float(rig.position[1])],
+        parts=[_puppet_part_record(part) for part in rig.parts],
+    )
+
+
+def _puppet_animation_record(
+    animation: PartAnimation,
+) -> PuppetAnimationRecord:
+    return PuppetAnimationRecord(
+        part_name=animation.part_name,
+        property_name=animation.property_name,
+        keyframes=[
+            PuppetKeyframeRecord(
+                time=keyframe.time,
+                value=(
+                    [
+                        float(keyframe.value[0]),
+                        float(keyframe.value[1]),
+                    ]
+                    if isinstance(keyframe.value, tuple)
+                    else float(keyframe.value)
+                ),
+                interp=keyframe.interp,
+            )
+            for keyframe in animation.keyframes
+        ],
+    )
+
+
+def _persist_puppet_rig(result: PuppetRigResult) -> None:
+    rig_directory = CONFIG.state_dir / "puppet_rigs"
+    rig_directory.mkdir(parents=True, exist_ok=True)
+    rig_name = result.rig.name
+    stem = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "_"
+        for character in rig_name
+    )[:48] or "rig"
+    digest = hashlib.sha256(rig_name.encode("utf-8")).hexdigest()[:12]
+    destination = rig_directory / f"{stem}-{digest}.json"
+    payload = f"{result.model_dump_json(indent=2)}\n".encode()
+
+    def validate(candidate: Path) -> None:
+        try:
+            persisted = PuppetRigResult.model_validate_json(
+                candidate.read_bytes()
+            )
+        except (OSError, ValueError) as error:
+            raise FCPMCPError(
+                ErrorCode.VALIDATION_FAILED,
+                "Persisted puppet rig is not valid structured JSON",
+            ) from error
+        if persisted != result:
+            raise FCPMCPError(
+                ErrorCode.VALIDATION_FAILED,
+                "Persisted puppet rig does not match the validated rig",
+            )
+
+    atomic_replace_bytes(
+        destination,
+        payload,
+        validate=validate,
+        event_format=CONFIG.log_format,
+    )
 
 
 def _parse_doc(path: str) -> FCPXMLDocument:
@@ -4974,13 +5158,17 @@ def media_loudness(path: str) -> ToolOutcome[LoudnessResult]:
     )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=MediaArtifactResult,
+)
 def media_extract_thumbnail(
     path: str,
     time: float = 0.0,
     output_path: str = "",
     width: int = 320,
-) -> str:
+) -> ToolOutcome[MediaArtifactResult]:
     """Extract a frame thumbnail from video at a specific time.
 
     Args:
@@ -4992,6 +5180,7 @@ def media_extract_thumbnail(
     from .media.ffprobe import extract_thumbnail
 
     source = _resolve_input(path)
+    source_reference = _media_artifact_reference(source)
     destination = _resolve_output(
         output_path
         or str(source.parent / f"{source.stem}_thumb_{time:.0f}s.jpg"),
@@ -5004,16 +5193,29 @@ def media_extract_thumbnail(
         str(destination),
         width,
     )
-    return f"Thumbnail saved: {out}"
+    artifact = _media_artifact_reference(Path(out))
+    text = f"Thumbnail saved: {out}"
+    return _TextToolOutcome(
+        text=text,
+        structured=MediaArtifactResult(
+            operation="extract_thumbnail",
+            source=source_reference,
+            artifact=artifact,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=MediaArtifactListResult,
+)
 def media_extract_thumbnails(
     path: str,
     interval: float = 5.0,
     output_dir: str = "",
     width: int = 320,
-) -> str:
+) -> ToolOutcome[MediaArtifactListResult]:
     """Extract thumbnails at regular intervals (contact sheet / storyboard).
 
     Args:
@@ -5025,6 +5227,7 @@ def media_extract_thumbnails(
     from .media.ffprobe import extract_thumbnails
 
     source = _resolve_input(path)
+    source_reference = _media_artifact_reference(source)
     destination = _resolve_output(
         output_dir or str(source.parent / f"{source.stem}_thumbs"),
         input_path=source,
@@ -5035,7 +5238,23 @@ def media_extract_thumbnails(
         str(destination),
         width,
     )
-    return json.dumps({"count": len(thumbs), "thumbnails": thumbs}, indent=2)
+    artifacts = [
+        _media_artifact_reference(Path(thumbnail))
+        for thumbnail in thumbs
+    ]
+    text = json.dumps(
+        {"count": len(thumbs), "thumbnails": thumbs},
+        indent=2,
+    )
+    return _TextToolOutcome(
+        text=text,
+        structured=MediaArtifactListResult(
+            operation="extract_thumbnails",
+            source=source_reference,
+            requested_count=len(thumbs),
+            artifacts=artifacts,
+        ),
+    )
 
 
 @TOOLS.tool(
@@ -5200,12 +5419,16 @@ def media_scene_detect(
     )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=MediaArtifactResult,
+)
 def media_extract_audio(
     path: str,
     output_path: str = "",
     format: str = "wav",
-) -> str:
+) -> ToolOutcome[MediaArtifactResult]:
     """Extract audio track from a video file.
 
     Useful for feeding video audio into transcription, analysis, or
@@ -5219,6 +5442,7 @@ def media_extract_audio(
     from .media.ffprobe import _find_ffmpeg, _run_checked
 
     source = _resolve_input(path)
+    source_reference = _media_artifact_reference(source)
     if format not in {"wav", "mp3", "flac"}:
         raise FCPMCPError(
             ErrorCode.INVALID_ARGUMENTS,
@@ -5247,19 +5471,31 @@ def media_extract_audio(
     )
 
     size_mb = output.stat().st_size / (1024 * 1024)
-    return json.dumps({
+    text = json.dumps({
         "audio_file": str(output),
         "format": format,
         "size_mb": f"{size_mb:.1f}",
         "source": str(source),
     }, indent=2)
+    return _TextToolOutcome(
+        text=text,
+        structured=MediaArtifactResult(
+            operation="extract_audio",
+            source=source_reference,
+            artifact=_media_artifact_reference(output),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=MediaArtifactResult,
+)
 def media_audio_to_midi(
     path: str,
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[MediaArtifactResult]:
     """Transcribe audio to MIDI using basic-pitch (ML audio transcription).
 
     Converts audio (from video or standalone) into MIDI note data.
@@ -5274,6 +5510,7 @@ def media_audio_to_midi(
     from .media.ffprobe import _find_ffmpeg, _run_checked
 
     source = _resolve_input(path)
+    source_reference = _media_artifact_reference(source)
     inference_source = source
 
     # If video, extract audio first
@@ -5331,13 +5568,21 @@ def media_audio_to_midi(
             min_pitch = max_pitch = 0
             total_dur = 0
 
-        return json.dumps({
+        text = json.dumps({
             "midi_file": str(output),
             "notes_detected": note_count,
             "pitch_range": f"MIDI {min_pitch}-{max_pitch}",
             "duration_seconds": f"{total_dur:.1f}",
             "source": str(inference_source),
         }, indent=2)
+        return _TextToolOutcome(
+            text=text,
+            structured=MediaArtifactResult(
+                operation="audio_to_midi",
+                source=source_reference,
+                artifact=_media_artifact_reference(output),
+            ),
+        )
 
     except ImportError as error:
         raise FCPMCPError(
@@ -5358,10 +5603,14 @@ def media_audio_to_midi(
 # Category 11: Puppet Animation (7 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.STATEFUL_WRITE,
+    safety_hints=STATEFUL_WRITE,
+    result_model=PuppetRigResult,
+)
 def puppet_create_rig(
     rig_json: str,
-) -> str:
+) -> ToolOutcome[PuppetRigResult]:
     """Define a puppet character rig from body parts.
 
     Each part is a separate image (PNG) that gets positioned and layered
@@ -5394,7 +5643,7 @@ def puppet_create_rig(
     """
     data = _resolve_rig_images(_load_json_object(rig_json, "rig_json"))
     rig = rig_from_json(data)
-    return json.dumps({
+    text = json.dumps({
         "name": rig.name,
         "position": list(rig.position),
         "parts": [
@@ -5411,16 +5660,23 @@ def puppet_create_rig(
         ],
         "status": "rig_valid",
     }, indent=2)
+    structured = PuppetRigResult(rig=_puppet_rig_record(rig))
+    _persist_puppet_rig(structured)
+    return _TextToolOutcome(text=text, structured=structured)
 
 
-@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.STATEFUL_WRITE,
+    safety_hints=STATEFUL_WRITE,
+    result_model=PuppetRigResult,
+)
 def puppet_create_humanoid_rig(
     name: str,
     image_dir: str,
     position_x: float = 0.0,
     position_y: float = 0.0,
     scale: float = 1.0,
-) -> str:
+) -> ToolOutcome[PuppetRigResult]:
     """Create a standard 6-part humanoid rig from a folder of images.
 
     Expects PNG files named: head.png, body.png, left_arm.png, right_arm.png,
@@ -5460,16 +5716,23 @@ def puppet_create_humanoid_rig(
         "parts_missing": missing,
         "status": "rig_valid",
     }
-    return json.dumps(result, indent=2)
+    text = json.dumps(result, indent=2)
+    structured = PuppetRigResult(rig=_puppet_rig_record(rig))
+    _persist_puppet_rig(structured)
+    return _TextToolOutcome(text=text, structured=structured)
 
 
-@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.STATEFUL_WRITE,
+    safety_hints=STATEFUL_WRITE,
+    result_model=PuppetBuildResult,
+)
 def puppet_build_scene(
     rigs_json: str,
     duration: str = "300300/30000s",
     project_name: str = "Puppet Animation",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[PuppetBuildResult]:
     """Build an FCPXML timeline from one or more puppet rigs.
 
     Each rig's parts become layered connected clips with transforms applied.
@@ -5486,37 +5749,55 @@ def puppet_build_scene(
     rigs_data = _load_rigs(rigs_json)
 
     builder = PuppetSceneBuilder(duration=duration)
-
-    for rd in rigs_data:
-        rig = rig_from_json(rd)
+    rigs = [rig_from_json(rig_data) for rig_data in rigs_data]
+    rig_records = [_puppet_rig_record(rig) for rig in rigs]
+    for rig in rigs:
         builder.add_rig(rig)
 
     gen = builder.build(project_name=project_name)
 
-    out = _save_generator(
+    receipt, committed_project = _save_puppet_generation(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
+        expected_project=project_name,
+        rigs=rigs,
+        animations=[],
     )
 
-    total_parts = sum(len(rig_from_json(rd).parts) for rd in rigs_data)
-    return json.dumps({
-        "file": str(out),
-        "rigs": len(rigs_data),
+    total_parts = sum(len(rig.parts) for rig in rigs)
+    text = json.dumps({
+        "file": str(receipt.destination),
+        "rigs": len(rigs),
         "total_parts": total_parts,
         "duration": duration,
         "status": "scene_built",
     }, indent=2)
+    return _TextToolOutcome(
+        text=text,
+        structured=PuppetBuildResult(
+            project=committed_project,
+            rigs=rig_records,
+            animations=[],
+            duration=duration,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.STATEFUL_WRITE,
+    safety_hints=STATEFUL_WRITE,
+    result_model=PuppetBuildResult,
+)
 def puppet_animate(
     rigs_json: str,
     animations_json: str,
     duration: str = "300300/30000s",
     project_name: str = "Puppet Animation",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[PuppetBuildResult]:
     """Build a puppet scene with custom keyframe animations.
 
     Args:
@@ -5558,9 +5839,9 @@ def puppet_animate(
         )
 
     builder = PuppetSceneBuilder(duration=duration)
-
-    for rd in rigs_data:
-        rig = rig_from_json(rd)
+    rigs = [rig_from_json(rig_data) for rig_data in rigs_data]
+    rig_records = [_puppet_rig_record(rig) for rig in rigs]
+    for rig in rigs:
         builder.add_rig(rig)
     part_names = {
         part["name"]
@@ -5569,6 +5850,7 @@ def puppet_animate(
     }
 
     # Parse animations
+    animations: list[PartAnimation] = []
     for index, ad in enumerate(anims_data):
         if (
             not isinstance(ad, dict)
@@ -5651,30 +5933,53 @@ def puppet_animate(
                 value=val,
                 interp=kf.get("interp", "smooth2"),
             ))
-        builder.add_animation(PartAnimation(
+        animation = PartAnimation(
             part_name=ad["part"],
             property_name=ad["property"],
             keyframes=keyframes,
-        ))
+        )
+        builder.add_animation(animation)
+        animations.append(animation)
 
     gen = builder.build(project_name=project_name)
-
-    out = _save_generator(
+    animation_records = [
+        _puppet_animation_record(animation)
+        for animation in animations
+    ]
+    receipt, committed_project = _save_puppet_generation(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
+        expected_project=project_name,
+        rigs=rigs,
+        animations=animations,
     )
 
-    return json.dumps({
-        "file": str(out),
-        "rigs": len(rigs_data),
-        "animations": len(anims_data),
+    text = json.dumps({
+        "file": str(receipt.destination),
+        "rigs": len(rigs),
+        "animations": len(animations),
         "duration": duration,
         "status": "animated_scene_built",
     }, indent=2)
+    return _TextToolOutcome(
+        text=text,
+        structured=PuppetBuildResult(
+            project=committed_project,
+            rigs=rig_records,
+            animations=animation_records,
+            duration=duration,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.STATEFUL_WRITE,
+    safety_hints=STATEFUL_WRITE,
+    result_model=PuppetBuildResult,
+)
 def puppet_preset_motion(
     rig_json: str,
     preset: str = "idle",
@@ -5683,7 +5988,7 @@ def puppet_preset_motion(
     output_path: str = "",
     cycles: int = 3,
     intensity: float = 1.0,
-) -> str:
+) -> ToolOutcome[PuppetBuildResult]:
     """Build a puppet scene with a preset motion applied.
 
     Available presets:
@@ -5755,30 +6060,52 @@ def puppet_preset_motion(
         builder.add_animation(anim)
 
     gen = builder.build(project_name=project_name)
-
-    out = _save_generator(
+    rig_record = _puppet_rig_record(rig)
+    animation_records = [
+        _puppet_animation_record(animation)
+        for animation in anims
+    ]
+    receipt, committed_project = _save_puppet_generation(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
+        expected_project=project_name,
+        rigs=[rig],
+        animations=anims,
     )
 
-    return json.dumps({
-        "file": str(out),
+    text = json.dumps({
+        "file": str(receipt.destination),
         "preset": preset,
         "animations_applied": len(anims),
         "parts_animated": [a.part_name for a in anims],
         "duration": duration,
         "status": "preset_applied",
     }, indent=2)
+    return _TextToolOutcome(
+        text=text,
+        structured=PuppetBuildResult(
+            project=committed_project,
+            rigs=[rig_record],
+            animations=animation_records,
+            duration=duration,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.STATEFUL_WRITE,
+    safety_hints=STATEFUL_WRITE,
+    result_model=PuppetMultiSceneResult,
+)
 def puppet_multi_scene(
     rigs_json: str,
     scenes_json: str,
     project_name: str = "Puppet Multi-Scene",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[PuppetMultiSceneResult]:
     """Build a multi-scene puppet animation with different presets per scene.
 
     Generates one FCPXML per scene. Useful for storyboarding a sequence.
@@ -5808,15 +6135,45 @@ def puppet_multi_scene(
                 ErrorCode.INVALID_ARGUMENTS,
                 f"scenes_json[{index}] must be an object",
             )
-        _parse_time(
-            str(scene.get("duration", "300300/30000s")),
-            f"scenes_json[{index}].duration",
-        )
+        scene_name = scene.get("name", f"scene_{index + 1}")
+        if not isinstance(scene_name, str) or not scene_name:
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"scenes_json[{index}].name must be a nonempty string",
+            )
+        scene_duration = scene.get("duration", "300300/30000s")
+        if not isinstance(scene_duration, str):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"scenes_json[{index}].duration must be a string",
+            )
+        _parse_time(scene_duration, f"scenes_json[{index}].duration")
         preset = scene.get("preset", "idle")
         if not isinstance(preset, str) or preset not in supported_presets:
             raise FCPMCPError(
                 ErrorCode.INVALID_ARGUMENTS,
                 f"Unknown scene preset: {preset}",
+            )
+        cycles = scene.get("cycles", 3)
+        if (
+            not isinstance(cycles, int)
+            or isinstance(cycles, bool)
+            or cycles <= 0
+        ):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"scenes_json[{index}].cycles must be a positive integer",
+            )
+        intensity = scene.get("intensity", 1.0)
+        if (
+            not isinstance(intensity, (int, float))
+            or isinstance(intensity, bool)
+            or not isfinite(intensity)
+            or intensity <= 0
+        ):
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"scenes_json[{index}].intensity must be positive and finite",
             )
 
     out_dir = _resolve_output(output_path or str(CONFIG.output_dir))
@@ -5826,6 +6183,7 @@ def puppet_multi_scene(
             f"Expected an existing output directory: {out_dir}",
         )
     results = []
+    scene_artifacts: list[PuppetSceneArtifactRecord] = []
 
     for i, scene in enumerate(scenes_data):
         scene_name = scene.get("name", f"scene_{i+1}")
@@ -5835,10 +6193,13 @@ def puppet_multi_scene(
         scene_intensity = scene.get("intensity", 1.0)
 
         builder = PuppetSceneBuilder(duration=scene_duration)
+        scene_rigs: list[PuppetRig] = []
+        scene_animations: list[PartAnimation] = []
 
         for rd in rigs_data:
             rig = rig_from_json(rd)
             builder.add_rig(rig)
+            scene_rigs.append(rig)
 
             # Apply preset
             if scene_preset == "idle":
@@ -5858,21 +6219,56 @@ def puppet_multi_scene(
 
             for anim in anims:
                 builder.add_animation(anim)
+                scene_animations.append(anim)
 
         full_name = f"{project_name}_{scene_name}"
         gen = builder.build(project_name=full_name)
-        out = _save_generator(
+        rig_records = [
+            _puppet_rig_record(rig)
+            for rig in scene_rigs
+        ]
+        animation_records = [
+            _puppet_animation_record(animation)
+            for animation in scene_animations
+        ]
+        receipt, committed_project = _save_puppet_generation(
             gen,
             str(out_dir / f"{full_name}.fcpxml"),
             default_name=f"{full_name}.fcpxml",
+            expected_project=full_name,
+            rigs=scene_rigs,
+            animations=scene_animations,
         )
-        results.append({"scene": scene_name, "file": str(out), "preset": scene_preset})
+        results.append({
+            "scene": scene_name,
+            "file": str(receipt.destination),
+            "preset": scene_preset,
+        })
+        scene_artifacts.append(
+            PuppetSceneArtifactRecord(
+                scene=scene_name,
+                preset=scene_preset,
+                project=committed_project,
+                rigs=rig_records,
+                animations=animation_records,
+                duration=scene_duration,
+                destination=_artifact_reference(receipt),
+                receipt=_receipt_result(receipt),
+            )
+        )
 
-    return json.dumps({
+    text = json.dumps({
         "scenes_created": len(results),
         "files": results,
         "status": "multi_scene_built",
     }, indent=2)
+    return _TextToolOutcome(
+        text=text,
+        structured=PuppetMultiSceneResult(
+            scene_count=len(results),
+            artifacts=scene_artifacts,
+        ),
+    )
 
 
 @TOOLS.tool(
