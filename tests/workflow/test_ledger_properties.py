@@ -161,19 +161,34 @@ def test_verifier_detects_property_mutation_of_every_bound_event_field(
         assert result.findings
 
 
+safe_text = st.text(
+    alphabet=st.characters(
+        blacklist_characters="\x00",
+        blacklist_categories=("Cs",),
+    ),
+    max_size=40,
+)
+safe_key = st.text(
+    alphabet=st.characters(
+        blacklist_characters="\x00",
+        blacklist_categories=("Cs",),
+    ),
+    min_size=1,
+    max_size=12,
+)
 json_scalar = st.none() | st.booleans() | st.integers(
     min_value=-(2**31),
     max_value=2**31 - 1,
-) | st.text(max_size=40)
+) | safe_text
 json_value = st.recursive(
     json_scalar,
     lambda children: st.lists(children, max_size=5)
-    | st.dictionaries(st.text(min_size=1, max_size=12), children, max_size=5),
+    | st.dictionaries(safe_key, children, max_size=5),
     max_leaves=20,
 )
 
 
-@given(st.dictionaries(st.text(min_size=1, max_size=12), json_value, max_size=8))
+@given(st.dictionaries(safe_key, json_value, max_size=8))
 @settings(max_examples=30, deadline=None)
 def test_canonical_payloads_round_trip_through_valid_event_chains(
     payload: dict[str, object],

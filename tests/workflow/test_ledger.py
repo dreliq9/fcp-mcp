@@ -25,7 +25,9 @@ from fcp_mcp.workflow.artifacts import (
 )
 from fcp_mcp.workflow.ledger import (
     MIGRATIONS,
+    ApprovalRecord,
     ArtifactMutationResult,
+    ArtifactRecord,
     DecisionMutationResult,
     EventMutationResult,
     IdempotencyResult,
@@ -267,7 +269,7 @@ def test_backup_source_destination_and_migration_connections_all_verify_pragmas(
     original_connect = sqlite3.connect
     checked: list[tuple[object, ...]] = []
 
-    class AuditedConnection(sqlite3.Connection):
+    class AuditedConnection(ledger_module._LedgerConnection):
         def close(self) -> None:
             if self.execute("PRAGMA database_list").fetchone() is not None:
                 checked.append(
@@ -580,6 +582,74 @@ def test_migration_statement_failure_rolls_back_and_removes_published_backup(
         current.close()
 
 
+def test_migration_failure_attaches_residual_backup_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    connection = _raw(paths.database)
+    connection.execute("CREATE TABLE legacy(value TEXT)")
+    connection.close()
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original_statement = ledger._execute_migration_statement
+    statement_calls = 0
+
+    def fail_second_statement(
+        connection: sqlite3.Connection,
+        statement: str,
+    ) -> None:
+        nonlocal statement_calls
+        statement_calls += 1
+        if statement_calls == 2:
+            raise sqlite3.OperationalError("injected migration failure")
+        original_statement(connection, statement)
+
+    original_unlink_at = ledger._unlink_at
+
+    def fail_published_backup_unlink(anchor: object, name: str) -> None:
+        if ".backup-" in name and not name.endswith(".tmp"):
+            raise OSError("injected backup cleanup failure")
+        original_unlink_at(anchor, name)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ledger, "_execute_migration_statement", fail_second_statement)
+    monkeypatch.setattr(
+        ledger,
+        "_unlink_at",
+        fail_published_backup_unlink,
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    cause = error.value.__cause__
+    assert cause is not None
+    cleanup_failures = getattr(cause, "cleanup_failures", ())
+    assert cleanup_failures
+    assert all(len(str(failure)) <= 255 for failure in cleanup_failures)
+    assert len(list(paths.root.glob("runs.sqlite3.backup-v0-to-v1-*"))) == 1
+    current = _raw(paths.database)
+    try:
+        assert (
+            current.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'schema_migrations'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            current.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'legacy'"
+            ).fetchone()[0]
+            == 1
+        )
+    finally:
+        current.close()
+
+
 def test_post_migration_schema_validation_failure_rolls_back_before_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -628,7 +698,7 @@ def test_migration_never_uses_executescript(
 ) -> None:
     original_connect = sqlite3.connect
 
-    class GuardedConnection(sqlite3.Connection):
+    class GuardedConnection(ledger_module._LedgerConnection):
         def executescript(self, sql_script: str) -> sqlite3.Cursor:
             raise AssertionError("executescript must not be called")
 
@@ -657,6 +727,89 @@ def test_reinitialize_fails_closed_when_an_append_only_trigger_is_missing(
         ).initialize()
 
     _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+
+
+@pytest.mark.parametrize(
+    ("trigger_name", "table", "operation"),
+    [
+        ("schema_migrations_no_update", "schema_migrations", "UPDATE"),
+        ("schema_migrations_no_delete", "schema_migrations", "DELETE"),
+        ("events_no_update", "events", "UPDATE"),
+        ("events_no_delete", "events", "DELETE"),
+        ("artifacts_no_update", "artifacts", "UPDATE"),
+        ("artifacts_no_delete", "artifacts", "DELETE"),
+        ("approvals_no_update", "approvals", "UPDATE"),
+        ("approvals_no_delete", "approvals", "DELETE"),
+        ("idempotency_keys_no_update", "idempotency_keys", "UPDATE"),
+        ("idempotency_keys_no_delete", "idempotency_keys", "DELETE"),
+    ],
+)
+def test_same_name_noop_trigger_substitution_is_detected(
+    tmp_path: Path,
+    trigger_name: str,
+    table: str,
+    operation: str,
+) -> None:
+    ledger = _ledger(tmp_path)
+    connection = _raw(ledger.paths.database)
+    try:
+        connection.execute(f'DROP TRIGGER "{trigger_name}"')
+        connection.execute(
+            f'CREATE TRIGGER "{trigger_name}" BEFORE {operation} ON "{table}" '
+            "BEGIN SELECT 1; END"
+        )
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity()
+    assert result.valid is False
+    assert {finding.code for finding in result.findings} >= {"schema_mismatch"}
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+
+
+def test_same_name_weak_required_table_substitution_is_detected(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    connection = _raw(ledger.paths.database)
+    try:
+        connection.execute("PRAGMA foreign_keys=OFF")
+        connection.execute("CREATE TABLE saved_runs AS SELECT * FROM runs")
+        connection.execute("DROP TABLE runs")
+        connection.execute("CREATE TABLE runs AS SELECT * FROM saved_runs")
+        connection.execute("DROP TABLE saved_runs")
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity()
+    assert result.valid is False
+    assert {finding.code for finding in result.findings} >= {"schema_mismatch"}
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+
+
+def test_unexpected_trigger_or_index_on_required_table_is_detected(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    connection = _raw(ledger.paths.database)
+    try:
+        connection.execute(
+            "CREATE TRIGGER runs_shadow_guard BEFORE UPDATE ON runs "
+            "BEGIN SELECT 1; END"
+        )
+        connection.execute("CREATE INDEX runs_shadow_index ON runs(updated_at)")
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity()
+    assert result.valid is False
+    assert {finding.code for finding in result.findings} >= {"schema_mismatch"}
 
 
 @pytest.mark.parametrize(
@@ -741,9 +894,6 @@ def test_database_symlink_substitution_between_check_and_connect_is_rejected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths = _paths(tmp_path)
-    paths.database.write_bytes(b"")
-    if os.name == "posix":
-        os.chmod(paths.database, 0o600)
     outside = tmp_path / "outside.sqlite3"
     external = _raw(outside)
     external.execute("CREATE TABLE sentinel(value TEXT)")
@@ -797,24 +947,28 @@ def test_repeated_database_creation_race_is_bounded_and_coded(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths = _paths(tmp_path)
-    original_open = os.open
+    ledger = WorkflowLedger(
+        paths,
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
     attempts = 0
 
-    def racing_open(path: object, *args: object, **kwargs: object) -> int:
+    def racing_publish(
+        anchor: object,
+        source: str,
+        target: str,
+    ) -> None:
+        del anchor, source
         nonlocal attempts
-        if Path(path) == paths.database:
+        if target == paths.database.name:
             attempts += 1
             raise FileExistsError("injected create race")
-        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(ledger_module.os, "open", racing_open)
+    monkeypatch.setattr(ledger, "_link_at", racing_publish)
 
     with pytest.raises(FCPMCPError) as error:
-        WorkflowLedger(
-            paths,
-            clock=TickClock(),
-            package_version="0.3.0-test",
-        ).initialize()
+        ledger.initialize()
 
     _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
     assert type(error.value.__cause__) is FileExistsError
@@ -852,6 +1006,280 @@ def test_unsafe_existing_database_mode_is_rejected_without_chmod(tmp_path: Path)
 
     _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
     assert _mode(paths.database) == 0o644
+
+
+def test_preexisting_empty_database_is_rejected_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    paths.database.write_bytes(b"")
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+
+    with pytest.raises(FCPMCPError) as error:
+        WorkflowLedger(
+            paths,
+            clock=TickClock(),
+            package_version="0.3.0-test",
+        ).initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert paths.database.read_bytes() == b""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX modes are not portable")
+def test_direct_state_paths_with_world_accessible_root_are_rejected(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o777)
+    os.chmod(root, 0o777)
+    paths = StatePaths(
+        root=root,
+        database=root / "runs.sqlite3",
+        artifacts=root / "artifacts",
+        locks=root / "locks",
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        WorkflowLedger(
+            paths,
+            clock=TickClock(),
+            package_version="0.3.0-test",
+        ).initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert _mode(root) == 0o777
+    assert not paths.database.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires descriptor-relative open")
+def test_root_substitution_before_database_open_cannot_redirect_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    parked_root = tmp_path / "parked-state"
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir(mode=0o700)
+    os.chmod(outside_root, 0o700)
+    original_open = os.open
+    swapped = False
+
+    def swapping_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if not swapped and Path(path).name == "runs.sqlite3":
+            os.replace(paths.root, parked_root)
+            paths.root.symlink_to(outside_root, target_is_directory=True)
+            swapped = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.os, "open", swapping_open)
+    try:
+        with pytest.raises(FCPMCPError) as error:
+            WorkflowLedger(
+                paths,
+                clock=TickClock(),
+                package_version="0.3.0-test",
+            ).initialize()
+        _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+        assert not (outside_root / "runs.sqlite3").exists()
+    finally:
+        if paths.root.is_symlink():
+            paths.root.unlink()
+        if parked_root.exists():
+            os.replace(parked_root, paths.root)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires hard-link race harness")
+def test_empty_database_connect_redirection_cannot_receive_migrations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    outside = tmp_path / "outside.sqlite3"
+    displaced = tmp_path / "outside-opened.sqlite3"
+    outside.write_bytes(b"")
+    os.chmod(outside, 0o600)
+    original_connect = sqlite3.connect
+    redirected = False
+
+    def redirecting_connect(
+        database: object,
+        *args: object,
+        **kwargs: object,
+    ) -> sqlite3.Connection:
+        nonlocal redirected
+        if redirected:
+            return original_connect(database, *args, **kwargs)
+        redirected = True
+        connection = original_connect(
+            f"{outside.as_uri()}?mode=rw",
+            *args,
+            **kwargs,
+        )
+        os.replace(outside, displaced)
+        os.link(paths.database, outside)
+        return connection
+
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", redirecting_connect)
+
+    with pytest.raises(FCPMCPError) as error:
+        WorkflowLedger(
+            paths,
+            clock=TickClock(),
+            package_version="0.3.0-test",
+        ).initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert displaced.read_bytes() == b""
+    assert os.path.samefile(paths.database, outside)
+
+
+def test_embedded_bootstrap_template_has_exact_provenance_and_shape(
+    tmp_path: Path,
+) -> None:
+    image = ledger_module._BOOTSTRAP_IMAGE
+    placeholder = ledger_module._BOOTSTRAP_PLACEHOLDER
+    token_offset = ledger_module._BOOTSTRAP_TOKEN_OFFSET
+    assert len(image) == 8192
+    assert image.startswith(b"SQLite format 3\x00")
+    assert image[16:18] == b"\x10\x00"
+    assert image.count(placeholder) == 1
+    assert image[token_offset : token_offset + len(placeholder)] == placeholder
+
+    database = tmp_path / "bootstrap.sqlite3"
+    database.write_bytes(image)
+    connection = _raw(database)
+    try:
+        objects = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master"
+        ).fetchall()
+        tokens = connection.execute(
+            "SELECT token FROM __fcp_ledger_identity"
+        ).fetchall()
+    finally:
+        connection.close()
+
+    expected_schema = (
+        "CREATE TABLE __fcp_ledger_identity("
+        "token TEXT NOT NULL CHECK(length(token)=64))"
+    )
+    assert [tuple(row) for row in objects] == [
+        (
+            "table",
+            "__fcp_ledger_identity",
+            "__fcp_ledger_identity",
+            expected_schema,
+        )
+    ]
+    assert [row["token"] for row in tokens] == ["0" * 64]
+
+
+def test_bootstrap_partial_write_is_never_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+
+    def interrupt_write(descriptor: int, image: bytes) -> None:
+        assert len(image) == 8192
+        os.write(descriptor, image[:100])
+        raise OSError("injected bootstrap write interruption")
+
+    monkeypatch.setattr(
+        ledger,
+        "_write_bootstrap_image",
+        interrupt_write,
+        raising=False,
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert not paths.database.exists()
+    assert not any(
+        path.name.startswith(".runs.sqlite3.bootstrap-")
+        for path in paths.root.iterdir()
+    )
+
+
+def test_foreign_bootstrap_identity_is_rejected_without_rewrite(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    image = bytearray(ledger_module._BOOTSTRAP_IMAGE)
+    image[ledger_module._BOOTSTRAP_TOKEN_OFFSET] = ord("g")
+    paths.database.write_bytes(image)
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+    before = paths.database.read_bytes()
+
+    with pytest.raises(FCPMCPError) as error:
+        WorkflowLedger(
+            paths,
+            clock=TickClock(),
+            package_version="0.3.0-test",
+        ).initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert paths.database.read_bytes() == before
+
+
+def test_stale_bootstrap_publish_hardlink_is_cleaned_before_sqlite_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    first = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original_unlink = getattr(first, "_unlink_at", None)
+
+    def interrupt_temp_unlink(anchor: object, name: str) -> None:
+        if name.startswith(".runs.sqlite3.bootstrap-"):
+            raise OSError("injected post-publish cleanup interruption")
+        assert original_unlink is not None
+        original_unlink(anchor, name)
+
+    monkeypatch.setattr(first, "_unlink_at", interrupt_temp_unlink, raising=False)
+    with pytest.raises(FCPMCPError) as error:
+        first.initialize()
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    stale = [
+        path
+        for path in paths.root.iterdir()
+        if path.name.startswith(".runs.sqlite3.bootstrap-")
+    ]
+    assert len(stale) == 1
+    assert os.path.samefile(paths.database, stale[0])
+
+    monkeypatch.undo()
+    observed_connect_entries: list[set[str]] = []
+    original_connect = sqlite3.connect
+
+    def observe_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        observed_connect_entries.append(
+            {path.name for path in paths.root.iterdir()}
+        )
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", observe_connect)
+    WorkflowLedger(
+        paths,
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    ).initialize()
+
+    assert observed_connect_entries
+    assert all(
+        not any(name.startswith(".runs.sqlite3.bootstrap-") for name in entries)
+        for entries in observed_connect_entries
+    )
+    assert not any(
+        path.name.startswith(".runs.sqlite3.bootstrap-")
+        for path in paths.root.iterdir()
+    )
 
 
 def test_create_run_writes_sequence_one_with_exact_canonical_payload_and_hash(
@@ -941,7 +1369,7 @@ def test_append_event_projection_event_and_revision_are_one_atomic_change(
     connection = _raw(ledger.paths.database)
     connection.execute(
         "CREATE TRIGGER reject_injected_event BEFORE INSERT ON events "
-        "WHEN NEW.event_type = 'reject_me' "
+        "WHEN NEW.event_type = 'source_inspected' "
         "BEGIN SELECT RAISE(ABORT, 'injected'); END"
     )
     connection.close()
@@ -951,7 +1379,7 @@ def test_append_event_projection_event_and_revision_are_one_atomic_change(
             RUN_ID,
             expected_state=WorkflowState.PREPARING,
             expected_revision=1,
-            event_type="reject_me",
+            event_type="source_inspected",
             payload={"sha256": HASH_A},
             projection_patch={"source_sha256": HASH_A},
         )
@@ -1130,6 +1558,184 @@ def test_record_decision_is_one_approval_transition_event_transaction(
     _assert_code(duplicate, ErrorCode.WORKFLOW_STATE_CONFLICT)
 
 
+def test_approved_and_terminal_runs_cannot_mutate_prepare_evidence(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    prepared = ledger.append_event(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="plan_built",
+        payload={"sha256": HASH_A},
+        projection_patch={"plan_sha256": HASH_A},
+    )
+    awaiting = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=prepared.run.revision,
+        target_state=WorkflowState.AWAITING_APPROVAL,
+        event_type="prepare_completed",
+        payload={},
+    )
+    approved = ledger.record_decision(
+        RUN_ID,
+        expected_state=WorkflowState.AWAITING_APPROVAL,
+        expected_revision=awaiting.run.revision,
+        decision=ApprovalDecision.APPROVED,
+        source=ApprovalSource.CLI,
+        operator="editor",
+        host="workstation",
+        terminal_present=True,
+        binding_sha256=HASH_D,
+        expires_at="2026-07-28T01:02:03Z",
+        approval_summary="Approved",
+        event_type="approval_recorded",
+        event_payload={"binding_sha256": HASH_D},
+    )
+
+    with pytest.raises(FCPMCPError) as prepare_patch:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.APPROVED,
+            expected_revision=approved.run.revision,
+            event_type="plan_built",
+            payload={"sha256": HASH_B},
+            projection_patch={
+                "plan_sha256": HASH_B,
+                "committed_at": "2026-07-27T02:02:03Z",
+            },
+        )
+    _assert_code(prepare_patch, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    cancelled = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.APPROVED,
+        expected_revision=approved.run.revision,
+        target_state=WorkflowState.CANCELLED,
+        event_type="cancelled",
+        payload={},
+    )
+    with pytest.raises(FCPMCPError) as terminal_append:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.CANCELLED,
+            expected_revision=cancelled.run.revision,
+            event_type="late_event",
+            payload={},
+        )
+    _assert_code(terminal_append, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    stored = ledger.get_run(RUN_ID)
+    assert stored is not None
+    assert stored.plan_sha256 == HASH_A
+    assert stored.committed_at is None
+    assert stored.revision == cancelled.run.revision
+
+
+@pytest.mark.parametrize(
+    "state",
+    [WorkflowState.AWAITING_APPROVAL, WorkflowState.APPROVED],
+)
+def test_artifacts_cannot_be_recorded_after_prepare(
+    tmp_path: Path,
+    state: WorkflowState,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    awaiting = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        target_state=WorkflowState.AWAITING_APPROVAL,
+        event_type="prepare_completed",
+        payload={},
+    )
+    revision = awaiting.run.revision
+    if state is WorkflowState.APPROVED:
+        decision = ledger.record_decision(
+            RUN_ID,
+            expected_state=WorkflowState.AWAITING_APPROVAL,
+            expected_revision=revision,
+            decision=ApprovalDecision.APPROVED,
+            source=ApprovalSource.CLI,
+            operator=None,
+            host=None,
+            terminal_present=True,
+            binding_sha256=HASH_D,
+            expires_at=None,
+            approval_summary="Approved",
+            event_type="approval_recorded",
+            event_payload={"binding_sha256": HASH_D},
+        )
+        revision = decision.run.revision
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.record_artifact(
+            _metadata(),
+            expected_state=state,
+            expected_revision=revision,
+            event_type="candidate_stored",
+            event_payload={},
+        )
+    _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+    assert ledger.get_run(RUN_ID).revision == revision  # type: ignore[union-attr]
+
+
+def test_integrity_detects_projection_and_approval_phase_inconsistency(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    prepared = ledger.append_event(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="plan_built",
+        payload={"sha256": HASH_A},
+        projection_patch={"plan_sha256": HASH_A},
+    )
+    awaiting = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=prepared.run.revision,
+        target_state=WorkflowState.AWAITING_APPROVAL,
+        event_type="prepare_completed",
+        payload={},
+    )
+    ledger.record_decision(
+        RUN_ID,
+        expected_state=WorkflowState.AWAITING_APPROVAL,
+        expected_revision=awaiting.run.revision,
+        decision=ApprovalDecision.APPROVED,
+        source=ApprovalSource.CLI,
+        operator=None,
+        host=None,
+        terminal_present=True,
+        binding_sha256=HASH_D,
+        expires_at=None,
+        approval_summary="Approved",
+        event_type="approval_recorded",
+        event_payload={"binding_sha256": HASH_D},
+    )
+    connection = _raw(ledger.paths.database)
+    try:
+        connection.execute(
+            "UPDATE runs SET plan_sha256 = ?, committed_at = ? WHERE run_id = ?",
+            (HASH_B, "2026-07-27T02:02:03Z", RUN_ID),
+        )
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity(RUN_ID)
+
+    assert result.valid is False
+    assert {finding.code for finding in result.findings} >= {
+        "projection_invariant",
+    }
+
+
 def test_append_only_triggers_reject_update_and_delete(
     tmp_path: Path,
 ) -> None:
@@ -1283,22 +1889,78 @@ def test_concurrent_same_key_same_request_creates_exactly_one_run(
     assert len(verifier.list_runs(limit=10)) == 1
 
 
-def test_reserve_idempotency_key_is_bounded_unique_and_typed(tmp_path: Path) -> None:
+def test_reserve_idempotency_key_is_audited_cas_and_prepare_only(
+    tmp_path: Path,
+) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger)
 
-    first = ledger.reserve_idempotency_key("later-key", HASH_A, RUN_ID)
-    second = ledger.reserve_idempotency_key("later-key", HASH_A, RUN_ID)
+    first = ledger.reserve_idempotency_key(
+        "later-key",
+        HASH_A,
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="idempotency_reserved",
+        event_payload={"key": "later-key"},
+    )
+    second = ledger.reserve_idempotency_key(
+        "later-key",
+        HASH_A,
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="idempotency_reserved",
+        event_payload={"key": "later-key"},
+    )
 
     assert first.existing is False
+    assert first.run.revision == 2
+    assert len(ledger.list_events(RUN_ID, limit=10)) == 2
     assert second.existing is True
     assert second.run.run_id == RUN_ID
     with pytest.raises(FCPMCPError) as conflict:
-        ledger.reserve_idempotency_key("later-key", HASH_B, RUN_ID)
+        ledger.reserve_idempotency_key(
+            "later-key",
+            HASH_B,
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=2,
+            event_type="idempotency_reserved",
+            event_payload={},
+        )
     _assert_code(conflict, ErrorCode.IDEMPOTENCY_CONFLICT)
     with pytest.raises(FCPMCPError) as too_long:
-        ledger.reserve_idempotency_key("x" * 129, HASH_A, RUN_ID)
+        ledger.reserve_idempotency_key(
+            "x" * 129,
+            HASH_A,
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=2,
+            event_type="idempotency_reserved",
+            event_payload={},
+        )
     _assert_code(too_long, ErrorCode.INVALID_ARGUMENTS)
+
+    awaiting = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=2,
+        target_state=WorkflowState.AWAITING_APPROVAL,
+        event_type="prepare_completed",
+        payload={},
+    )
+    with pytest.raises(FCPMCPError) as wrong_phase:
+        ledger.reserve_idempotency_key(
+            "late-key",
+            HASH_A,
+            RUN_ID,
+            expected_state=WorkflowState.AWAITING_APPROVAL,
+            expected_revision=awaiting.run.revision,
+            event_type="idempotency_reserved",
+            event_payload={},
+        )
+    _assert_code(wrong_phase, ErrorCode.WORKFLOW_STATE_CONFLICT)
 
 
 def test_real_concurrent_writer_serializes_then_commits(tmp_path: Path) -> None:
@@ -1408,7 +2070,7 @@ def test_integrity_verifier_uses_one_snapshot_during_concurrent_append(
     resume_event_select = threading.Event()
     paused = False
 
-    class PausingConnection(sqlite3.Connection):
+    class PausingConnection(ledger_module._LedgerConnection):
         def execute(
             self,
             sql: str,
@@ -1623,6 +2285,69 @@ def test_integrity_verifier_detects_orphan_event_rows(tmp_path: Path) -> None:
     assert {finding.code for finding in result.findings} >= {"orphan_event"}
 
 
+def test_child_tables_constrain_run_identity_length(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    connection = _raw(ledger.paths.database)
+    try:
+        definitions = {
+            row["name"]: row["sql"]
+            for row in connection.execute(
+                "SELECT name, sql FROM sqlite_master "
+                "WHERE type = 'table' AND name IN "
+                "('events', 'artifacts', 'approvals', 'idempotency_keys')"
+            )
+        }
+    finally:
+        connection.close()
+
+    assert set(definitions) == {
+        "events",
+        "artifacts",
+        "approvals",
+        "idempotency_keys",
+    }
+    assert all("length(run_id) = 36" in sql for sql in definitions.values())
+
+
+def test_integrity_sanitizes_hostile_orphan_identity_and_sequence(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    hostile_run_id = "x" * 200_000
+    connection = _raw(ledger.paths.database)
+    try:
+        connection.execute("PRAGMA ignore_check_constraints=ON")
+        connection.execute(
+            "INSERT INTO events("
+            "run_id, sequence, event_type, payload_text, timestamp, elapsed_ms, "
+            "previous_hash, event_hash"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                hostile_run_id,
+                1,
+                "orphan",
+                "{}",
+                "2026-07-27T01:02:03Z",
+                None,
+                "0" * 64,
+                "f" * 64,
+            ),
+        )
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity()
+
+    assert result.valid is False
+    orphan = next(finding for finding in result.findings if finding.code == "orphan_event")
+    assert orphan.run_id is None or (
+        len(orphan.run_id) <= 36
+        and "\x00" not in orphan.run_id
+        and orphan.run_id.encode("utf-8")
+    )
+    assert orphan.sequence == 1
+
+
 def test_integrity_verifier_returns_typed_migration_tamper_finding(
     tmp_path: Path,
 ) -> None:
@@ -1766,6 +2491,183 @@ def test_list_runs_and_events_are_bounded_and_deterministic(tmp_path: Path) -> N
     _assert_code(too_many, ErrorCode.INVALID_ARGUMENTS)
 
 
+def _database_entry_snapshot(root: Path) -> dict[str, tuple[bytes, int, int]]:
+    return {
+        path.name: (
+            path.read_bytes(),
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+        )
+        for path in root.iterdir()
+        if path.is_file() and path.name.startswith("runs.sqlite3")
+    }
+
+
+def test_read_apis_do_not_rewrite_a_nonconforming_wal_database(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    connection = _raw(ledger.paths.database)
+    try:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    finally:
+        connection.close()
+    before_entries = {path.name for path in ledger.paths.root.iterdir()}
+    before = _database_entry_snapshot(ledger.paths.root)
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.list_runs(limit=10)
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert {path.name for path in ledger.paths.root.iterdir()} == before_entries
+    assert _database_entry_snapshot(ledger.paths.root) == before
+
+
+def test_healthy_read_apis_leave_database_aliases_bytes_and_times_unchanged(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    before_entries = {path.name for path in ledger.paths.root.iterdir()}
+    before = _database_entry_snapshot(ledger.paths.root)
+
+    assert ledger.get_run(RUN_ID) is not None
+    assert ledger.list_runs(limit=10)
+    assert ledger.list_events(RUN_ID, limit=10)
+    assert ledger.get_artifact(RUN_ID, ArtifactKind.CANDIDATE) is None
+    assert ledger.list_artifacts(RUN_ID, limit=10) == ()
+    assert ledger.get_approval(RUN_ID) is None
+    assert ledger.verify_integrity(RUN_ID).valid is True
+
+    assert {path.name for path in ledger.paths.root.iterdir()} == before_entries
+    assert _database_entry_snapshot(ledger.paths.root) == before
+    assert not any(
+        path.name.startswith(("fd", "proc", "dev"))
+        for path in ledger.paths.root.iterdir()
+    )
+
+
+def test_restart_read_surface_returns_typed_artifacts_and_approval(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    candidate = ledger.record_artifact(
+        _metadata(),
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="candidate_stored",
+        event_payload={},
+    )
+    diff = ledger.record_artifact(
+        _metadata(kind=ArtifactKind.DIFF, digest=HASH_D, size=17),
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=candidate.run.revision,
+        event_type="diff_created",
+        event_payload={},
+    )
+    awaiting = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=diff.run.revision,
+        target_state=WorkflowState.AWAITING_APPROVAL,
+        event_type="prepare_completed",
+        payload={},
+    )
+    decision = ledger.record_decision(
+        RUN_ID,
+        expected_state=WorkflowState.AWAITING_APPROVAL,
+        expected_revision=awaiting.run.revision,
+        decision=ApprovalDecision.APPROVED,
+        source=ApprovalSource.CLI,
+        operator="editor",
+        host="workstation",
+        terminal_present=True,
+        binding_sha256=HASH_E,
+        expires_at="2026-07-28T01:02:03Z",
+        approval_summary="Approved",
+        event_type="approval_recorded",
+        event_payload={"binding_sha256": HASH_E},
+    )
+    restarted = WorkflowLedger(
+        ledger.paths,
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+
+    stored_candidate = restarted.get_artifact(RUN_ID, ArtifactKind.CANDIDATE)
+    artifacts = restarted.list_artifacts(RUN_ID, limit=1)
+    remaining = restarted.list_artifacts(
+        RUN_ID,
+        after_kind=artifacts[-1].kind,
+        limit=10,
+    )
+    approval = restarted.get_approval(RUN_ID)
+
+    assert isinstance(stored_candidate, ArtifactRecord)
+    assert stored_candidate.sha256 == HASH_C
+    assert [record.kind for record in artifacts + remaining] == [
+        ArtifactKind.CANDIDATE,
+        ArtifactKind.DIFF,
+    ]
+    assert isinstance(approval, ApprovalRecord)
+    assert approval == decision.approval
+
+
+def test_terminal_cutoff_keyset_reaches_more_than_one_thousand_runs(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    timestamp = "2020-01-01T00:00:00Z"
+    rows = [
+        (
+            f"00000000-0000-4000-8000-{number:012x}",
+            "1",
+            "0.3.0-test",
+            "1",
+            WorkflowState.FAILED.value,
+            1,
+            Profile.WORKFLOW.value,
+            ApprovalMode.CLI.value,
+            "/private/input.fcpxml",
+            "/private/output.fcpxml",
+            timestamp,
+            timestamp,
+        )
+        for number in range(1, 1006)
+    ]
+    connection = _raw(ledger.paths.database)
+    try:
+        connection.executemany(
+            "INSERT INTO runs("
+            "run_id, graph_version, package_version, run_version, state, revision, "
+            "profile, approval_mode, source_path, destination_path, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+    finally:
+        connection.close()
+
+    first = ledger.list_terminal_runs_before(
+        "2026-01-01T00:00:00Z",
+        limit=1000,
+    )
+    second = ledger.list_terminal_runs_before(
+        "2026-01-01T00:00:00Z",
+        after_updated_at=first[-1].updated_at,
+        after_run_id=first[-1].run_id,
+        limit=1000,
+    )
+
+    assert len(first) == 1000
+    assert len(second) == 5
+    assert len({run.run_id for run in first + second}) == 1005
+    assert [run.run_id for run in first + second] == sorted(
+        run.run_id for run in first + second
+    )
+
+
 def test_invalid_values_fail_before_sql_with_stable_caller_codes(tmp_path: Path) -> None:
     ledger = _ledger(tmp_path)
     with pytest.raises(FCPMCPError) as run_id:
@@ -1791,6 +2693,84 @@ def test_invalid_values_fail_before_sql_with_stable_caller_codes(tmp_path: Path)
             elapsed_ms=-1,
         )
     _assert_code(elapsed, ErrorCode.INVALID_ARGUMENTS)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("event_type", "\x00"),
+        ("source_path", "\ud800"),
+    ],
+)
+def test_public_text_rejects_nul_and_non_utf8_before_sql(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    ledger = _ledger(tmp_path)
+    arguments: dict[str, object] = {
+        "run_id": RUN_ID,
+        "graph_version": "1",
+        "run_version": "1",
+        "profile": Profile.WORKFLOW,
+        "approval_mode": ApprovalMode.CLI,
+        "source_path": "/private/input.fcpxml",
+        "destination_path": "/private/output.fcpxml",
+        "event_type": "run_created",
+        "event_payload": {},
+    }
+    arguments[field] = value
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.create_run(**arguments)  # type: ignore[arg-type]
+
+    _assert_code(error, ErrorCode.INVALID_ARGUMENTS)
+    assert ledger.list_runs(limit=10) == ()
+
+
+@pytest.mark.parametrize("bad_text", ["\x00", "\ud800"])
+def test_event_payload_text_rejects_unsafe_unicode_before_sql(
+    tmp_path: Path,
+    bad_text: str,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=1,
+            event_type="unsafe_payload",
+            payload={"text": bad_text},
+        )
+
+    _assert_code(error, ErrorCode.INVALID_ARGUMENTS)
+    run = ledger.get_run(RUN_ID)
+    assert run is not None and run.revision == 1
+
+
+def test_text_character_limits_match_sqlite_unicode_length(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+
+    accepted = ledger.append_event(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="😀" * 128,
+        payload={},
+    )
+    assert accepted.event.event_type == "😀" * 128
+    with pytest.raises(FCPMCPError) as error:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=2,
+            event_type="😀" * 129,
+            payload={},
+        )
+    _assert_code(error, ErrorCode.INVALID_ARGUMENTS)
 
 
 def test_integers_outside_sqlite_signed_range_fail_before_sql(

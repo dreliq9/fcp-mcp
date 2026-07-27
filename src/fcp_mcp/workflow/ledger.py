@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -9,7 +10,9 @@ import re
 import secrets
 import sqlite3
 import stat
+import zlib
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +28,8 @@ from fcp_mcp.workflow.artifacts import (
     ArtifactKind,
     ArtifactMetadataV1,
     StatePaths,
+    _fallback_open_file,
+    _windows_directory_guard,
 )
 from fcp_mcp.workflow.models import (
     ApprovalDecision,
@@ -37,6 +42,7 @@ from fcp_mcp.workflow.models import (
 
 _DATABASE_NAME = "runs.sqlite3"
 _DATABASE_MODE = 0o600
+_ROOT_MODE = 0o700
 _BUSY_TIMEOUT_MS = 5000
 _ZERO_HASH = "0" * 64
 _MAX_EVENT_TYPE_CHARS = 128
@@ -48,6 +54,39 @@ _MAX_READ_LIMIT = 1000
 _MAX_INTEGRITY_FINDINGS = 100
 _MAX_CREATE_RACE_RETRIES = 3
 _SQLITE_MAX_INTEGER = 2**63 - 1
+_BOOTSTRAP_TABLE = "__fcp_ledger_identity"
+_BOOTSTRAP_SCHEMA_SQL = (
+    "CREATE TABLE __fcp_ledger_identity("
+    "token TEXT NOT NULL CHECK(length(token)=64))"
+)
+_BOOTSTRAP_PLACEHOLDER = b"0" * 64
+_BOOTSTRAP_TOKEN_OFFSET = 8128
+_BOOTSTRAP_TEMP_PREFIX = ".runs.sqlite3.bootstrap-"
+# Generated with SQLite 3.53.0 using a 4096-byte page size, the exact
+# _BOOTSTRAP_SCHEMA_SQL above, and one 64-character zero-token row. SQLite's
+# version-3 file format is backwards compatible across the supported runtime
+# matrix. The compressed fixture is validated without filesystem I/O at import.
+_BOOTSTRAP_IMAGE = zlib.decompress(
+    base64.b64decode(
+        "eNrt18EKAVEUBuBzh1iJne1ZmpQUsVKYbikTYZTdNLiYjCHdkuU8hKfxAh7LCBsp"
+        "Cxvl/zr/4pz+Fzijge1rxYvtfuNprlCOhKAmMxEZjzyJOMmX/RODSqdL5lbOHige"
+        "AAAAAAAAgH8SpUQ6X6+LqKi9aaBcdzHbuYGaL9Xe9ecq1L4+vj0a1lC2HMlOq21"
+        "Lflsp6O1ahezIicO9fpyxbbPVkVa3EKhwqVf3gtmoVU3z/pufKR4AAAAAAAAA+D2"
+        "WSESZ8peucc1Fcw=="
+    )
+)
+if (
+    len(_BOOTSTRAP_IMAGE) != 8192
+    or not _BOOTSTRAP_IMAGE.startswith(b"SQLite format 3\x00")
+    or _BOOTSTRAP_IMAGE[16:18] != b"\x10\x00"
+    or _BOOTSTRAP_IMAGE.count(_BOOTSTRAP_PLACEHOLDER) != 1
+    or _BOOTSTRAP_IMAGE[
+        _BOOTSTRAP_TOKEN_OFFSET : _BOOTSTRAP_TOKEN_OFFSET
+        + len(_BOOTSTRAP_PLACEHOLDER)
+    ]
+    != _BOOTSTRAP_PLACEHOLDER
+):
+    raise RuntimeError("embedded workflow ledger bootstrap image is invalid")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -106,6 +145,97 @@ class Migration:
     name: str
     statements: tuple[str, ...]
     checksum: str
+
+
+@dataclass
+class _RootAnchor:
+    path: Path
+    descriptor: int | None
+    identity: tuple[int, int, int]
+    guard: ExitStack | None = None
+
+    def close(self) -> None:
+        failures: list[BaseException] = []
+        descriptor, self.descriptor = self.descriptor, None
+        guard, self.guard = self.guard, None
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                failures.append(error)
+        if guard is not None:
+            try:
+                guard.close()
+            except (OSError, RuntimeError) as error:
+                failures.append(error)
+        if failures:
+            primary = failures[0]
+            _attach_cleanup_failures(primary, failures[1:])
+            raise primary
+
+
+@dataclass
+class _DatabaseLease:
+    anchor: _RootAnchor
+    name: str
+    descriptor: int
+    identity: tuple[int, int, int]
+    bootstrap_token: str | None
+    owns_anchor: bool = True
+
+    def close(self) -> None:
+        failure: BaseException | None = None
+        try:
+            os.close(self.descriptor)
+        except OSError as error:
+            failure = error
+        finally:
+            if self.owns_anchor:
+                try:
+                    self.anchor.close()
+                except (OSError, RuntimeError) as error:
+                    if failure is None:
+                        failure = error
+                    else:
+                        _attach_cleanup_failures(failure, [error])
+        if failure is not None:
+            raise failure
+
+
+class _LedgerConnection(sqlite3.Connection):
+    """SQLite connection that retains its validated filesystem authority."""
+
+    _ledger_lease: _DatabaseLease | None = None
+    _ledger_read_only = False
+
+    def retain_lease(
+        self,
+        lease: _DatabaseLease,
+        *,
+        read_only: bool,
+    ) -> None:
+        if self._ledger_lease is not None:
+            raise RuntimeError("workflow connection already retains a lease")
+        self._ledger_lease = lease
+        self._ledger_read_only = read_only
+
+    def close(self) -> None:
+        primary: BaseException | None = None
+        try:
+            super().close()
+        except sqlite3.Error as error:
+            primary = error
+        lease, self._ledger_lease = self._ledger_lease, None
+        if lease is not None:
+            try:
+                lease.close()
+            except (OSError, RuntimeError) as error:
+                if primary is None:
+                    primary = error
+                else:
+                    _attach_cleanup_failures(primary, [error])
+        if primary is not None:
+            raise primary
 
 
 @dataclass(frozen=True)
@@ -368,7 +498,7 @@ _MIGRATION_1_STATEMENTS = (
     """.strip(),
     """
     CREATE TABLE events (
-        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        run_id TEXT NOT NULL REFERENCES runs(run_id) CHECK (length(run_id) = 36),
         sequence INTEGER NOT NULL CHECK (sequence > 0),
         event_type TEXT NOT NULL CHECK (length(event_type) BETWEEN 1 AND 128),
         payload_text TEXT NOT NULL CHECK (length(payload_text) <= 1048576),
@@ -385,7 +515,7 @@ _MIGRATION_1_STATEMENTS = (
     """.strip(),
     """
     CREATE TABLE artifacts (
-        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        run_id TEXT NOT NULL REFERENCES runs(run_id) CHECK (length(run_id) = 36),
         kind TEXT NOT NULL CHECK (kind IN ('candidate', 'diff')),
         relative_path TEXT NOT NULL UNIQUE CHECK (length(relative_path) BETWEEN 1 AND 255),
         sha256 TEXT NOT NULL CHECK (
@@ -398,7 +528,7 @@ _MIGRATION_1_STATEMENTS = (
     """.strip(),
     """
     CREATE TABLE approvals (
-        run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+        run_id TEXT PRIMARY KEY REFERENCES runs(run_id) CHECK (length(run_id) = 36),
         decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected')),
         source TEXT NOT NULL CHECK (source IN ('cli', 'client')),
         operator TEXT CHECK (operator IS NULL OR length(operator) BETWEEN 1 AND 255),
@@ -417,7 +547,7 @@ _MIGRATION_1_STATEMENTS = (
         request_sha256 TEXT NOT NULL CHECK (
             length(request_sha256) = 64 AND request_sha256 NOT GLOB '*[^0-9a-f]*'
         ),
-        run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id)
+        run_id TEXT NOT NULL UNIQUE REFERENCES runs(run_id) CHECK (length(run_id) = 36)
     )
     """.strip(),
     "CREATE INDEX idx_runs_created ON runs(created_at DESC, run_id ASC)",
@@ -487,28 +617,53 @@ MIGRATIONS = (
     ),
 )
 
-_REQUIRED_TABLES = frozenset(
+_EXPECTED_TABLE_SQL = {
+    statement.split()[2]: statement
+    for statement in _MIGRATION_1_STATEMENTS
+    if statement.startswith("CREATE TABLE ")
+}
+_EXPECTED_TRIGGER_SQL = {
+    statement.split()[2]: statement
+    for statement in _MIGRATION_1_STATEMENTS
+    if statement.startswith("CREATE TRIGGER ")
+}
+_EXPECTED_TRIGGER_TABLES = {
+    name: re.search(r"\bON ([a-z_]+)\b", statement).group(1)
+    for name, statement in _EXPECTED_TRIGGER_SQL.items()
+}
+_EXPECTED_INDEX_SQL = {
+    statement.split()[2]: statement
+    for statement in _MIGRATION_1_STATEMENTS
+    if statement.startswith("CREATE INDEX ")
+}
+_EXPECTED_INDEX_TABLES = {
+    name: re.search(r"\bON ([a-z_]+)\b", statement).group(1)
+    for name, statement in _EXPECTED_INDEX_SQL.items()
+}
+_REQUIRED_TABLES = frozenset(_EXPECTED_TABLE_SQL)
+_REQUIRED_TRIGGERS = frozenset(_EXPECTED_TRIGGER_SQL)
+_REQUIRED_INDEXES = frozenset(_EXPECTED_INDEX_SQL)
+_TERMINAL_STATES = frozenset(
     {
-        "schema_migrations",
-        "runs",
-        "events",
-        "artifacts",
-        "approvals",
-        "idempotency_keys",
+        WorkflowState.COMMITTED,
+        WorkflowState.FAILED,
+        WorkflowState.REJECTED,
+        WorkflowState.CANCELLED,
+        WorkflowState.EXPIRED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+        WorkflowState.RECOVERY_REQUIRED,
     }
 )
-_REQUIRED_TRIGGERS = frozenset(
+_PRUNE_ELIGIBLE_STATES = frozenset(
     {
-        "schema_migrations_no_update",
-        "schema_migrations_no_delete",
-        "events_no_update",
-        "events_no_delete",
-        "artifacts_no_update",
-        "artifacts_no_delete",
-        "approvals_no_update",
-        "approvals_no_delete",
-        "idempotency_keys_no_update",
-        "idempotency_keys_no_delete",
+        WorkflowState.COMMITTED,
+        WorkflowState.FAILED,
+        WorkflowState.REJECTED,
+        WorkflowState.CANCELLED,
+        WorkflowState.EXPIRED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
     }
 )
 _PROJECTION_PATCH_FIELDS = frozenset(
@@ -530,6 +685,35 @@ _PROJECTION_PATCH_FIELDS = frozenset(
         "terminal_error_summary",
     }
 )
+_PREPARE_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
+    "source_sha256": frozenset({"source_inspected"}),
+    "prior_destination_state": frozenset({"source_inspected"}),
+    "prior_destination_sha256": frozenset({"source_inspected"}),
+    "plan_sha256": frozenset({"plan_built", "plan_normalized"}),
+    "receipt_sha256": frozenset({"dry_run_completed"}),
+    "receipt_size_bytes": frozenset({"dry_run_completed"}),
+    "expires_at": frozenset(
+        {
+            "awaiting_approval",
+            "prepare_completed",
+            "prepared",
+            "preview_persisted",
+        }
+    ),
+}
+_COMMIT_INTENT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
+    "commit_attempt_id": frozenset({"commit_started"}),
+    "expected_backup_path": frozenset({"commit_started"}),
+    "backup_sha256": frozenset({"backup_created", "commit_started"}),
+}
+_COMMIT_RESULT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
+    "destination_sha256": frozenset({"commit_completed", "committed"}),
+    "committed_at": frozenset({"commit_completed", "committed"}),
+}
+_TERMINAL_ERROR_FIELDS = frozenset(
+    {"terminal_error_code", "terminal_error_summary"}
+)
+_APPROVAL_PROJECTION_FIELDS = frozenset({"approval_summary"})
 
 
 def _is_reparse_stat(result: os.stat_result) -> bool:
@@ -546,13 +730,39 @@ def _stat_identity(result: os.stat_result) -> tuple[int, int, int]:
     )
 
 
-def _rollback(connection: sqlite3.Connection, begun: bool) -> None:
-    if not begun:
+def _attach_cleanup_failures(
+    primary: BaseException,
+    failures: Sequence[BaseException],
+) -> None:
+    if not failures:
         return
+    bounded = tuple(
+        _MigrationError(
+            (
+                f"{type(failure).__name__}: {failure}"
+                if str(failure)
+                else type(failure).__name__
+            )[:255]
+        )
+        for failure in failures
+    )
+    try:
+        primary.__dict__["cleanup_failures"] = bounded
+    except (AttributeError, TypeError):
+        pass
+
+
+def _rollback(
+    connection: sqlite3.Connection,
+    begun: bool,
+) -> sqlite3.Error | None:
+    if not begun:
+        return None
     try:
         connection.execute("ROLLBACK")
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as error:
+        return error
+    return None
 
 
 def _fsync_file(path: Path) -> None:
@@ -574,6 +784,54 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _validate_projection_policy(
+    *,
+    source: WorkflowState,
+    target: WorkflowState,
+    event_type: str,
+    patch: Mapping[str, object],
+) -> None:
+    if source in _TERMINAL_STATES:
+        raise _state_conflict("terminal workflow runs are immutable")
+    if target in {WorkflowState.APPROVED, WorkflowState.REJECTED}:
+        raise _state_conflict("approval transitions require record_decision")
+    fields = frozenset(patch)
+    if fields & _APPROVAL_PROJECTION_FIELDS:
+        raise _state_conflict("approval fields require record_decision")
+
+    allowed: set[str] = set()
+    if source is WorkflowState.PREPARING:
+        for field, event_types in _PREPARE_PROJECTION_EVENTS.items():
+            if event_type in event_types:
+                allowed.add(field)
+    if (
+        source is WorkflowState.APPROVED
+        and target is WorkflowState.COMMITTING
+    ) or (
+        source is WorkflowState.COMMITTING
+        and target is WorkflowState.COMMITTING
+    ):
+        for field, event_types in _COMMIT_INTENT_PROJECTION_EVENTS.items():
+            if event_type in event_types:
+                allowed.add(field)
+    if source is WorkflowState.COMMITTING and target is WorkflowState.COMMITTED:
+        for field, event_types in _COMMIT_RESULT_PROJECTION_EVENTS.items():
+            if event_type in event_types:
+                allowed.add(field)
+        if event_type in {"commit_completed", "committed"}:
+            allowed.add("backup_sha256")
+        if patch.get("committed_at") is None:
+            raise _state_conflict(
+                "committed transitions require a committed_at timestamp"
+            )
+    if target in _TERMINAL_STATES - {WorkflowState.COMMITTED}:
+        allowed.update(_TERMINAL_ERROR_FIELDS)
+    if fields - allowed:
+        raise _state_conflict(
+            "projection fields are not allowed for this workflow event"
+        )
 
 
 class WorkflowLedger:
@@ -612,58 +870,145 @@ class WorkflowLedger:
             raise _ledger_unavailable(_MigrationError("database path contract changed"))
         return expected
 
-    def _validate_root(self) -> None:
-        try:
-            result = self.paths.root.lstat()
-        except OSError as error:
-            raise _ledger_unavailable(error)
-        if (
-            stat.S_ISLNK(result.st_mode)
-            or _is_reparse_stat(result)
-            or not stat.S_ISDIR(result.st_mode)
-        ):
-            raise _ledger_unavailable(_MigrationError("unsafe state root"))
-
-    def _secure_database_entry(self, *, create: bool = True) -> Path:
-        self._validate_root()
-        path = self._database_path()
-        for attempt in range(_MAX_CREATE_RACE_RETRIES):
+    def _open_root_anchor(self) -> _RootAnchor:
+        root = self.paths.root
+        if not root.is_absolute():
+            raise _MigrationError("workflow state root is not absolute")
+        if os.name != "posix":
+            guard = ExitStack()
             try:
-                result = path.lstat()
-            except FileNotFoundError:
-                if not create:
-                    raise _ledger_unavailable(
-                        FileNotFoundError("workflow database is missing")
-                    )
-                flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-                if hasattr(os, "O_CLOEXEC"):
-                    flags |= os.O_CLOEXEC
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
-                try:
-                    descriptor = os.open(path, flags, _DATABASE_MODE)
-                except FileExistsError as error:
-                    if attempt + 1 == _MAX_CREATE_RACE_RETRIES:
-                        raise _ledger_unavailable(error)
-                    continue
-                except OSError as error:
-                    raise _ledger_unavailable(error)
-                try:
-                    if os.name == "posix":
-                        os.fchmod(descriptor, _DATABASE_MODE)
-                    os.fsync(descriptor)
-                finally:
-                    os.close(descriptor)
-                try:
-                    _fsync_directory(self.paths.root)
-                    result = path.lstat()
-                except OSError as error:
-                    raise _ledger_unavailable(error)
-            except OSError as error:
-                raise _ledger_unavailable(error)
-            self._validate_database_stat(result)
-            return path
-        raise _ledger_unavailable(_MigrationError("database creation race did not settle"))
+                guard.enter_context(_windows_directory_guard(root))
+                result = root.lstat()
+                if (
+                    stat.S_ISLNK(result.st_mode)
+                    or _is_reparse_stat(result)
+                    or not stat.S_ISDIR(result.st_mode)
+                ):
+                    raise _MigrationError("unsafe state root")
+                return _RootAnchor(
+                    path=root,
+                    descriptor=None,
+                    identity=_stat_identity(result),
+                    guard=guard,
+                )
+            except BaseException:
+                guard.close()
+                raise
+
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        parts = root.parts
+        if not parts:
+            raise _MigrationError("workflow state root is empty")
+        current = os.open(parts[0], flags)
+        try:
+            for component in parts[1:]:
+                following = os.open(component, flags, dir_fd=current)
+                os.close(current)
+                current = following
+            opened = os.fstat(current)
+            current_path = root.lstat()
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or _is_reparse_stat(opened)
+                or stat.S_IMODE(opened.st_mode) != _ROOT_MODE
+                or _stat_identity(current_path) != _stat_identity(opened)
+            ):
+                raise _MigrationError("unsafe state root")
+            return _RootAnchor(
+                path=root,
+                descriptor=current,
+                identity=_stat_identity(opened),
+            )
+        except BaseException:
+            os.close(current)
+            raise
+
+    def _validate_anchor_path(self, anchor: _RootAnchor) -> None:
+        current = anchor.path.lstat()
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or _is_reparse_stat(current)
+            or _stat_identity(current) != anchor.identity
+        ):
+            raise _MigrationError("workflow state root changed during access")
+
+    def _root_names(self, anchor: _RootAnchor) -> tuple[str, ...]:
+        if anchor.descriptor is not None:
+            return tuple(os.listdir(anchor.descriptor))
+        return tuple(os.listdir(anchor.path))
+
+    def _stat_at(
+        self,
+        anchor: _RootAnchor,
+        name: str,
+    ) -> os.stat_result:
+        if anchor.descriptor is not None:
+            return os.stat(name, dir_fd=anchor.descriptor, follow_symlinks=False)
+        return (anchor.path / name).lstat()
+
+    def _open_at(
+        self,
+        anchor: _RootAnchor,
+        name: str,
+        *,
+        write: bool,
+        exclusive: bool = False,
+    ) -> int:
+        if anchor.descriptor is None:
+            return _fallback_open_file(
+                anchor.path / name,
+                write=write,
+                exclusive=exclusive,
+                failure_code=ErrorCode.LEDGER_UNAVAILABLE,
+            )
+        flags = os.O_RDWR if write else os.O_RDONLY
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        if exclusive:
+            flags |= os.O_CREAT | os.O_EXCL
+        return os.open(
+            name,
+            flags,
+            _DATABASE_MODE,
+            dir_fd=anchor.descriptor,
+        )
+
+    def _unlink_at(self, anchor: _RootAnchor, name: str) -> None:
+        if anchor.descriptor is not None:
+            os.unlink(name, dir_fd=anchor.descriptor)
+        else:
+            (anchor.path / name).unlink()
+
+    def _link_at(self, anchor: _RootAnchor, source: str, target: str) -> None:
+        if anchor.descriptor is not None:
+            os.link(
+                source,
+                target,
+                src_dir_fd=anchor.descriptor,
+                dst_dir_fd=anchor.descriptor,
+                follow_symlinks=False,
+            )
+        else:
+            os.link(anchor.path / source, anchor.path / target)
+
+    def _replace_at(self, anchor: _RootAnchor, source: str, target: str) -> None:
+        if anchor.descriptor is not None:
+            os.replace(
+                source,
+                target,
+                src_dir_fd=anchor.descriptor,
+                dst_dir_fd=anchor.descriptor,
+            )
+        else:
+            os.replace(anchor.path / source, anchor.path / target)
+
+    def _fsync_anchor(self, anchor: _RootAnchor) -> None:
+        if anchor.descriptor is not None:
+            os.fsync(anchor.descriptor)
 
     def _validate_database_stat(self, result: os.stat_result) -> None:
         if (
@@ -671,20 +1016,199 @@ class WorkflowLedger:
             or _is_reparse_stat(result)
             or not stat.S_ISREG(result.st_mode)
         ):
-            raise _ledger_unavailable(_MigrationError("unsafe workflow database entry"))
+            raise _MigrationError("unsafe workflow database entry")
         if os.name == "posix" and stat.S_IMODE(result.st_mode) != _DATABASE_MODE:
-            raise _ledger_unavailable(_MigrationError("unsafe workflow database mode"))
+            raise _MigrationError("unsafe workflow database mode")
+
+    def _cleanup_stale_bootstrap_entries(self, anchor: _RootAnchor) -> None:
+        try:
+            target = self._stat_at(anchor, _DATABASE_NAME)
+        except FileNotFoundError:
+            target = None
+        removed = False
+        for name in self._root_names(anchor):
+            if not name.startswith(_BOOTSTRAP_TEMP_PREFIX):
+                continue
+            try:
+                candidate = self._stat_at(anchor, name)
+            except FileNotFoundError:
+                continue
+            self._validate_database_stat(candidate)
+            if target is None or _stat_identity(candidate) != _stat_identity(target):
+                # A different inode may be an in-flight concurrent publisher.
+                # It has no authority over the fixed database entry.
+                continue
+            try:
+                self._unlink_at(anchor, name)
+            except FileNotFoundError:
+                continue
+            removed = True
+        if removed:
+            self._fsync_anchor(anchor)
+
+    def _write_bootstrap_image(self, descriptor: int, image: bytes) -> None:
+        offset = 0
+        while offset < len(image):
+            written = os.write(descriptor, image[offset:])
+            if written <= 0:
+                raise OSError("bootstrap write did not make progress")
+            offset += written
+
+    def _publish_bootstrap(self, anchor: _RootAnchor) -> None:
+        token = secrets.token_hex(32)
+        token_bytes = token.encode("ascii")
+        image = (
+            _BOOTSTRAP_IMAGE[:_BOOTSTRAP_TOKEN_OFFSET]
+            + token_bytes
+            + _BOOTSTRAP_IMAGE[
+                _BOOTSTRAP_TOKEN_OFFSET + len(_BOOTSTRAP_PLACEHOLDER) :
+            ]
+        )
+        temporary = f"{_BOOTSTRAP_TEMP_PREFIX}{secrets.token_hex(8)}.tmp"
+        descriptor = self._open_at(
+            anchor,
+            temporary,
+            write=True,
+            exclusive=True,
+        )
+        published = False
+        primary: BaseException | None = None
+        try:
+            if os.name == "posix":
+                os.fchmod(descriptor, _DATABASE_MODE)
+            self._write_bootstrap_image(descriptor, image)
+            os.fsync(descriptor)
+            self._link_at(anchor, temporary, _DATABASE_NAME)
+            published = True
+            self._unlink_at(anchor, temporary)
+            self._fsync_anchor(anchor)
+        except BaseException as error:
+            primary = error
+            cleanup_failures: list[BaseException] = []
+            try:
+                self._unlink_at(anchor, temporary)
+            except FileNotFoundError:
+                pass
+            except _LEDGER_FAILURES as cleanup_error:
+                cleanup_failures.append(cleanup_error)
+            _attach_cleanup_failures(error, cleanup_failures)
+            raise
+        finally:
+            try:
+                os.close(descriptor)
+            except OSError as cleanup_error:
+                if primary is not None:
+                    _attach_cleanup_failures(primary, [cleanup_error])
+                else:
+                    raise
+        if not published:
+            raise _MigrationError("bootstrap database was not published")
+
+    def _read_descriptor(self, descriptor: int, size: int) -> bytes:
+        position = os.lseek(descriptor, 0, os.SEEK_CUR)
+        try:
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            chunks: list[bytes] = []
+            remaining = size
+            while remaining:
+                chunk = os.read(descriptor, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+        finally:
+            os.lseek(descriptor, position, os.SEEK_SET)
+
+    def _bootstrap_token_from_descriptor(
+        self,
+        descriptor: int,
+        result: os.stat_result,
+    ) -> str | None:
+        if result.st_size == 0:
+            raise _MigrationError("preexisting empty database is unsafe")
+        header = self._read_descriptor(descriptor, min(result.st_size, 8192))
+        if not header.startswith(b"SQLite format 3\x00"):
+            raise _MigrationError("workflow database header is invalid")
+        if result.st_size != len(_BOOTSTRAP_IMAGE):
+            return None
+        token_bytes = header[
+            _BOOTSTRAP_TOKEN_OFFSET : _BOOTSTRAP_TOKEN_OFFSET
+            + len(_BOOTSTRAP_PLACEHOLDER)
+        ]
+        if re.fullmatch(rb"[0-9a-f]{64}", token_bytes) is None:
+            return None
+        normalized = (
+            header[:_BOOTSTRAP_TOKEN_OFFSET]
+            + _BOOTSTRAP_PLACEHOLDER
+            + header[_BOOTSTRAP_TOKEN_OFFSET + len(_BOOTSTRAP_PLACEHOLDER) :]
+        )
+        if normalized != _BOOTSTRAP_IMAGE:
+            return None
+        return token_bytes.decode("ascii")
+
+    def _secure_database_entry(
+        self,
+        *,
+        create: bool,
+        write: bool,
+    ) -> _DatabaseLease:
+        self._database_path()
+        anchor = self._open_root_anchor()
+        try:
+            self._cleanup_stale_bootstrap_entries(anchor)
+            for attempt in range(_MAX_CREATE_RACE_RETRIES):
+                try:
+                    result = self._stat_at(anchor, _DATABASE_NAME)
+                except FileNotFoundError:
+                    if not create:
+                        raise FileNotFoundError("workflow database is missing")
+                    try:
+                        self._publish_bootstrap(anchor)
+                    except FileExistsError:
+                        if attempt + 1 == _MAX_CREATE_RACE_RETRIES:
+                            raise
+                        continue
+                    result = self._stat_at(anchor, _DATABASE_NAME)
+                self._validate_database_stat(result)
+                descriptor = self._open_at(
+                    anchor,
+                    _DATABASE_NAME,
+                    write=write,
+                )
+                try:
+                    opened = os.fstat(descriptor)
+                    self._validate_database_stat(opened)
+                    if _stat_identity(opened) != _stat_identity(result):
+                        raise _MigrationError(
+                            "database entry changed while it was opened"
+                        )
+                    token = self._bootstrap_token_from_descriptor(
+                        descriptor,
+                        opened,
+                    )
+                    self._validate_anchor_path(anchor)
+                    return _DatabaseLease(
+                        anchor=anchor,
+                        name=_DATABASE_NAME,
+                        descriptor=descriptor,
+                        identity=_stat_identity(opened),
+                        bootstrap_token=token,
+                    )
+                except BaseException:
+                    os.close(descriptor)
+                    raise
+            raise _MigrationError("database creation race did not settle")
+        except BaseException:
+            anchor.close()
+            raise
 
     def _validate_internal_database_entry(self, path: Path) -> os.stat_result:
         result = path.lstat()
-        try:
-            self._validate_database_stat(result)
-        except FCPMCPError as error:
-            cause = error.__cause__ or error
-            raise OSError("unsafe internal database entry") from cause
+        self._validate_database_stat(result)
         return result
 
-    def _configure_connection(self, connection: sqlite3.Connection) -> None:
+    def _configure_write_connection(self, connection: sqlite3.Connection) -> None:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA journal_mode=DELETE")
         connection.execute("PRAGMA synchronous=FULL")
@@ -699,30 +1223,164 @@ class WorkflowLedger:
         if observed != ("delete", 2, 1, _BUSY_TIMEOUT_MS):
             raise _MigrationError("SQLite connection contract was not applied")
 
-    def _connect_path(self, path: Path) -> sqlite3.Connection:
-        before = self._validate_internal_database_entry(path)
+    def _configure_read_connection(self, connection: sqlite3.Connection) -> None:
+        connection.row_factory = sqlite3.Row
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+        if journal_mode != "delete":
+            raise _MigrationError("workflow database journal mode is not delete")
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+        observed = (
+            connection.execute("PRAGMA query_only").fetchone()[0],
+            connection.execute("PRAGMA journal_mode").fetchone()[0],
+            connection.execute("PRAGMA synchronous").fetchone()[0],
+            connection.execute("PRAGMA foreign_keys").fetchone()[0],
+            connection.execute("PRAGMA busy_timeout").fetchone()[0],
+        )
+        if observed != (1, "delete", 2, 1, _BUSY_TIMEOUT_MS):
+            raise _MigrationError("read-only SQLite contract was not applied")
+
+    def _validate_connection_identity(
+        self,
+        lease: _DatabaseLease,
+        opened_path: Path | None,
+    ) -> None:
+        opened_descriptor = os.fstat(lease.descriptor)
+        current = self._stat_at(lease.anchor, lease.name)
+        self._validate_database_stat(opened_descriptor)
+        self._validate_database_stat(current)
+        if (
+            _stat_identity(opened_descriptor) != lease.identity
+            or _stat_identity(current) != lease.identity
+        ):
+            raise _MigrationError("database entry changed while it was opened")
+        self._validate_anchor_path(lease.anchor)
+        if opened_path is not None:
+            opened = self._validate_internal_database_entry(opened_path)
+            if _stat_identity(opened) != lease.identity:
+                raise _MigrationError("SQLite opened a different database entry")
+
+    def _verify_bootstrap_connection(
+        self,
+        connection: sqlite3.Connection,
+        expected_token: str,
+    ) -> bool:
+        try:
+            objects = tuple(
+                connection.execute(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+                ).fetchmany(3)
+            )
+            tokens = tuple(
+                connection.execute(
+                    f"SELECT token FROM {_BOOTSTRAP_TABLE}"
+                ).fetchmany(2)
+            )
+        except sqlite3.Error:
+            migrated = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'schema_migrations'"
+            ).fetchone()
+            if migrated is not None:
+                return False
+            raise
+        expected_object = (
+            "table",
+            _BOOTSTRAP_TABLE,
+            _BOOTSTRAP_TABLE,
+            _BOOTSTRAP_SCHEMA_SQL,
+        )
+        observed_objects = tuple(
+            (row["type"], row["name"], row["tbl_name"], row["sql"])
+            for row in objects
+        )
+        if (
+            observed_objects != (expected_object,)
+            or len(tokens) != 1
+            or not isinstance(tokens[0]["token"], str)
+            or not secrets.compare_digest(tokens[0]["token"], expected_token)
+        ):
+            raise _MigrationError("bootstrap database identity mismatch")
+        return True
+
+    def _probe_write_identity(self, connection: sqlite3.Connection) -> None:
+        probe_name = f"__fcp_identity_probe_{secrets.token_hex(8)}"
+        begun = False
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            begun = True
+            connection.execute(f'CREATE TABLE main."{probe_name}"(value INTEGER)')
+            connection.execute("ROLLBACK")
+            begun = False
+        except _LEDGER_FAILURES as error:
+            rollback_error = _rollback(connection, begun)
+            begun = False
+            if rollback_error is not None:
+                _attach_cleanup_failures(error, [rollback_error])
+            raise
+        finally:
+            if begun:
+                rollback_error = _rollback(connection, begun)
+                if rollback_error is not None:
+                    raise rollback_error
+
+    def _connect_lease(
+        self,
+        lease: _DatabaseLease,
+        *,
+        read_only: bool,
+    ) -> sqlite3.Connection:
         connection: sqlite3.Connection | None = None
         try:
+            if read_only and lease.anchor.descriptor is not None:
+                descriptor_path = (
+                    Path(f"/proc/self/fd/{lease.descriptor}")
+                    if Path("/proc/self/fd").is_dir()
+                    else Path(f"/dev/fd/{lease.descriptor}")
+                )
+                database_uri = f"{descriptor_path.as_uri()}?mode=ro"
+            else:
+                mode = "ro" if read_only else "rw"
+                database_uri = f"{(lease.anchor.path / lease.name).as_uri()}?mode={mode}"
             connection = sqlite3.connect(
-                f"{path.as_uri()}?mode=rw",
+                database_uri,
                 timeout=_BUSY_TIMEOUT_MS / 1000,
                 isolation_level=None,
                 uri=True,
+                factory=_LedgerConnection,
             )
             connection.row_factory = sqlite3.Row
             database_row = connection.execute("PRAGMA database_list").fetchone()
             if database_row is None or not database_row["file"]:
                 raise _MigrationError("SQLite did not identify the opened database")
-            after = self._validate_internal_database_entry(path)
-            opened_path = Path(database_row["file"])
-            opened = self._validate_internal_database_entry(opened_path)
-            expected_identity = _stat_identity(before)
-            if (
-                _stat_identity(after) != expected_identity
-                or _stat_identity(opened) != expected_identity
+            opened_path = None if read_only and lease.anchor.descriptor is not None else Path(
+                database_row["file"]
+            )
+            self._validate_connection_identity(lease, opened_path)
+            bootstrap = False
+            if lease.bootstrap_token is not None:
+                bootstrap = self._verify_bootstrap_connection(
+                    connection,
+                    lease.bootstrap_token,
+                )
+            elif (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = ?",
+                    (_BOOTSTRAP_TABLE,),
+                ).fetchone()
+                is not None
             ):
-                raise _MigrationError("database entry changed while it was opened")
-            self._configure_connection(connection)
+                raise _MigrationError("unverified bootstrap database")
+            if read_only:
+                self._configure_read_connection(connection)
+            else:
+                if not bootstrap:
+                    self._probe_write_identity(connection)
+                    self._validate_connection_identity(lease, opened_path)
+                self._configure_write_connection(connection)
             return connection
         except BaseException:
             if connection is not None:
@@ -730,22 +1388,85 @@ class WorkflowLedger:
             raise
 
     def _connect(self) -> sqlite3.Connection:
+        lease: _DatabaseLease | None = None
         try:
-            path = self._secure_database_entry()
-            return self._connect_path(path)
+            lease = self._secure_database_entry(create=True, write=True)
+            connection = self._connect_lease(lease, read_only=False)
+            if not isinstance(connection, _LedgerConnection):
+                raise _MigrationError("SQLite connection factory was bypassed")
+            connection.retain_lease(lease, read_only=False)
+            lease = None
+            return connection
         except FCPMCPError:
             raise
         except _LEDGER_FAILURES as error:
             raise _ledger_unavailable(error)
+        finally:
+            if lease is not None:
+                lease.close()
 
     def _connect_existing(self) -> sqlite3.Connection:
+        lease: _DatabaseLease | None = None
         try:
-            path = self._secure_database_entry(create=False)
-            return self._connect_path(path)
+            lease = self._secure_database_entry(create=False, write=False)
+            connection = self._connect_lease(lease, read_only=True)
+            if not isinstance(connection, _LedgerConnection):
+                raise _MigrationError("SQLite connection factory was bypassed")
+            connection.retain_lease(lease, read_only=True)
+            lease = None
+            return connection
         except FCPMCPError:
             raise
         except _LEDGER_FAILURES as error:
             raise _ledger_unavailable(error)
+        finally:
+            if lease is not None:
+                lease.close()
+
+    def _connect_write_existing(self) -> sqlite3.Connection:
+        lease: _DatabaseLease | None = None
+        try:
+            lease = self._secure_database_entry(create=False, write=True)
+            connection = self._connect_lease(lease, read_only=False)
+            if not isinstance(connection, _LedgerConnection):
+                raise _MigrationError("SQLite connection factory was bypassed")
+            connection.retain_lease(lease, read_only=False)
+            lease = None
+            return connection
+        except FCPMCPError:
+            raise
+        except _LEDGER_FAILURES as error:
+            raise _ledger_unavailable(error)
+        finally:
+            if lease is not None:
+                lease.close()
+
+    def _retained_lease(
+        self,
+        connection: sqlite3.Connection,
+    ) -> _DatabaseLease:
+        if (
+            not isinstance(connection, _LedgerConnection)
+            or connection._ledger_lease is None
+        ):
+            raise _MigrationError(
+                "workflow connection lost its filesystem authority"
+            )
+        return connection._ledger_lease
+
+    def _validate_retained_connection(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        lease = self._retained_lease(connection)
+        opened_path = (
+            None
+            if isinstance(connection, _LedgerConnection)
+            and connection._ledger_read_only
+            and lease.anchor.descriptor is not None
+            else lease.anchor.path / lease.name
+        )
+        self._validate_connection_identity(lease, opened_path)
 
     def _migration_rows(self, connection: sqlite3.Connection) -> tuple[sqlite3.Row, ...]:
         exists = connection.execute(
@@ -779,10 +1500,43 @@ class WorkflowLedger:
         return (
             connection.execute(
                 "SELECT 1 FROM sqlite_master "
-                "WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+                "WHERE name NOT LIKE 'sqlite_%' AND name != ? LIMIT 1",
+                (_BOOTSTRAP_TABLE,),
             ).fetchone()
             is not None
         )
+
+    def _drop_verified_bootstrap(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        row = connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name = ?",
+            (_BOOTSTRAP_TABLE,),
+        ).fetchone()
+        if row is None:
+            return
+        observed = (row["type"], row["name"], row["tbl_name"], row["sql"])
+        expected = (
+            "table",
+            _BOOTSTRAP_TABLE,
+            _BOOTSTRAP_TABLE,
+            _BOOTSTRAP_SCHEMA_SQL,
+        )
+        tokens = tuple(
+            connection.execute(
+                f"SELECT token FROM {_BOOTSTRAP_TABLE}"
+            ).fetchmany(2)
+        )
+        if (
+            observed != expected
+            or len(tokens) != 1
+            or not isinstance(tokens[0]["token"], str)
+            or _SHA256_RE.fullmatch(tokens[0]["token"]) is None
+        ):
+            raise _MigrationError("unverified bootstrap database")
+        connection.execute(f"DROP TABLE {_BOOTSTRAP_TABLE}")
 
     def _backup_database(
         self,
@@ -791,57 +1545,118 @@ class WorkflowLedger:
         from_version: int,
         to_version: int,
     ) -> Path:
-        del migration_connection
+        migration_lease = self._retained_lease(migration_connection)
+        self._validate_retained_connection(migration_connection)
         timestamp = _canonical_clock_timestamp(self._clock()).replace(":", "").replace("-", "")
         token = secrets.token_hex(8)
         stem = (
             f"{_DATABASE_NAME}.backup-v{from_version}-to-v{to_version}-"
             f"{timestamp}-{token}"
         )
-        published = self.paths.root / stem
-        temporary = self.paths.root / f".{stem}.tmp"
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        descriptor = os.open(temporary, flags, _DATABASE_MODE)
-        try:
-            if os.name == "posix":
-                os.fchmod(descriptor, _DATABASE_MODE)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-
+        temporary_name = f".{stem}.tmp"
+        anchor = migration_lease.anchor
+        source_descriptor: int | None = None
+        destination_descriptor: int | None = None
         source: sqlite3.Connection | None = None
         destination: sqlite3.Connection | None = None
         replaced = False
+        primary: BaseException | None = None
         try:
-            source = self._connect_existing()
-            destination = self._connect_path(temporary)
+            destination_descriptor = self._open_at(
+                anchor,
+                temporary_name,
+                write=True,
+                exclusive=True,
+            )
+            if os.name == "posix":
+                os.fchmod(destination_descriptor, _DATABASE_MODE)
+            os.fsync(destination_descriptor)
+            destination_result = os.fstat(destination_descriptor)
+            self._validate_database_stat(destination_result)
+            destination_lease = _DatabaseLease(
+                anchor=anchor,
+                name=temporary_name,
+                descriptor=destination_descriptor,
+                identity=_stat_identity(destination_result),
+                bootstrap_token=None,
+                owns_anchor=False,
+            )
+            source_result = self._stat_at(anchor, _DATABASE_NAME)
+            self._validate_database_stat(source_result)
+            if _stat_identity(source_result) != migration_lease.identity:
+                raise _MigrationError("backup source is not the migration database")
+            source_descriptor = self._open_at(
+                anchor,
+                _DATABASE_NAME,
+                write=False,
+            )
+            opened_source = os.fstat(source_descriptor)
+            if _stat_identity(opened_source) != _stat_identity(source_result):
+                raise _MigrationError("backup source changed while it was opened")
+            source_lease = _DatabaseLease(
+                anchor=anchor,
+                name=_DATABASE_NAME,
+                descriptor=source_descriptor,
+                identity=_stat_identity(opened_source),
+                bootstrap_token=self._bootstrap_token_from_descriptor(
+                    source_descriptor,
+                    opened_source,
+                ),
+                owns_anchor=False,
+            )
+            source = self._connect_lease(source_lease, read_only=True)
+            destination = self._connect_lease(destination_lease, read_only=False)
             source.backup(destination)
             destination.close()
             destination = None
             source.close()
             source = None
-            _fsync_file(temporary)
-            os.replace(temporary, published)
+            os.fsync(destination_descriptor)
+            self._replace_at(anchor, temporary_name, stem)
             replaced = True
-            _fsync_directory(self.paths.root)
-            self._validate_internal_database_entry(published)
-            return published
-        except BaseException:
-            if destination is not None:
-                destination.close()
-            if source is not None:
-                source.close()
-            for candidate in (temporary, published if replaced else None):
-                if candidate is not None:
-                    try:
-                        candidate.unlink(missing_ok=True)
-                    except OSError:
-                        pass
+            self._fsync_anchor(anchor)
+            self._validate_retained_connection(migration_connection)
+            published_result = self._stat_at(anchor, stem)
+            self._validate_database_stat(published_result)
+            if _stat_identity(published_result) != _stat_identity(destination_result):
+                raise _MigrationError("published backup identity changed")
+            return anchor.path / stem
+        except BaseException as error:
+            primary = error
+            cleanup_failures: list[BaseException] = []
+            for opened_connection in (destination, source):
+                if opened_connection is None:
+                    continue
+                try:
+                    opened_connection.close()
+                except (OSError, RuntimeError) as cleanup_error:
+                    cleanup_failures.append(cleanup_error)
+            for candidate in (temporary_name, stem if replaced else None):
+                if candidate is None:
+                    continue
+                try:
+                    self._unlink_at(anchor, candidate)
+                except FileNotFoundError:
+                    pass
+                except _LEDGER_FAILURES as cleanup_error:
+                    cleanup_failures.append(cleanup_error)
+            try:
+                self._fsync_anchor(anchor)
+            except _LEDGER_FAILURES as cleanup_error:
+                cleanup_failures.append(cleanup_error)
+            _attach_cleanup_failures(error, cleanup_failures)
             raise
+        finally:
+            for descriptor in (destination_descriptor, source_descriptor):
+                if descriptor is None:
+                    continue
+                try:
+                    os.close(descriptor)
+                except OSError as cleanup_error:
+                    if primary is not None:
+                        _attach_cleanup_failures(primary, [cleanup_error])
+                    else:
+                        raise
 
     def _execute_migration_statement(
         self,
@@ -851,19 +1666,95 @@ class WorkflowLedger:
         connection.execute(statement)
 
     def _validate_schema_objects(self, connection: sqlite3.Connection) -> None:
-        cursor = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        rows = tuple(
+            connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE type IN ('table', 'trigger', 'index')"
+            ).fetchmany(500)
         )
-        tables = {row["name"] for row in cursor.fetchmany(100)}
-        missing = _REQUIRED_TABLES - tables
-        if missing:
+        tables = {
+            row["name"]: row
+            for row in rows
+            if row["type"] == "table" and row["name"] in _REQUIRED_TABLES
+        }
+        if set(tables) != _REQUIRED_TABLES:
             raise _MigrationError("current migration is missing schema objects")
-        trigger_cursor = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+        for name, expected_sql in _EXPECTED_TABLE_SQL.items():
+            row = tables[name]
+            if row["tbl_name"] != name or row["sql"] != expected_sql:
+                raise _MigrationError("required table definition changed")
+
+        triggers = {
+            row["name"]: row
+            for row in rows
+            if row["type"] == "trigger" and row["tbl_name"] in _REQUIRED_TABLES
+        }
+        if set(triggers) != _REQUIRED_TRIGGERS:
+            raise _MigrationError("append-only trigger set changed")
+        for name, expected_sql in _EXPECTED_TRIGGER_SQL.items():
+            row = triggers[name]
+            if (
+                row["tbl_name"] != _EXPECTED_TRIGGER_TABLES[name]
+                or row["sql"] != expected_sql
+            ):
+                raise _MigrationError("append-only trigger definition changed")
+
+        indexes = {
+            row["name"]: row
+            for row in rows
+            if row["type"] == "index"
+            and row["tbl_name"] in _REQUIRED_TABLES
+            and not row["name"].startswith("sqlite_autoindex_")
+        }
+        if set(indexes) != _REQUIRED_INDEXES:
+            raise _MigrationError("required table index set changed")
+        for name, expected_sql in _EXPECTED_INDEX_SQL.items():
+            row = indexes[name]
+            if (
+                row["tbl_name"] != _EXPECTED_INDEX_TABLES[name]
+                or row["sql"] != expected_sql
+            ):
+                raise _MigrationError("required index definition changed")
+
+    def _required_tables_match(self, connection: sqlite3.Connection) -> bool:
+        rows = tuple(
+            connection.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master "
+                "WHERE type = 'table' AND name IN "
+                f"({', '.join('?' for _ in _REQUIRED_TABLES)})",
+                tuple(sorted(_REQUIRED_TABLES)),
+            ).fetchmany(len(_REQUIRED_TABLES) + 1)
         )
-        triggers = {row["name"] for row in trigger_cursor.fetchmany(100)}
-        if _REQUIRED_TRIGGERS - triggers:
-            raise _MigrationError("current migration is missing append-only guards")
+        observed = {
+            row["name"]: (row["tbl_name"], row["sql"]) for row in rows
+        }
+        return observed == {
+            name: (name, expected_sql)
+            for name, expected_sql in _EXPECTED_TABLE_SQL.items()
+        }
+
+    def _remove_published_backup(
+        self,
+        backup: Path,
+        *,
+        anchor: _RootAnchor | None = None,
+    ) -> None:
+        if backup.parent != self.paths.root or not backup.name.startswith(
+            f"{_DATABASE_NAME}.backup-"
+        ):
+            raise _MigrationError("backup cleanup target is outside state root")
+        owned_anchor = anchor is None
+        if anchor is None:
+            anchor = self._open_root_anchor()
+        try:
+            self._validate_anchor_path(anchor)
+            result = self._stat_at(anchor, backup.name)
+            self._validate_database_stat(result)
+            self._unlink_at(anchor, backup.name)
+            self._fsync_anchor(anchor)
+        finally:
+            if owned_anchor:
+                anchor.close()
 
     def initialize(self) -> None:
         """Configure the database and apply all pending migrations atomically."""
@@ -871,10 +1762,13 @@ class WorkflowLedger:
         begun = False
         published_backup: Path | None = None
         try:
+            retained_lease = self._retained_lease(connection)
+            self._validate_retained_connection(connection)
             before_lock = self._migration_rows(connection)
             self._validate_migrations(before_lock)
             connection.execute("BEGIN IMMEDIATE")
             begun = True
+            self._drop_verified_bootstrap(connection)
             rows = self._migration_rows(connection)
             self._validate_migrations(rows)
             pending = MIGRATIONS[len(rows) :]
@@ -901,44 +1795,61 @@ class WorkflowLedger:
                     ),
                 )
             self._validate_schema_objects(connection)
+            self._validate_retained_connection(connection)
             connection.execute("COMMIT")
             begun = False
-        except FCPMCPError:
-            _rollback(connection, begun)
+            self._validate_retained_connection(connection)
+        except FCPMCPError as error:
+            rollback_error = _rollback(connection, begun)
+            if rollback_error is not None:
+                _attach_cleanup_failures(error, [rollback_error])
             if published_backup is not None:
                 try:
-                    published_backup.unlink(missing_ok=True)
-                    _fsync_directory(self.paths.root)
-                except OSError:
-                    pass
+                    self._remove_published_backup(
+                        published_backup,
+                        anchor=retained_lease.anchor,
+                    )
+                except _LEDGER_FAILURES as cleanup_error:
+                    _attach_cleanup_failures(error, [cleanup_error])
             raise
         except _LEDGER_FAILURES as error:
-            _rollback(connection, begun)
+            rollback_error = _rollback(connection, begun)
+            if rollback_error is not None:
+                _attach_cleanup_failures(error, [rollback_error])
             if published_backup is not None:
                 try:
-                    published_backup.unlink(missing_ok=True)
-                    _fsync_directory(self.paths.root)
-                except OSError:
-                    pass
+                    self._remove_published_backup(
+                        published_backup,
+                        anchor=retained_lease.anchor,
+                    )
+                except _LEDGER_FAILURES as cleanup_error:
+                    _attach_cleanup_failures(error, [cleanup_error])
             raise _ledger_unavailable(error)
         finally:
             connection.close()
 
     def _write(self, operation: Callable[[sqlite3.Connection], Any]) -> Any:
-        connection = self._connect_existing()
+        connection = self._connect_write_existing()
         begun = False
         try:
+            self._validate_retained_connection(connection)
             connection.execute("BEGIN IMMEDIATE")
             begun = True
             result = operation(connection)
+            self._validate_retained_connection(connection)
             connection.execute("COMMIT")
             begun = False
+            self._validate_retained_connection(connection)
             return result
-        except FCPMCPError:
-            _rollback(connection, begun)
+        except FCPMCPError as error:
+            rollback_error = _rollback(connection, begun)
+            if rollback_error is not None:
+                _attach_cleanup_failures(error, [rollback_error])
             raise
         except _LEDGER_FAILURES as error:
-            _rollback(connection, begun)
+            rollback_error = _rollback(connection, begun)
+            if rollback_error is not None:
+                _attach_cleanup_failures(error, [rollback_error])
             raise _ledger_unavailable(error)
         finally:
             connection.close()
@@ -1052,10 +1963,25 @@ class WorkflowLedger:
         key: str,
         request_sha256: str,
         run_id: str,
+        *,
+        expected_state: WorkflowState | str,
+        expected_revision: int,
+        event_type: str,
+        event_payload: Mapping[str, object],
+        elapsed_ms: int | None = None,
     ) -> IdempotencyResult:
         canonical_key = _idempotency_key(key)
         request_hash = _sha256(request_sha256, field="request_sha256")
         canonical_run_id = _run_id(run_id)
+        state = _workflow_state(expected_state)
+        revision = _positive_revision(expected_revision)
+        name = _event_type(event_type)
+        payload, payload_text = _event_payload(event_payload)
+        elapsed = _elapsed_ms(elapsed_ms)
+        if state is not WorkflowState.PREPARING:
+            raise _state_conflict(
+                "idempotency keys can only be reserved while preparing"
+            )
 
         def reserve(connection: sqlite3.Connection) -> IdempotencyResult:
             existing = connection.execute(
@@ -1072,9 +1998,12 @@ class WorkflowLedger:
                 if run is None:
                     raise _MigrationError("idempotency row references a missing run")
                 return IdempotencyResult(existing=True, run=run)
-            run = self._select_run(connection, canonical_run_id)
-            if run is None:
-                raise _state_conflict("run does not exist")
+            run = self._run_for_cas(
+                connection,
+                run_id=canonical_run_id,
+                expected_state=state,
+                expected_revision=revision,
+            )
             other = connection.execute(
                 "SELECT key FROM idempotency_keys WHERE run_id = ?",
                 (canonical_run_id,),
@@ -1086,7 +2015,33 @@ class WorkflowLedger:
                 "VALUES (?, ?, ?)",
                 (canonical_key, request_hash, canonical_run_id),
             )
-            return IdempotencyResult(existing=False, run=run)
+            timestamp = _canonical_clock_timestamp(self._clock())
+            cursor = connection.execute(
+                "UPDATE runs SET revision = ?, updated_at = ? "
+                "WHERE run_id = ? AND state = ? AND revision = ?",
+                (
+                    run.revision + 1,
+                    timestamp,
+                    canonical_run_id,
+                    state.value,
+                    revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise _state_conflict("workflow state or revision is stale")
+            self._append_event_locked(
+                connection,
+                run_id=canonical_run_id,
+                event_type=name,
+                payload=payload,
+                payload_text=payload_text,
+                timestamp=timestamp,
+                elapsed_ms=elapsed,
+            )
+            updated = self._select_run(connection, canonical_run_id)
+            if updated is None:
+                raise _MigrationError("updated run disappeared")
+            return IdempotencyResult(existing=False, run=updated)
 
         return self._write(reserve)
 
@@ -1248,6 +2203,12 @@ class WorkflowLedger:
         copied_payload, payload_text = _event_payload(payload)
         elapsed = _elapsed_ms(elapsed_ms)
         patch = _projection_patch(projection_patch)
+        _validate_projection_policy(
+            source=state,
+            target=state,
+            event_type=name,
+            patch=patch,
+        )
         return self._event_mutation(
             run_id=canonical_run_id,
             expected_state=state,
@@ -1282,6 +2243,12 @@ class WorkflowLedger:
         copied_payload, payload_text = _event_payload(payload)
         elapsed = _elapsed_ms(elapsed_ms)
         patch = _projection_patch(projection_patch)
+        _validate_projection_policy(
+            source=source,
+            target=target,
+            event_type=name,
+            patch=patch,
+        )
         return self._event_mutation(
             run_id=canonical_run_id,
             expected_state=source,
@@ -1306,6 +2273,10 @@ class WorkflowLedger:
     ) -> ArtifactMutationResult:
         canonical_metadata = _artifact_metadata(metadata)
         state = _workflow_state(expected_state)
+        if state is not WorkflowState.PREPARING:
+            raise _state_conflict(
+                "artifacts can only be recorded while preparing"
+            )
         revision = _positive_revision(expected_revision)
         name = _event_type(event_type)
         payload, payload_text = _event_payload(event_payload)
@@ -1436,7 +2407,16 @@ class WorkflowLedger:
             maximum=_MAX_TEXT_CHARS,
         )
         name = _event_type(event_type)
-        payload, payload_text = _event_payload(event_payload)
+        if not isinstance(event_payload, Mapping):
+            raise _invalid("event payload must be a JSON object")
+        decision_payload = dict(event_payload)
+        supplied_binding = decision_payload.get("binding_sha256")
+        if supplied_binding is not None and supplied_binding != binding:
+            raise _invalid(
+                "decision event binding_sha256 must match the approval binding"
+            )
+        decision_payload["binding_sha256"] = binding
+        payload, payload_text = _event_payload(decision_payload)
         elapsed = _elapsed_ms(elapsed_ms)
 
         def record(connection: sqlite3.Connection) -> DecisionMutationResult:
@@ -1544,6 +2524,79 @@ class WorkflowLedger:
         finally:
             connection.close()
 
+    def get_artifact(
+        self,
+        run_id: str,
+        kind: ArtifactKind | str,
+    ) -> ArtifactRecord | None:
+        canonical_run_id = _run_id(run_id)
+        closed_kind = _artifact_kind_value(kind)
+        connection = self._connect_existing()
+        try:
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE run_id = ? AND kind = ?",
+                (canonical_run_id, closed_kind.value),
+            ).fetchone()
+            return _row_to_artifact(row) if row is not None else None
+        except FCPMCPError:
+            raise
+        except _LEDGER_FAILURES as error:
+            raise _ledger_unavailable(error)
+        finally:
+            connection.close()
+
+    def list_artifacts(
+        self,
+        run_id: str,
+        *,
+        after_kind: ArtifactKind | str | None = None,
+        limit: int = 100,
+    ) -> tuple[ArtifactRecord, ...]:
+        canonical_run_id = _run_id(run_id)
+        bounded_limit = _read_limit(limit)
+        closed_after = (
+            _artifact_kind_value(after_kind) if after_kind is not None else None
+        )
+        connection = self._connect_existing()
+        try:
+            if closed_after is None:
+                cursor = connection.execute(
+                    "SELECT * FROM artifacts WHERE run_id = ? "
+                    "ORDER BY kind ASC LIMIT ?",
+                    (canonical_run_id, bounded_limit),
+                )
+            else:
+                cursor = connection.execute(
+                    "SELECT * FROM artifacts WHERE run_id = ? AND kind > ? "
+                    "ORDER BY kind ASC LIMIT ?",
+                    (canonical_run_id, closed_after.value, bounded_limit),
+                )
+            return tuple(
+                _row_to_artifact(row) for row in cursor.fetchmany(bounded_limit)
+            )
+        except FCPMCPError:
+            raise
+        except _LEDGER_FAILURES as error:
+            raise _ledger_unavailable(error)
+        finally:
+            connection.close()
+
+    def get_approval(self, run_id: str) -> ApprovalRecord | None:
+        canonical_run_id = _run_id(run_id)
+        connection = self._connect_existing()
+        try:
+            row = connection.execute(
+                "SELECT * FROM approvals WHERE run_id = ?",
+                (canonical_run_id,),
+            ).fetchone()
+            return _row_to_approval(row) if row is not None else None
+        except FCPMCPError:
+            raise
+        except _LEDGER_FAILURES as error:
+            raise _ledger_unavailable(error)
+        finally:
+            connection.close()
+
     def list_runs(
         self,
         *,
@@ -1566,6 +2619,69 @@ class WorkflowLedger:
                     (closed_state.value, bounded_limit),
                 )
             return tuple(_row_to_run(row) for row in cursor.fetchmany(bounded_limit))
+        except FCPMCPError:
+            raise
+        except _LEDGER_FAILURES as error:
+            raise _ledger_unavailable(error)
+        finally:
+            connection.close()
+
+    def list_terminal_runs_before(
+        self,
+        cutoff: str,
+        *,
+        after_updated_at: str | None = None,
+        after_run_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[LedgerRunRecord, ...]:
+        canonical_cutoff = _canonical_timestamp(cutoff, field="cutoff")
+        bounded_limit = _read_limit(limit)
+        if (after_updated_at is None) != (after_run_id is None):
+            raise _invalid(
+                "after_updated_at and after_run_id must be provided together"
+            )
+        cursor_timestamp = (
+            _canonical_timestamp(after_updated_at, field="after_updated_at")
+            if after_updated_at is not None
+            else None
+        )
+        cursor_run_id = (
+            _run_id(after_run_id) if after_run_id is not None else None
+        )
+        states = tuple(sorted(state.value for state in _PRUNE_ELIGIBLE_STATES))
+        placeholders = ", ".join("?" for _ in states)
+        connection = self._connect_existing()
+        try:
+            if cursor_timestamp is None:
+                parameters: tuple[object, ...] = (
+                    *states,
+                    canonical_cutoff,
+                    bounded_limit,
+                )
+                sql = (
+                    f"SELECT * FROM runs WHERE state IN ({placeholders}) "
+                    "AND updated_at < ? "
+                    "ORDER BY updated_at ASC, run_id ASC LIMIT ?"
+                )
+            else:
+                parameters = (
+                    *states,
+                    canonical_cutoff,
+                    cursor_timestamp,
+                    cursor_timestamp,
+                    cursor_run_id,
+                    bounded_limit,
+                )
+                sql = (
+                    f"SELECT * FROM runs WHERE state IN ({placeholders}) "
+                    "AND updated_at < ? AND "
+                    "(updated_at > ? OR (updated_at = ? AND run_id > ?)) "
+                    "ORDER BY updated_at ASC, run_id ASC LIMIT ?"
+                )
+            cursor = connection.execute(sql, parameters)
+            return tuple(
+                _row_to_run(row) for row in cursor.fetchmany(bounded_limit)
+            )
         except FCPMCPError:
             raise
         except _LEDGER_FAILURES as error:
@@ -1626,14 +2742,29 @@ class WorkflowLedger:
                 IntegrityFinding(
                     code=code[:64],
                     summary=summary[:_MAX_TEXT_CHARS],
-                    run_id=finding_run_id,
-                    sequence=sequence,
+                    run_id=_safe_finding_run_id(finding_run_id),
+                    sequence=_safe_finding_sequence(sequence),
                 )
             )
 
         try:
             connection.execute("BEGIN")
             begun = True
+            try:
+                self._validate_schema_objects(connection)
+            except _MigrationError:
+                add("schema_mismatch", "stored schema objects do not match")
+                if not self._required_tables_match(connection):
+                    result = IntegrityResult(
+                        valid=False,
+                        checked_migrations=0,
+                        checked_runs=0,
+                        checked_events=0,
+                        findings=tuple(findings),
+                    )
+                    connection.execute("ROLLBACK")
+                    begun = False
+                    return result
             migration_rows = self._migration_rows(connection)
             checked_migrations = len(migration_rows)
             try:
@@ -1673,11 +2804,11 @@ class WorkflowLedger:
 
             if canonical_run_id is None:
                 run_cursor = connection.execute(
-                    "SELECT run_id, revision FROM runs ORDER BY run_id ASC"
+                    "SELECT * FROM runs ORDER BY run_id ASC"
                 )
             else:
                 run_cursor = connection.execute(
-                    "SELECT run_id, revision FROM runs WHERE run_id = ?",
+                    "SELECT * FROM runs WHERE run_id = ?",
                     (canonical_run_id,),
                 )
 
@@ -1698,6 +2829,8 @@ class WorkflowLedger:
                     expected_sequence = 1
                     expected_previous = _ZERO_HASH
                     run_event_count = 0
+                    event_evidence: dict[str, str] = {}
+                    approval_bindings: set[str] = set()
                     while True:
                         event_rows = event_cursor.fetchmany(100)
                         if not event_rows:
@@ -1744,6 +2877,10 @@ class WorkflowLedger:
                                         raise TypeError("payload is not an object")
                                     payload_value = parsed
                                     canonical_text = canonical_json(parsed).decode("utf-8")
+                                    if not _json_text_is_safe(parsed):
+                                        raise ValueError(
+                                            "payload contains unsafe text"
+                                        )
                                     if canonical_text != payload_text:
                                         add(
                                             "noncanonical_payload",
@@ -1777,6 +2914,7 @@ class WorkflowLedger:
                                 and 1
                                 <= len(row["event_type"])
                                 <= _MAX_EVENT_TYPE_CHARS
+                                and _text_is_safe(row["event_type"])
                                 and _stored_timestamp_is_canonical(row["timestamp"])
                                 and elapsed_valid
                                 and isinstance(raw_previous, str)
@@ -1784,7 +2922,13 @@ class WorkflowLedger:
                                 and isinstance(row["event_hash"], str)
                                 and _SHA256_RE.fullmatch(row["event_hash"]) is not None
                                 and isinstance(payload_text, str)
-                                and len(payload_text.encode("utf-8"))
+                                and (
+                                    _safe_utf8_length(payload_text)
+                                    is not None
+                                )
+                                and (
+                                    _safe_utf8_length(payload_text) or 0
+                                )
                                 <= _MAX_EVENT_PAYLOAD_BYTES
                             )
                             if not stored_fields_valid:
@@ -1795,6 +2939,32 @@ class WorkflowLedger:
                                     sequence=sequence_value,
                                 )
                             if payload_value is not None and sequence_value is not None:
+                                event_name = row["event_type"]
+                                payload_sha = payload_value.get("sha256")
+                                if (
+                                    event_name == "source_inspected"
+                                    and isinstance(payload_sha, str)
+                                    and _SHA256_RE.fullmatch(payload_sha)
+                                ):
+                                    event_evidence["source_sha256"] = payload_sha
+                                elif (
+                                    event_name in {"plan_built", "plan_normalized"}
+                                    and isinstance(payload_sha, str)
+                                    and _SHA256_RE.fullmatch(payload_sha)
+                                ):
+                                    event_evidence["plan_sha256"] = payload_sha
+                                elif (
+                                    event_name == "dry_run_completed"
+                                    and isinstance(payload_sha, str)
+                                    and _SHA256_RE.fullmatch(payload_sha)
+                                ):
+                                    event_evidence["receipt_sha256"] = payload_sha
+                                binding = payload_value.get("binding_sha256")
+                                if (
+                                    isinstance(binding, str)
+                                    and _SHA256_RE.fullmatch(binding)
+                                ):
+                                    approval_bindings.add(binding)
                                 try:
                                     recomputed = _event_digest(
                                         run_id=row["run_id"],
@@ -1838,6 +3008,175 @@ class WorkflowLedger:
                         add(
                             "event_projection_mismatch",
                             "event chain does not match the run revision",
+                            finding_run_id=current_run_id,
+                        )
+                    for field, expected_value in event_evidence.items():
+                        if run_row[field] != expected_value:
+                            add(
+                                "projection_invariant",
+                                "event evidence does not match the run projection",
+                                finding_run_id=current_run_id,
+                            )
+                    for field in (
+                        "source_sha256",
+                        "plan_sha256",
+                        "receipt_sha256",
+                    ):
+                        if run_row[field] is not None and field not in event_evidence:
+                            add(
+                                "projection_invariant",
+                                "run projection lacks its required event evidence",
+                                finding_run_id=current_run_id,
+                            )
+
+                    artifact_rows = tuple(
+                        connection.execute(
+                            "SELECT * FROM artifacts WHERE run_id = ? "
+                            "ORDER BY kind ASC",
+                            (current_run_id,),
+                        ).fetchmany(10)
+                    )
+                    artifacts_by_kind = {
+                        row["kind"]: row for row in artifact_rows
+                    }
+                    for kind in ArtifactKind:
+                        artifact = artifacts_by_kind.get(kind.value)
+                        projected_hash = run_row[f"{kind.value}_sha256"]
+                        projected_size = run_row[f"{kind.value}_size_bytes"]
+                        if artifact is None:
+                            matches = (
+                                projected_hash is None
+                                and projected_size is None
+                            )
+                        else:
+                            matches = (
+                                projected_hash == artifact["sha256"]
+                                and projected_size == artifact["byte_size"]
+                            )
+                        if not matches:
+                            add(
+                                "projection_invariant",
+                                "artifact metadata does not match the run projection",
+                                finding_run_id=current_run_id,
+                            )
+
+                    approval_row = connection.execute(
+                        "SELECT * FROM approvals WHERE run_id = ?",
+                        (current_run_id,),
+                    ).fetchone()
+                    raw_state = run_row["state"]
+                    try:
+                        current_state = WorkflowState(raw_state)
+                    except (TypeError, ValueError):
+                        current_state = None
+                        add(
+                            "projection_invariant",
+                            "run state is invalid",
+                            finding_run_id=current_run_id,
+                        )
+                    if approval_row is None:
+                        approval_projection_present = any(
+                            run_row[field] is not None
+                            for field in (
+                                "approved_at",
+                                "approval_decision",
+                                "approval_source",
+                                "approval_summary",
+                            )
+                        )
+                        if approval_projection_present or current_state in {
+                            WorkflowState.APPROVED,
+                            WorkflowState.COMMITTING,
+                            WorkflowState.COMMITTED,
+                            WorkflowState.REJECTED,
+                            WorkflowState.STALE,
+                            WorkflowState.ROLLED_BACK,
+                            WorkflowState.RECOVERY_REQUIRED,
+                        }:
+                            add(
+                                "projection_invariant",
+                                "approval projection lacks immutable approval evidence",
+                                finding_run_id=current_run_id,
+                            )
+                    else:
+                        approval_matches = (
+                            run_row["approval_decision"]
+                            == approval_row["decision"]
+                            and run_row["approval_source"]
+                            == approval_row["source"]
+                            and approval_row["binding_sha256"]
+                            in approval_bindings
+                        )
+                        if approval_row["decision"] == ApprovalDecision.APPROVED.value:
+                            approval_matches = approval_matches and (
+                                run_row["approved_at"]
+                                == approval_row["created_at"]
+                            )
+                        else:
+                            approval_matches = approval_matches and (
+                                run_row["approved_at"] is None
+                            )
+                        if (
+                            approval_row["expires_at"] is not None
+                            and run_row["expires_at"]
+                            != approval_row["expires_at"]
+                        ):
+                            approval_matches = False
+                        if not approval_matches:
+                            add(
+                                "projection_invariant",
+                                "approval evidence does not match the run projection",
+                                finding_run_id=current_run_id,
+                            )
+
+                    committed_at = run_row["committed_at"]
+                    if (
+                        committed_at is not None
+                        and current_state is not WorkflowState.COMMITTED
+                    ) or (
+                        current_state is WorkflowState.COMMITTED
+                        and committed_at is None
+                    ):
+                        add(
+                            "projection_invariant",
+                            "committed timestamp contradicts workflow state",
+                            finding_run_id=current_run_id,
+                        )
+                    commit_evidence_present = any(
+                        run_row[field] is not None
+                        for field in (
+                            "commit_attempt_id",
+                            "expected_backup_path",
+                            "backup_sha256",
+                        )
+                    )
+                    if commit_evidence_present and current_state not in {
+                        WorkflowState.COMMITTING,
+                        WorkflowState.COMMITTED,
+                        WorkflowState.ROLLED_BACK,
+                        WorkflowState.RECOVERY_REQUIRED,
+                    }:
+                        add(
+                            "projection_invariant",
+                            "commit evidence contradicts workflow state",
+                            finding_run_id=current_run_id,
+                        )
+                    terminal_error_present = (
+                        run_row["terminal_error_code"] is not None,
+                        run_row["terminal_error_summary"] is not None,
+                    )
+                    if terminal_error_present[0] != terminal_error_present[1] or (
+                        any(terminal_error_present)
+                        and current_state
+                        not in {
+                            WorkflowState.FAILED,
+                            WorkflowState.ROLLED_BACK,
+                            WorkflowState.RECOVERY_REQUIRED,
+                        }
+                    ):
+                        add(
+                            "projection_invariant",
+                            "terminal error evidence contradicts workflow state",
                             finding_run_id=current_run_id,
                         )
             if canonical_run_id is not None and checked_runs == 0:
@@ -1933,6 +3272,75 @@ def _row_to_event(row: sqlite3.Row) -> EventRecord:
     )
 
 
+def _row_to_artifact(row: sqlite3.Row) -> ArtifactRecord:
+    return ArtifactRecord(
+        run_id=row["run_id"],
+        kind=ArtifactKind(row["kind"]),
+        relative_path=row["relative_path"],
+        sha256=row["sha256"],
+        byte_size=row["byte_size"],
+        created_at=row["created_at"],
+    )
+
+
+def _row_to_approval(row: sqlite3.Row) -> ApprovalRecord:
+    return ApprovalRecord(
+        run_id=row["run_id"],
+        decision=ApprovalDecision(row["decision"]),
+        source=ApprovalSource(row["source"]),
+        operator=row["operator"],
+        host=row["host"],
+        terminal_present=bool(row["terminal_present"]),
+        binding_sha256=row["binding_sha256"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+    )
+
+
+def _safe_finding_run_id(value: object) -> str | None:
+    if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
+        return None
+    try:
+        parsed = UUID(value)
+    except ValueError:
+        return None
+    if parsed.int == 0 or str(parsed) != value or not _text_is_safe(value):
+        return None
+    return value
+
+
+def _safe_finding_sequence(value: object) -> int | None:
+    if type(value) is not int or not 1 <= value <= _SQLITE_MAX_INTEGER:
+        return None
+    return value
+
+
+def _safe_utf8_length(value: object) -> int | None:
+    if not isinstance(value, str) or "\x00" in value:
+        return None
+    try:
+        return len(value.encode("utf-8", errors="strict"))
+    except UnicodeEncodeError:
+        return None
+
+
+def _text_is_safe(value: object) -> bool:
+    return _safe_utf8_length(value) is not None
+
+
+def _json_text_is_safe(value: object) -> bool:
+    if isinstance(value, str):
+        return _text_is_safe(value)
+    if isinstance(value, Mapping):
+        return all(
+            _text_is_safe(key) and _json_text_is_safe(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return all(_json_text_is_safe(item) for item in value)
+    return True
+
+
 def _run_id(value: object) -> str:
     if not isinstance(value, str) or not _UUID_RE.fullmatch(value):
         raise _invalid("run_id must use canonical lowercase UUID spelling")
@@ -1945,9 +3353,26 @@ def _run_id(value: object) -> str:
     return value
 
 
+def _artifact_kind_value(value: object) -> ArtifactKind:
+    if isinstance(value, ArtifactKind):
+        return value
+    if isinstance(value, str):
+        try:
+            return ArtifactKind(value)
+        except ValueError:
+            pass
+    raise _invalid("artifact kind must be candidate or diff")
+
+
 def _bounded_text(value: object, *, field: str, maximum: int) -> str:
     if not isinstance(value, str) or not 1 <= len(value) <= maximum:
         raise _invalid(f"{field} must be nonempty bounded text")
+    if "\x00" in value:
+        raise _invalid(f"{field} must not contain NUL")
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise _invalid(f"{field} must be valid UTF-8 text", error)
     return value
 
 
@@ -2065,7 +3490,27 @@ def _event_payload(
         raise _invalid("event payload exceeds the byte limit")
     if not isinstance(parsed, dict):
         raise _invalid("event payload must be a JSON object")
+    _validate_json_text(parsed)
     return parsed, encoded.decode("utf-8")
+
+
+def _validate_json_text(value: object) -> None:
+    if isinstance(value, str):
+        if "\x00" in value:
+            raise _invalid("event payload text must not contain NUL")
+        try:
+            value.encode("utf-8", errors="strict")
+        except UnicodeEncodeError as error:
+            raise _invalid("event payload text must be valid UTF-8", error)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _validate_json_text(key)
+            _validate_json_text(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_json_text(item)
 
 
 def _event_digest(
