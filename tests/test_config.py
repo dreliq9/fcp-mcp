@@ -89,6 +89,23 @@ def test_explicit_state_path_is_resolved_without_creating_directory(
     assert not expected.exists()
 
 
+def test_explicit_state_path_preserves_root_symlink_evidence(
+    tmp_path: Path,
+):
+    target = tmp_path / "real-state"
+    target.mkdir()
+    requested = tmp_path / "requested-state"
+    requested.symlink_to(target, target_is_directory=True)
+
+    config = RuntimeConfig.from_env(
+        {"FCP_MCP_STATE_DIR": str(requested)},
+        home=tmp_path,
+    )
+
+    assert config.state_dir == requested
+    assert config.state_dir.is_symlink()
+
+
 def test_default_state_path_uses_platformdirs_without_creating_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

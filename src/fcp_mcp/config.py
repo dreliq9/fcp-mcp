@@ -14,6 +14,11 @@ TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 FALSE_VALUES = frozenset({"", "0", "false", "no", "off"})
 
 
+def _lexical_absolute_path(value: str | os.PathLike[str]) -> Path:
+    """Normalize an absolute path without following symlinks or creating it."""
+    return Path(os.path.abspath(os.path.expanduser(os.fspath(value))))
+
+
 def _boolean(env: Mapping[str, str], name: str, default: bool) -> bool:
     if name not in env:
         return default
@@ -122,11 +127,15 @@ class RuntimeConfig:
         )
         state_raw = values.get("FCP_MCP_STATE_DIR")
         state_dir = (
-            Path(state_raw).expanduser().resolve()
+            _lexical_absolute_path(state_raw)
             if state_raw is not None
-            else Path(platformdirs.user_state_path("fcp-mcp", appauthor=False))
-            .expanduser()
-            .resolve()
+            else _lexical_absolute_path(
+                platformdirs.user_state_path(
+                    "fcp-mcp",
+                    appauthor=False,
+                    ensure_exists=False,
+                )
+            )
         )
         return cls(
             output_dir=output_dir,
