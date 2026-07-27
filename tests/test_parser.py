@@ -1,5 +1,7 @@
 """Tests for FCPXML parser."""
 
+from pathlib import Path
+
 import pytest
 
 from fcp_mcp.fcpxml.models import (
@@ -41,6 +43,43 @@ class TestParserBasic:
         assert sample_doc.effects["r6"].name == "Basic Title"
         assert "r7" in sample_doc.effects
         assert sample_doc.effects["r7"].name == "Cross Dissolve"
+
+    def test_parse_transform_preserves_xy_scale(self, tmp_path: Path):
+        path = tmp_path / "xy-scale.fcpxml"
+        path.write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r1" frameDuration="1/30s" width="1920" height="1080"/>
+    <asset id="r2" name="Clip" duration="1s"/>
+  </resources>
+  <event name="Event">
+    <project name="Project">
+      <sequence format="r1" duration="1s">
+        <spine>
+          <asset-clip ref="r2" name="Clip" duration="1s">
+            <adjust-transform scale="1.25 0.75"/>
+          </asset-clip>
+        </spine>
+      </sequence>
+    </project>
+  </event>
+</fcpxml>
+""",
+            encoding="utf-8",
+        )
+
+        transform = (
+            FCPXMLParser()
+            .parse(path)
+            .all_projects[0]
+            .sequence.spine.clips[0]
+            .transform
+        )
+
+        assert transform is not None
+        assert transform.scale == 1.25
+        assert transform.scale_y == 0.75
 
 
 class TestParserLibrary:

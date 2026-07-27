@@ -108,6 +108,16 @@ class TransformParams:
     rotation: float = 0.0
     anchor_x: float = 0.0
     anchor_y: float = 0.0
+    scale_y: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.scale_y is None:
+            self.scale_y = self.scale
+
+    @property
+    def scale_x(self) -> float:
+        """Horizontal scale, preserving the original scalar API as an alias."""
+        return self.scale
 
 
 @dataclass

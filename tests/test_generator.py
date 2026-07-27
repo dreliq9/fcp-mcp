@@ -1,8 +1,8 @@
 """Tests for FCPXML generator."""
 
-import pytest
-import tempfile
 from pathlib import Path
+
+import pytest
 
 from fcp_mcp.fcpxml.generator import FCPXMLGenerator
 from fcp_mcp.fcpxml.parser import FCPXMLParser
@@ -113,7 +113,7 @@ class TestClipBuilding:
 
 
 class TestTimelineBuilder:
-    def test_build_from_clips(self, gen, parser):
+    def test_build_from_clips(self, gen, parser, tmp_path):
         clips = [
             {"src": "/tmp/a.mov", "name": "A", "duration": "150150/30000s"},
             {"src": "/tmp/b.mov", "name": "B", "duration": "90090/30000s"},
@@ -121,8 +121,7 @@ class TestTimelineBuilder:
         ]
         root = gen.build_timeline_from_clips(clips, project_name="Auto Timeline")
 
-        with tempfile.NamedTemporaryFile(suffix=".fcpxml", delete=False) as f:
-            output = Path(f.name)
+        output = tmp_path / "timeline.fcpxml"
         gen.save(output)
 
         doc = parser.parse(output)
@@ -133,20 +132,16 @@ class TestTimelineBuilder:
         assert spine_clips[0].name == "A"
         assert spine_clips[2].role == "B-Roll"
 
-        output.unlink()
-
 
 class TestOutput:
-    def test_save_creates_file(self, gen):
+    def test_save_creates_file(self, gen, tmp_path):
         gen.create_project(name="Test")
-        with tempfile.NamedTemporaryFile(suffix=".fcpxml", delete=False) as f:
-            output = Path(f.name)
+        output = tmp_path / "generated.fcpxml"
         gen.save(output)
         assert output.exists()
         content = output.read_text()
         assert "fcpxml" in content
         assert 'version="1.11"' in content
-        output.unlink()
 
     def test_to_string(self, gen):
         gen.create_project(name="Test")

@@ -13,6 +13,7 @@ from typing import Optional, Union
 
 from ..utils.safe_xml import parse_fcpxml
 from .time_utils import RationalTime
+from .transaction import commit_fcpxml
 
 
 class FCPXMLModifier:
@@ -23,15 +24,27 @@ class FCPXMLModifier:
         self.tree = parse_fcpxml(self.path)
         self.root = self.tree.getroot()
 
-    def save(self, output_path: Optional[Union[str, Path]] = None) -> Path:
+    def save(
+        self,
+        output_path: Optional[Union[str, Path]] = None,
+        *,
+        event_format: str = "text",
+    ) -> Path:
         """Save modified FCPXML. Defaults to original_name_modified.fcpxml."""
         if output_path is None:
             stem = self.path.stem
             output_path = self.path.parent / f"{stem}_modified.fcpxml"
         output_path = Path(output_path)
         ET.indent(self.root, space="    ")
-        self.tree.write(str(output_path), encoding="unicode", xml_declaration=True)
-        return output_path
+        xml_text = ET.tostring(self.root, encoding="unicode", xml_declaration=True)
+        receipt = commit_fcpxml(
+            source=self.path,
+            destination=output_path,
+            xml_text=xml_text,
+            event_format=event_format,
+            operation="modifier_save",
+        )
+        return receipt.destination
 
     # --- Markers ---
 

@@ -11,6 +11,7 @@ from typing import Optional, Union
 from urllib.parse import quote as url_quote
 
 from .time_utils import RationalTime, FORMAT_FRAME_DURATIONS
+from .transaction import commit_fcpxml
 
 
 class FCPXMLGenerator:
@@ -360,17 +361,22 @@ class FCPXMLGenerator:
 
     # --- Output ---
 
-    def save(self, path: Union[str, Path]) -> Path:
+    def save(
+        self,
+        path: Union[str, Path],
+        *,
+        event_format: str = "text",
+    ) -> Path:
         """Write FCPXML to file."""
         path = Path(path)
-        ET.indent(self.root, space="    ")
-        xml_str = ET.tostring(self.root, encoding="unicode")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-            f.write("<!DOCTYPE fcpxml>\n")
-            f.write(xml_str)
-            f.write("\n")
-        return path
+        receipt = commit_fcpxml(
+            source=None,
+            destination=path,
+            xml_text=f"{self.to_string()}\n",
+            event_format=event_format,
+            operation="generator_save",
+        )
+        return receipt.destination
 
     def to_string(self) -> str:
         """Return FCPXML as string."""

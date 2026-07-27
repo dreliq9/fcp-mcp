@@ -1,6 +1,5 @@
 """Tests for puppet animation engine."""
 
-import tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -21,7 +20,6 @@ from fcp_mcp.fcpxml.puppet import (
     preset_wave,
     rig_from_json,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -210,18 +208,16 @@ class TestPuppetSceneBuilder:
                 kfs = param.findall("keyframe")
                 assert len(kfs) == 2
 
-    def test_save_to_file(self, simple_rig):
+    def test_save_to_file(self, simple_rig, tmp_path):
         builder = PuppetSceneBuilder(duration="300300/30000s")
         builder.add_rig(simple_rig)
         gen = builder.build()
 
-        with tempfile.NamedTemporaryFile(suffix=".fcpxml", delete=False) as f:
-            path = gen.save(f.name)
-            assert Path(path).exists()
-            content = Path(path).read_text()
-            assert '<?xml version="1.0"' in content
-            assert "fcpxml" in content
-            Path(path).unlink()
+        path = gen.save(tmp_path / "puppet.fcpxml")
+        assert Path(path).exists()
+        content = Path(path).read_text()
+        assert '<?xml version="1.0"' in content
+        assert "fcpxml" in content
 
     def test_multi_rig_scene(self, simple_rig):
         rig2 = PuppetRig(name="char2", position=(400, 0))

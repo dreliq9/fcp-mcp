@@ -286,11 +286,15 @@ class FCPXMLParser:
         """Parse adjust-transform element."""
         position = el.get("position", "0 0").split()
         anchor = el.get("anchor", "0 0").split()
+        scale = el.get("scale", "1 1").split()
+        scale_x = float(scale[0]) if scale else 1.0
+        scale_y = float(scale[1]) if len(scale) > 1 else scale_x
         return TransformParams(
             position_x=float(position[0]) if len(position) > 0 else 0.0,
             position_y=float(position[1]) if len(position) > 1 else 0.0,
-            scale=float(el.get("scale", "1")),
+            scale=scale_x,
             rotation=float(el.get("rotation", "0")),
             anchor_x=float(anchor[0]) if len(anchor) > 0 else 0.0,
             anchor_y=float(anchor[1]) if len(anchor) > 1 else 0.0,
+            scale_y=scale_y,
         )

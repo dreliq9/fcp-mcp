@@ -11,6 +11,13 @@ from .parser import FCPXMLParser
 from .models import FCPXMLDocument, ClipType
 
 
+def parse_fcpxml_version(value: str) -> tuple[int, ...]:
+    parts = value.split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValueError(value)
+    return tuple(int(part) for part in parts)
+
+
 @dataclass
 class ValidationIssue:
     severity: str  # "error", "warning", "info"
@@ -80,8 +87,8 @@ class FCPXMLValidator:
 
         # Check version
         try:
-            version = float(doc.version)
-            if version < 1.6:
+            version = parse_fcpxml_version(doc.version)
+            if version < (1, 6):
                 result.add("warning", f"Old FCPXML version {doc.version} — some features may not be supported")
         except ValueError:
             result.add("error", f"Invalid version: {doc.version}")

@@ -1,12 +1,11 @@
 """Tests for FCPXML writer/modifier."""
 
-import pytest
 from pathlib import Path
-import tempfile
 
-from fcp_mcp.fcpxml.writer import FCPXMLModifier
+import pytest
+
 from fcp_mcp.fcpxml.parser import FCPXMLParser
-
+from fcp_mcp.fcpxml.writer import FCPXMLModifier
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -109,10 +108,8 @@ class TestBatchOps:
 
 
 class TestSaveRoundtrip:
-    def test_save_and_reparse(self, modifier, parser):
-        with tempfile.NamedTemporaryFile(suffix=".fcpxml", delete=False) as f:
-            output = Path(f.name)
-
+    def test_save_and_reparse(self, modifier, parser, tmp_path):
+        output = tmp_path / "roundtrip.fcpxml"
         modifier.add_marker("Interview_A", "0s", "Test Marker")
         modifier.save(output)
 
@@ -121,5 +118,3 @@ class TestSaveRoundtrip:
         interview = clips[0]
         marker_values = [m.value for m in interview.markers]
         assert "Test Marker" in marker_values
-
-        output.unlink()
