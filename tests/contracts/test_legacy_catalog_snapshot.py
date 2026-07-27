@@ -28,3 +28,4 @@ def test_v021_snapshot_matches_names_inputs_and_annotations():
         assert frozen["annotations"] == tool.annotations.model_dump(
             by_alias=True, exclude_none=True
         )
+        assert frozen["output_schema"] == tool.outputSchema
