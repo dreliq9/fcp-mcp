@@ -10,7 +10,7 @@ permissions:
 jobs:
   verify:
     name: Reverify tagged release candidate
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -65,7 +65,6 @@ jobs:
       name: pypi
       url: https://pypi.org/p/fcp-mcp
     permissions:
-      contents: read
       id-token: write
     steps:
       - name: Download verified distributions

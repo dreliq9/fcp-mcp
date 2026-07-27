@@ -32,7 +32,7 @@ sees them in the MCP prompt list and can invoke them by name.
 - AppleScript/JXA argv isolation
 - Explicit MCP annotations on all 89 tools
 - Executable documentation and prompt contracts
-- Python 3.10–3.13 CI, offline Windows coverage, dependency audit,
+- Python 3.10–3.13 CI on macOS, dependency audit,
   coverage floors, package checks, and installed-wheel smoke
 - FastMCP v1 bounded below v2, with package and wire versions disclosed
   separately

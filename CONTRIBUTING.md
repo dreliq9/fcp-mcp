@@ -10,13 +10,12 @@ git clone https://github.com/dreliq9/fcp-mcp.git
 cd fcp-mcp
 
 python3 -m venv .venv
-source .venv/bin/activate       # macOS/Linux
-# .venv\Scripts\activate        # Windows (FCPXML tools only — live FCP tools are macOS)
+source .venv/bin/activate
 
 pip install -e ".[dev]"
 
 # Optional but recommended for media_* tool development
-brew install ffmpeg             # or apt install ffmpeg on Linux
+brew install ffmpeg
 ```
 
 ## Adding a new tool

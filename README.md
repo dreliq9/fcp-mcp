@@ -87,7 +87,6 @@ fcp-mcp/
 │   └── GALLERY.md               # workflow gallery with prompts
 ├── pyproject.toml
 ├── server.json                  # MCP Registry manifest
-├── smithery.yaml                # Smithery directory config
 ├── LLM_GUIDE.md                 # operational guide for agents
 ├── WORKFLOWS.md                 # production recipes
 ├── CHANGELOG.md
@@ -103,7 +102,7 @@ fcp-mcp/
 ### Prerequisites
 
 - Python 3.10+
-- macOS with Final Cut Pro (for live-control tools — FCPXML tools work anywhere)
+- macOS 15.6 or later with Final Cut Pro
 - **FFmpeg** on `$PATH` (for `media_*` tools): `brew install ffmpeg`
 - **Apple Compressor** (optional, for `compressor_*` tools)
 
@@ -267,8 +266,7 @@ export FCP_MCP_OUTPUT_DIR=/your/path
 `FCP_MCP_OUTPUT_DIR` is unset. Relative input paths resolve beneath the
 output directory.
 
-Allow additional input roots with the platform path separator (`:` on
-macOS/Linux, `;` on Windows):
+Allow additional input roots with the macOS path separator (`:`):
 
 ```bash
 export FCP_MCP_ALLOWED_ROOTS="/Users/me/Movies:/Volumes/Media"
@@ -370,7 +368,6 @@ v0.2.1 schema and is intentionally unavailable.
 See [ROADMAP.md](ROADMAP.md) for the full plan. Highlights:
 
 - **MCP Prompts** — shipped: `qc-check`, `youtube-chapters`, `cleanup`, `rough-cut`, `beat-sync`
-- **Windows/Linux parity for FCPXML tools** — live-control tools remain macOS-only
 - **Proxy/Resolve round-trip** — proxy-aware offline/online workflows
 
 ---
