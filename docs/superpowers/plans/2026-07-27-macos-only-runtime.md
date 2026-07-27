@@ -464,7 +464,7 @@ Run:
 .venv/bin/python -m pytest \
   tests/contracts/test_macos_only_distribution.py \
   tests/test_version_contracts.py tests/test_release_smoke.py -q
-.venv/bin/python scripts/check_contracts.py
+FCP_MCP_PROFILE=full .venv/bin/python scripts/check_contracts.py
 .venv/bin/python -m build
 .venv/bin/python -m twine check dist/*
 git diff --check
