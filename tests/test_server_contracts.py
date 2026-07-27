@@ -53,6 +53,8 @@ def automation_calls(monkeypatch, tmp_path: Path):
 
     def fake(program, args=(), **kwargs):
         calls.append((program, tuple(args), kwargs))
+        if program in {automation.FCP_EVENTS, automation.FCP_PROJECTS}:
+            return "[]"
         return "ok"
 
     monkeypatch.setattr(server, "CONFIG", config)
@@ -61,21 +63,22 @@ def automation_calls(monkeypatch, tmp_path: Path):
 
 
 @pytest.mark.parametrize(
-    ("handler", "value"),
+    ("handler", "value", "expected_text"),
     [
-        (server.fcp_get_events, HOSTILE),
-        (server.fcp_get_projects, HOSTILE),
-        (server.fcp_navigate, HOSTILE),
-        (server.fcp_menu_command, f"File > {HOSTILE}"),
-        (server.fcp_share, HOSTILE),
+        (server.fcp_get_events, HOSTILE, "[]"),
+        (server.fcp_get_projects, HOSTILE, "[]"),
+        (server.fcp_navigate, HOSTILE, "ok"),
+        (server.fcp_menu_command, f"File > {HOSTILE}", "ok"),
+        (server.fcp_share, HOSTILE, "ok"),
     ],
 )
 def test_live_handler_keeps_hostile_value_out_of_program_source(
     handler,
     value,
+    expected_text,
     automation_calls,
 ):
-    assert handler(value) == "ok"
+    assert handler(value) == expected_text
     program, args, _ = automation_calls[-1]
     assert HOSTILE not in program.source
     assert HOSTILE in " ".join(args)

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -125,6 +126,44 @@ from .result_models.fcpxml import (
     TransitionMutationRecord,
     TransitionMutationResult,
     UnsupportedToolResult,
+)
+from .result_models.live import (
+    CollectionParentFilter,
+    CompressorCLIInformationRecord,
+    CompressorCommandResult,
+    CompressorCustomSettingRecord,
+    CompressorSettingsResult,
+    CompressorSubmissionRequest,
+    CompressorSubmissionResult,
+    EmptyActionRequest,
+    EventRecord,
+    FCPAppStateResult,
+    FCPCollectionResult,
+    FCPExportXMLResult,
+    FCPImportXMLRequest,
+    FCPImportXMLResult,
+    FCPKeyboardShortcutRequest,
+    FCPKeyboardShortcutResult,
+    FCPMenuCommandRequest,
+    FCPMenuCommandResult,
+    FCPNavigateRequest,
+    FCPNavigateResult,
+    FCPOpenLibraryRequest,
+    FCPOpenLibraryResult,
+    FCPPlaybackRequest,
+    FCPPlaybackResult,
+    FCPRedoResult,
+    FCPRunningResult,
+    FCPSelectToolRequest,
+    FCPSelectToolResult,
+    FCPShareRequest,
+    FCPShareResult,
+    FCPTimelineInfoResult,
+    FCPTimeObservation,
+    FCPUndoResult,
+    LibraryRecord,
+    ProjectRecord,
+    VerificationStatus,
 )
 from .result_models.media import (
     AudioStreamRecord,
@@ -4594,8 +4633,97 @@ def fcpxml_save_template(
 # Category 1: Library Inspection — live FCP (6 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
-def fcp_is_running() -> str:
+_UNVERIFIED_FCP_WARNING = (
+    "The automation command returned, but Final Cut Pro state was not "
+    "independently observed."
+)
+_UNVERIFIED_COMPRESSOR_WARNING = (
+    "Compressor accepted the command, but durable job state was not "
+    "independently observed."
+)
+_COMPRESSOR_JOB_IDENTIFIER = re.compile(
+    r"(?im)^\s*job\s+(?:id|identifier):\s*"
+    r"([A-Za-z0-9][A-Za-z0-9._:-]{0,127})\s*$"
+)
+
+
+def _live_json(raw: str, context: str) -> object:
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"{context} returned malformed JSON",
+        ) from error
+
+
+def _collection_result(
+    raw: str,
+    *,
+    collection_type: str,
+    record_model: type[LibraryRecord | EventRecord | ProjectRecord],
+    parent_filter: CollectionParentFilter | None,
+) -> _TextToolOutcome:
+    payload = _live_json(raw, f"FCP {collection_type} query")
+    if not isinstance(payload, list):
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"FCP {collection_type} query returned a non-list response",
+        )
+    try:
+        records = [
+            record_model.model_validate(
+                {
+                    **item,
+                    "kind": {
+                        "libraries": "library",
+                        "events": "event",
+                        "projects": "project",
+                    }[collection_type],
+                }
+            )
+            for item in payload
+        ]
+        structured = FCPCollectionResult(
+            collection_type=collection_type,
+            parent_filter=parent_filter,
+            names=[record.name for record in records],
+            records=records,
+        )
+    except (TypeError, ValueError) as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"FCP {collection_type} query returned an invalid response shape",
+        ) from error
+    return _TextToolOutcome(text=raw, structured=structured)
+
+
+def _time_observation(
+    value: object,
+    field: str,
+) -> FCPTimeObservation | None:
+    if value is None:
+        return None
+    try:
+        return FCPTimeObservation.model_validate(value)
+    except ValueError as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"FCP timeline query returned an invalid {field}",
+        ) from error
+
+
+def _compressor_job_identifier(stdout: str) -> str | None:
+    match = _COMPRESSOR_JOB_IDENTIFIER.search(stdout)
+    return match.group(1) if match is not None else None
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=LIVE_READ,
+    result_model=FCPRunningResult,
+)
+def fcp_is_running() -> ToolOutcome[FCPRunningResult]:
     """Check if Final Cut Pro is currently running."""
     try:
         result = subprocess.run(
@@ -4638,80 +4766,217 @@ def fcp_is_running() -> str:
             ErrorCode.COMMAND_FAILED,
             "Final Cut Pro process probe returned an unexpected response",
         )
-    return json.dumps({"running": state == "true"})
-
-
-@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
-def fcp_get_libraries() -> str:
-    """Get all open libraries in Final Cut Pro (requires FCP to be running)."""
-    return automation.run_osascript(
-        automation.FCP_LIBRARIES,
-        config=CONFIG,
+    text = json.dumps({"running": state == "true"})
+    return _TextToolOutcome(
+        text=text,
+        structured=FCPRunningResult(
+            running=state == "true",
+            observation_method="system_events_process_list",
+        ),
     )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
-def fcp_get_events(library_name: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=LIVE_READ,
+    result_model=FCPCollectionResult,
+)
+def fcp_get_libraries() -> ToolOutcome[FCPCollectionResult]:
+    """Get all open libraries in Final Cut Pro (requires FCP to be running)."""
+    raw = automation.run_osascript(
+        automation.FCP_LIBRARIES,
+        config=CONFIG,
+    )
+    return _collection_result(
+        raw,
+        collection_type="libraries",
+        record_model=LibraryRecord,
+        parent_filter=None,
+    )
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=LIVE_READ,
+    result_model=FCPCollectionResult,
+)
+def fcp_get_events(library_name: str = "") -> ToolOutcome[FCPCollectionResult]:
     """Get events in a library (or all libraries if name not specified).
 
     Args:
         library_name: Library name to filter (optional)
     """
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_EVENTS,
         [library_name],
         config=CONFIG,
     )
+    return _collection_result(
+        raw,
+        collection_type="events",
+        record_model=EventRecord,
+        parent_filter=(
+            CollectionParentFilter(
+                field="library_name",
+                value=library_name,
+            )
+            if library_name
+            else None
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
-def fcp_get_projects(event_name: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=LIVE_READ,
+    result_model=FCPCollectionResult,
+)
+def fcp_get_projects(event_name: str = "") -> ToolOutcome[FCPCollectionResult]:
     """Get projects in an event (or all events if name not specified).
 
     Args:
         event_name: Event name to filter (optional)
     """
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_PROJECTS,
         [event_name],
         config=CONFIG,
     )
+    return _collection_result(
+        raw,
+        collection_type="projects",
+        record_model=ProjectRecord,
+        parent_filter=(
+            CollectionParentFilter(
+                field="event_name",
+                value=event_name,
+            )
+            if event_name
+            else None
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
-def fcp_get_timeline_info() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=LIVE_READ,
+    result_model=FCPTimelineInfoResult,
+)
+def fcp_get_timeline_info() -> ToolOutcome[FCPTimelineInfoResult]:
     """Get info about the current/first timeline in FCP."""
-    result = automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_TIMELINE_INFO,
         config=CONFIG,
     )
-    try:
-        payload = json.loads(result)
-    except json.JSONDecodeError:
-        return result
-    if isinstance(payload, dict) and payload.get("error"):
+    payload = _live_json(raw, "FCP timeline query")
+    if (
+        isinstance(payload, dict)
+        and set(payload) == {"error"}
+        and isinstance(payload["error"], str)
+        and payload["error"]
+    ):
         raise FCPMCPError(
             ErrorCode.TARGET_NOT_FOUND,
             f"Timeline unavailable: {payload['error']}",
         )
-    return result
+    if not isinstance(payload, dict):
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "FCP timeline query returned a non-object response",
+        )
+    if set(payload) != {
+        "library",
+        "event",
+        "project",
+        "duration",
+        "frameDuration",
+        "tcFormat",
+    }:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "FCP timeline query returned an invalid response shape",
+        )
+    try:
+        structured = FCPTimelineInfoResult(
+            library=payload["library"],
+            event=payload["event"],
+            project=payload["project"],
+            duration=_time_observation(payload["duration"], "duration"),
+            frame_duration=_time_observation(
+                payload["frameDuration"],
+                "frame duration",
+            ),
+            timecode_format=payload["tcFormat"],
+            playhead=None,
+            selection_range=None,
+            warnings=[
+                (
+                    "The current JXA response does not observe the playhead "
+                    "position."
+                ),
+                (
+                    "The current JXA response does not observe a timeline "
+                    "selection or range."
+                ),
+            ],
+        )
+    except ValueError as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "FCP timeline query returned invalid field values",
+        ) from error
+    return _TextToolOutcome(text=raw, structured=structured)
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
-def fcp_get_app_state() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=LIVE_READ,
+    result_model=FCPAppStateResult,
+)
+def fcp_get_app_state() -> ToolOutcome[FCPAppStateResult]:
     """Get FCP application state — version, frontmost status."""
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_APP_STATE,
         config=CONFIG,
     )
+    payload = _live_json(raw, "FCP application-state query")
+    if not isinstance(payload, dict) or set(payload) != {
+        "name",
+        "version",
+        "frontmost",
+        "libraryCount",
+    }:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "FCP application-state query returned an invalid response shape",
+        )
+    try:
+        structured = FCPAppStateResult(
+            name=payload["name"],
+            version=payload["version"],
+            frontmost=payload["frontmost"],
+            library_count=payload["libraryCount"],
+        )
+    except ValueError as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "FCP application-state query returned invalid field values",
+        ) from error
+    return _TextToolOutcome(text=raw, structured=structured)
 
 
 # ============================================================================
 # Category 6: FCP Live Control (10 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_open_library(library_path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPOpenLibraryResult,
+)
+def fcp_open_library(
+    library_path: str,
+) -> ToolOutcome[FCPOpenLibraryResult]:
     """Open a FCP library file.
 
     Args:
@@ -4725,7 +4990,17 @@ def fcp_open_library(library_path: str) -> str:
     )
     try:
         subprocess.run(["open", str(path)], check=True, timeout=10)
-        return f"Opening library: {path}"
+        text = f"Opening library: {path}"
+        return _TextToolOutcome(
+            text=text,
+            structured=FCPOpenLibraryResult(
+                request=FCPOpenLibraryRequest(library_path=str(path)),
+                raw_response=text,
+                verification_status=VerificationStatus.UNVERIFIED,
+                observed_outcome=None,
+                warnings=[_UNVERIFIED_FCP_WARNING],
+            ),
+        )
     except subprocess.TimeoutExpired as error:
         raise FCPMCPError(
             ErrorCode.COMMAND_FAILED,
@@ -4738,8 +5013,12 @@ def fcp_open_library(library_path: str) -> str:
         ) from error
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_import_xml(fcpxml_path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPImportXMLResult,
+)
+def fcp_import_xml(fcpxml_path: str) -> ToolOutcome[FCPImportXMLResult]:
     """Import an FCPXML file into Final Cut Pro.
 
     Args:
@@ -4749,7 +5028,17 @@ def fcp_import_xml(fcpxml_path: str) -> str:
     path = _resolve_input(fcpxml_path, suffixes={".fcpxml"})
     try:
         subprocess.run(["open", "-a", "Final Cut Pro", str(path)], check=True, timeout=10)
-        return f"Importing FCPXML: {path}"
+        text = f"Importing FCPXML: {path}"
+        return _TextToolOutcome(
+            text=text,
+            structured=FCPImportXMLResult(
+                request=FCPImportXMLRequest(fcpxml_path=str(path)),
+                raw_response=text,
+                verification_status=VerificationStatus.UNVERIFIED,
+                observed_outcome=None,
+                warnings=[_UNVERIFIED_FCP_WARNING],
+            ),
+        )
     except subprocess.TimeoutExpired as error:
         raise FCPMCPError(
             ErrorCode.COMMAND_FAILED,
@@ -4762,18 +5051,36 @@ def fcp_import_xml(fcpxml_path: str) -> str:
         ) from error
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_export_xml() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPExportXMLResult,
+)
+def fcp_export_xml() -> ToolOutcome[FCPExportXMLResult]:
     """Trigger XML export in FCP via menu automation (requires Accessibility permissions)."""
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_EXPORT_XML,
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPExportXMLResult(
+            request=EmptyActionRequest(),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_playback(action: str = "toggle") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPPlaybackResult,
+)
+def fcp_playback(action: str = "toggle") -> ToolOutcome[FCPPlaybackResult]:
     """Control FCP playback.
 
     Args:
@@ -4790,16 +5097,33 @@ def fcp_playback(action: str = "toggle") -> str:
             ErrorCode.INVALID_ARGUMENTS,
             f"Unsupported playback action: {action}",
         )
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_PLAYBACK,
         [action, key_map[action]],
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPPlaybackResult(
+            request=FCPPlaybackRequest(
+                playback_action=action,
+                key=key_map[action],
+            ),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_navigate(timecode: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPNavigateResult,
+)
+def fcp_navigate(timecode: str = "") -> ToolOutcome[FCPNavigateResult]:
     """Navigate to a specific timecode in FCP.
 
     Args:
@@ -4810,16 +5134,33 @@ def fcp_navigate(timecode: str = "") -> str:
 
     # Control+P opens the timecode entry field in FCP
     clean_tc = timecode.replace(":", "").replace(";", "")
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_NAVIGATE,
         [timecode, clean_tc],
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPNavigateResult(
+            request=FCPNavigateRequest(
+                timecode=timecode,
+                normalized_timecode=clean_tc,
+            ),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_select_tool(tool: str = "select") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPSelectToolResult,
+)
+def fcp_select_tool(tool: str = "select") -> ToolOutcome[FCPSelectToolResult]:
     """Switch FCP editing tool.
 
     Args:
@@ -4834,36 +5175,81 @@ def fcp_select_tool(tool: str = "select") -> str:
             ErrorCode.INVALID_ARGUMENTS,
             f"Unsupported FCP tool: {tool}",
         )
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_SELECT_TOOL,
         [tool, tool_keys[tool]],
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPSelectToolResult(
+            request=FCPSelectToolRequest(
+                tool=tool,
+                key=tool_keys[tool],
+            ),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_undo() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPUndoResult,
+)
+def fcp_undo() -> ToolOutcome[FCPUndoResult]:
     """Undo the last action in FCP."""
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_UNDO,
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPUndoResult(
+            request=EmptyActionRequest(),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_redo() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPRedoResult,
+)
+def fcp_redo() -> ToolOutcome[FCPRedoResult]:
     """Redo the last undone action in FCP."""
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_REDO,
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPRedoResult(
+            request=EmptyActionRequest(),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_menu_command(menu_path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPMenuCommandResult,
+)
+def fcp_menu_command(menu_path: str) -> ToolOutcome[FCPMenuCommandResult]:
     """Execute any FCP menu command by path.
 
     Args:
@@ -4876,27 +5262,60 @@ def fcp_menu_command(menu_path: str) -> str:
             "Menu path must contain two or three nonempty components",
         )
     validated_json = json.dumps(parts, separators=(",", ":"))
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_MENU_COMMAND,
         [validated_json, menu_path, *parts],
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPMenuCommandResult(
+            request=FCPMenuCommandRequest(
+                menu_path=menu_path,
+                components=parts,
+            ),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_keyboard_shortcut(keys: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPKeyboardShortcutResult,
+)
+def fcp_keyboard_shortcut(
+    keys: str,
+) -> ToolOutcome[FCPKeyboardShortcutResult]:
     """Send a keyboard shortcut to FCP.
 
     Args:
         keys: Shortcut description like "cmd+c", "cmd+shift+e", "option+w"
     """
     key, modifiers = automation.parse_shortcut(keys)
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_KEYBOARD_SHORTCUT,
         [keys, key, *modifiers],
         timeout=30,
         config=CONFIG,
+    )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPKeyboardShortcutResult(
+            request=FCPKeyboardShortcutRequest(
+                keys=keys,
+                key=key,
+                modifiers=list(modifiers),
+            ),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
     )
 
 
@@ -4904,28 +5323,46 @@ def fcp_keyboard_shortcut(keys: str) -> str:
 # Category 7: Export & Encoding (6 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
-def fcp_share(destination: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPShareResult,
+)
+def fcp_share(destination: str = "") -> ToolOutcome[FCPShareResult]:
     """Trigger a share/export from FCP.
 
     Args:
         destination: Share destination name (opens default if empty)
     """
-    return automation.run_osascript(
+    raw = automation.run_osascript(
         automation.FCP_SHARE,
         [destination],
         timeout=30,
         config=CONFIG,
     )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPShareResult(
+            request=FCPShareRequest(destination=destination),
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=CompressorSubmissionResult,
+)
 def compressor_encode(
     input_path: str,
     setting_path: str = "",
     output_dir: str = "",
     batch_name: str = "MCP Encode",
-) -> str:
+) -> ToolOutcome[CompressorSubmissionResult]:
     """Encode a file using Compressor CLI.
 
     Args:
@@ -4947,9 +5384,12 @@ def compressor_encode(
 
     source = _resolve_input(input_path)
     cmd = [str(comp), "-batchName", batch_name, "-jobpath", str(source)]
+    setting_value = None
     if setting_path:
         setting = _resolve_input(setting_path, suffixes={".cmprstng"})
+        setting_value = str(setting)
         cmd.extend(["-settingpath", str(setting)])
+    destination_value = None
     if output_dir:
         destination = _resolve_output(
             output_dir,
@@ -4960,14 +5400,40 @@ def compressor_encode(
                 ErrorCode.INVALID_PATH,
                 f"Compressor output directory not found: {destination}",
             )
+        destination_value = str(destination)
         cmd.extend(["-locationpath", str(destination)])
 
     result = _run_checked(cmd, timeout=30)
-    return f"Compressor encode started: {result.stdout or result.stderr}"
+    text = f"Compressor encode started: {result.stdout or result.stderr}"
+    return _TextToolOutcome(
+        text=text,
+        structured=CompressorSubmissionResult(
+            request=CompressorSubmissionRequest(
+                source_path=str(source),
+                setting_path=setting_value,
+                output_directory=destination_value,
+                batch_name=batch_name,
+            ),
+            command=CompressorCommandResult(
+                argv=list(cmd),
+                returncode=result.returncode,
+                stdout=result.stdout or "",
+                stderr=result.stderr or "",
+            ),
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            job_identifier=_compressor_job_identifier(result.stdout or ""),
+            warnings=[_UNVERIFIED_COMPRESSOR_WARNING],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
-def compressor_list_settings() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=LIVE_READ,
+    result_model=CompressorSettingsResult,
+)
+def compressor_list_settings() -> ToolOutcome[CompressorSettingsResult]:
     """List available Compressor encoding presets."""
     from .media.ffprobe import _run_checked
     from .utils.paths import compressor_binary, compressor_settings_dir
@@ -4977,7 +5443,7 @@ def compressor_list_settings() -> str:
     custom = []
     if settings_dir.exists():
         for f in settings_dir.rglob("*.cmprstng"):
-            custom.append(str(f))
+            custom.append(str(f.resolve()))
 
     # Also try listing via Compressor CLI
     comp = compressor_binary()
@@ -4990,7 +5456,34 @@ def compressor_list_settings() -> str:
             if line.strip()
         ]
 
-    return json.dumps({"custom_presets": custom, "cli_info": built_in}, indent=2)
+    text = json.dumps(
+        {"custom_presets": custom, "cli_info": built_in},
+        indent=2,
+    )
+    warnings = []
+    if custom:
+        warnings.append(
+            "Custom setting paths were discovered, but preset contents were "
+            "not validated."
+        )
+    if built_in:
+        warnings.append(
+            "Compressor -info output is retained as raw CLI information."
+        )
+    return _TextToolOutcome(
+        text=text,
+        structured=CompressorSettingsResult(
+            custom_settings=[
+                CompressorCustomSettingRecord(path=path)
+                for path in custom
+            ],
+            cli_information=[
+                CompressorCLIInformationRecord(raw_line=line)
+                for line in built_in
+            ],
+            warnings=warnings,
+        ),
+    )
 
 
 @TOOLS.tool(

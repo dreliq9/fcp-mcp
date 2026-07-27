@@ -19,11 +19,14 @@ def test_v021_snapshot_matches_names_inputs_and_annotations():
     )
     tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
     assert len(snapshot["tools"]) == len(tools) == 89
+    assert set(snapshot["tools"]) == set(tools)
     assert snapshot["prompts"] == sorted(
         prompt.name for prompt in asyncio.run(mcp.list_prompts())
     )
     for name, frozen in snapshot["tools"].items():
         tool = tools[name]
+        # Output schemas intentionally migrate to typed domain models. The
+        # public v0.2.1 names, inputs, and annotations remain frozen.
         assert frozen["output_schema"]
         assert frozen["input_schema"] == tool.inputSchema
         assert frozen["annotations"] == tool.annotations.model_dump(
