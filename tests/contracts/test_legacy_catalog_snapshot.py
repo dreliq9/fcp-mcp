@@ -2,7 +2,10 @@ import asyncio
 import json
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 from fcp_mcp.server import mcp
 
