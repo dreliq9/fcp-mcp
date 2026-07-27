@@ -12,7 +12,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 import fcp_mcp.automation.osascript as automation
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
-from fcp_mcp.contracts import ErrorCode, FCPMCPError
+from fcp_mcp.contracts import FCPMCPError
 from fcp_mcp.result_models.common import LegacyTextResult, ToolOutcome
 from fcp_mcp.security.paths import PathPolicy
 from fcp_mcp.version import distribution_version
@@ -20,17 +20,56 @@ from fcp_mcp.version import distribution_version
 HOSTILE = 'x" & do shell script "touch /tmp/pwned" & "'
 
 
-def test_direct_server_main_rejects_non_macos_before_mcp_run(monkeypatch):
-    def forbidden():
-        raise AssertionError("unsupported startup crossed the server boundary")
+def test_direct_server_startup_rejects_before_runtime_construction():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+import sysconfig
 
-    monkeypatch.setattr("fcp_mcp.platform_support.sys.platform", "linux")
-    monkeypatch.setattr(server.mcp, "run", forbidden)
+sysconfig.get_config_vars()
 
-    with pytest.raises(FCPMCPError) as caught:
-        server.main()
+from fcp_mcp.config import RuntimeConfig
+from fcp_mcp.contracts import ErrorCode, FCPMCPError
+from fcp_mcp.mcp_boundary import FCPFastMCP
+from fcp_mcp.registry import PromptRegistry, ToolRegistry
+from fcp_mcp.security.paths import PathPolicy
+import fcp_mcp.mcp_boundary as mcp_boundary
 
-    assert caught.value.code is ErrorCode.UNSUPPORTED_PLATFORM
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("unsupported startup crossed a runtime boundary")
+
+
+RuntimeConfig.from_env = classmethod(forbidden)
+PathPolicy.__init__ = forbidden
+ToolRegistry.__init__ = forbidden
+PromptRegistry.__init__ = forbidden
+mcp_boundary.build_mcp_server = forbidden
+FCPFastMCP.run = forbidden
+
+sys.platform = "linux"
+import fcp_mcp.server as server
+
+try:
+    server.main()
+except FCPMCPError as error:
+    assert error.code is ErrorCode.UNSUPPORTED_PLATFORM
+    assert str(error) == "unsupported_platform: fcp-mcp requires macOS"
+else:
+    raise AssertionError("direct startup accepted an unsupported platform")
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
 
 
 @pytest.fixture
