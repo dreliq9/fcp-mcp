@@ -92,6 +92,11 @@ framework?
      3.10 and later.
    - Its `user_state_dir` abstraction covers the supported macOS, Windows, and
      Linux platforms without embedding home-directory conventions in the server.
+5. [Hypothesis on PyPI](https://pypi.org/project/hypothesis/)
+   - `6.161.5` is the current production/stable release and supports Python
+     3.10 and later.
+   - It supplies the property-based state-machine and canonicalization coverage
+     required by this design without becoming a runtime dependency.
 
 ## Local evidence
 
@@ -244,6 +249,8 @@ Adopted.
 - A durable SQLite event ledger and private hashed artifacts.
 - `platformdirs>=4.11,<5` as a direct dependency for the default per-user state
   location.
+- `hypothesis>=6.161,<7` as a development-only dependency for property-based
+  workflow tests.
 - CLI approval by default; explicit client-approval opt-in.
 - A default `workflow` capability profile.
 - Meaningful typed structured outputs for all existing tools while retaining
