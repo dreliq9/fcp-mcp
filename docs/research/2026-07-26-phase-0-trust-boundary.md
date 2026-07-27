@@ -117,3 +117,27 @@ Repeat targeted research before changing the design if any of these occur:
 - Atomic replacement or directory syncing behaves differently on a supported
   platform.
 - A supported MCP client cannot consume the planned structured doctor output.
+
+## Revalidation addendum: FastMCP v1 server identity
+
+The pre-implementation API inspection on 2026-07-26 triggered the metadata
+revalidation condition:
+
+- `FastMCP` 1.28.1 has no documented `version` constructor parameter or public
+  version setter.
+- The public low-level `Server` accepts `version`, but FastMCP creates and owns
+  that object behind a private `_mcp_server` attribute.
+- When the low-level version is unset, `create_initialization_options()` uses
+  the installed `mcp` distribution version for `serverInfo.version`.
+- Official FastMCP v1 examples and documented properties expose name,
+  instructions, website, icons, and settings, but not server software version.
+
+Decision:
+
+- Do not mutate `_mcp_server` or copy FastMCP internals.
+- Keep the wire name `fcp-mcp`.
+- Put `fcp-mcp v0.2.1` in server instructions.
+- Report package and wire/SDK versions separately in CLI and doctor.
+- Document the v1 wire-version limitation in release notes.
+- Re-evaluate correct wire identity through the public `MCPServer` v2 API in
+  Phase 1.
