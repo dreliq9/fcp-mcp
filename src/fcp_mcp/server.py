@@ -50,26 +50,41 @@ from .registry import PromptRegistry, ToolRegistry
 from .result_models.common import ToolOutcome
 from .result_models.fcpxml import (
     AppliedEffectRecord,
+    AudioLevelCheckResult,
+    AudioLevelObservationRecord,
     ClipListResult,
     ClipRecord,
     DiffChangeRecord,
     DiffCountsRecord,
     DuplicateDetectionResult,
+    DurationCheckResult,
     EffectInventoryResult,
     EffectParameterRecord,
     FCPXMLDiffResult,
     FCPXMLSummaryResult,
     FCPXMLValidationResult,
     FlashFrameDetectionResult,
+    FrameRateCheckResult,
+    FrameRateFormatRecord,
+    FrameRateMismatchRecord,
     GapDetectionResult,
+    InstalledEffectListResult,
     KeywordRecord,
     MarkerListResult,
     MarkerRecord,
+    MediaLinkCheckResult,
+    MotionTemplateListResult,
+    MotionTemplateRecord,
     PacingAnalysisResult,
     PacingHistogram,
     PacingRecord,
     ProjectDiffRecord,
+    QCReportResult,
     RoleListResult,
+    SafeZoneCheckResult,
+    SafeZoneObservationRecord,
+    ShareDestinationListResult,
+    TemplateListResult,
     TimelineStatsResult,
 )
 from .security.paths import PathPolicy
@@ -1879,8 +1894,12 @@ def fcpxml_batch_apply_transition(
 # Category 9: QC & Validation (6 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_qc_report(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=QCReportResult,
+)
+def fcpxml_qc_report(path: str) -> ToolOutcome[QCReportResult]:
     """Generate a comprehensive quality check report for the timeline.
 
     Checks: validation, gaps, flash frames, duplicates, pacing.
@@ -1942,11 +1961,58 @@ def fcpxml_qc_report(path: str) -> str:
         lines.append(f"Shortest: {pacing.shortest_shot:.3f}s, Longest: {pacing.longest_shot:.2f}s")
         lines.append(f"Distribution: {json.dumps(pacing.histogram)}")
 
-    return "\n".join(lines)
+    markdown = "\n".join(lines)
+    validation_record = FCPXMLValidationResult(
+        valid=validation.valid,
+        issues=[_serializable(issue) for issue in validation.issues],
+        error_count=len(validation.errors),
+        warning_count=len(validation.warnings),
+        info_count=(
+            len(validation.issues)
+            - len(validation.errors)
+            - len(validation.warnings)
+        ),
+        summary=validation.summary(),
+    )
+    pacing_records = [
+        PacingRecord(
+            average_shot_length=pacing.average_shot_length,
+            median_shot_length=pacing.median_shot_length,
+            std_deviation=pacing.std_deviation,
+            shortest_shot=pacing.shortest_shot,
+            longest_shot=pacing.longest_shot,
+            pacing_curve=pacing.pacing_curve,
+            histogram=PacingHistogram(
+                under_one_second=pacing.histogram.get("< 1s", 0),
+                one_to_three_seconds=pacing.histogram.get("1-3s", 0),
+                three_to_five_seconds=pacing.histogram.get("3-5s", 0),
+                five_to_ten_seconds=pacing.histogram.get("5-10s", 0),
+                ten_to_thirty_seconds=pacing.histogram.get("10-30s", 0),
+                thirty_seconds_or_more=pacing.histogram.get("30s+", 0),
+            ),
+        )
+        for pacing in pacing_list
+    ]
+    return ToolOutcome(
+        text=markdown,
+        structured=QCReportResult(
+            validation=validation_record,
+            stats=[_serializable(stats) for stats in stats_list],
+            gaps=[_serializable(gap) for gap in gaps],
+            flash_frames=[_serializable(flash) for flash in flashes],
+            duplicates=[_serializable(dupe) for dupe in dupes],
+            pacing=pacing_records,
+            markdown=markdown,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_check_media_links(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=MediaLinkCheckResult,
+)
+def fcpxml_check_media_links(path: str) -> ToolOutcome[MediaLinkCheckResult]:
     """Verify all referenced media files exist on disk.
 
     Args:
@@ -1957,13 +2023,25 @@ def fcpxml_check_media_links(path: str) -> str:
         if asset.src.startswith("file://"):
             PATHS.resolve_reference(url_unquote(asset.src[7:]))
     result = _validator.check_media_links(doc)
-    if not result.issues:
-        return "All media files found."
-    return result.summary()
+    text = "All media files found." if not result.issues else result.summary()
+    return ToolOutcome(
+        text=text,
+        structured=MediaLinkCheckResult(
+            issues=[_serializable(issue) for issue in result.issues],
+            missing_count=sum(
+                issue.message.startswith("Media file not found:")
+                for issue in result.issues
+            ),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_check_frame_rates(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=FrameRateCheckResult,
+)
+def fcpxml_check_frame_rates(path: str) -> ToolOutcome[FrameRateCheckResult]:
     """Detect mixed frame rate issues in the timeline.
 
     Args:
@@ -1971,18 +2049,56 @@ def fcpxml_check_frame_rates(path: str) -> str:
     """
     doc = _parse_doc(path)
     frame_rates = set()
-    for fmt in doc.formats.values():
+    formats = []
+    for format_id, fmt in doc.formats.items():
+        formats.append(
+            FrameRateFormatRecord(
+                format_id=format_id,
+                name=fmt.name,
+                frame_duration=fmt.frame_duration.to_fcpxml(),
+                fps=fmt.fps,
+            )
+        )
         if fmt.frame_duration.numerator > 0:
             frame_rates.add(fmt.fps)
 
     if len(frame_rates) <= 1:
-        return f"Consistent frame rate: {frame_rates.pop() if frame_rates else 'unknown'}fps"
+        text = (
+            "Consistent frame rate: "
+            f"{frame_rates.pop() if frame_rates else 'unknown'}fps"
+        )
+        mismatches = []
+    else:
+        text = (
+            "MIXED FRAME RATES DETECTED: "
+            + ", ".join(f"{rate:.2f}fps" for rate in sorted(frame_rates))
+        )
+        expected_fps = formats[0].fps
+        mismatches = [
+            FrameRateMismatchRecord(
+                format_id=item.format_id,
+                expected_fps=expected_fps,
+                actual_fps=item.fps,
+            )
+            for item in formats[1:]
+            if item.fps != expected_fps
+        ]
 
-    return f"MIXED FRAME RATES DETECTED: {', '.join(f'{r:.2f}fps' for r in sorted(frame_rates))}"
+    return ToolOutcome(
+        text=text,
+        structured=FrameRateCheckResult(
+            formats=formats,
+            mismatches=mismatches,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_check_audio_levels(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=AudioLevelCheckResult,
+)
+def fcpxml_check_audio_levels(path: str) -> ToolOutcome[AudioLevelCheckResult]:
     """Flag clips with potential audio issues (volume adjustments, missing audio).
 
     Args:
@@ -1990,6 +2106,7 @@ def fcpxml_check_audio_levels(path: str) -> str:
     """
     doc = _parse_doc(path)
     issues = []
+    observations = []
 
     for clip in doc.all_clips:
         if clip.is_gap:
@@ -1999,7 +2116,19 @@ def fcpxml_check_audio_levels(path: str) -> str:
         if clip.ref and clip.ref in doc.assets:
             asset = doc.assets[clip.ref]
             if not asset.has_audio and clip.role in ("Dialogue", "Music", ""):
-                issues.append(f"'{clip.name}': no audio in source (role: {clip.role or 'none'})")
+                message = (
+                    f"'{clip.name}': no audio in source "
+                    f"(role: {clip.role or 'none'})"
+                )
+                issues.append(message)
+                observations.append(
+                    AudioLevelObservationRecord(
+                        clip_name=clip.name,
+                        kind="missing_audio",
+                        message=message,
+                        role=clip.role,
+                    )
+                )
 
         # Check volume adjustments
         if clip.volume:
@@ -2008,19 +2137,61 @@ def fcpxml_check_audio_levels(path: str) -> str:
                 try:
                     db_val = float(amt.replace("dB", ""))
                     if db_val > 6:
-                        issues.append(f"'{clip.name}': very high volume (+{db_val}dB)")
+                        message = (
+                            f"'{clip.name}': very high volume (+{db_val}dB)"
+                        )
+                        issues.append(message)
+                        observations.append(
+                            AudioLevelObservationRecord(
+                                clip_name=clip.name,
+                                kind="high_volume",
+                                message=message,
+                                role=clip.role,
+                                amount_db=db_val,
+                            )
+                        )
                     elif db_val < -20:
-                        issues.append(f"'{clip.name}': very low volume ({db_val}dB)")
+                        message = (
+                            f"'{clip.name}': very low volume ({db_val}dB)"
+                        )
+                        issues.append(message)
+                        observations.append(
+                            AudioLevelObservationRecord(
+                                clip_name=clip.name,
+                                kind="low_volume",
+                                message=message,
+                                role=clip.role,
+                                amount_db=db_val,
+                            )
+                        )
                 except ValueError:
                     pass
 
-    if not issues:
-        return "No audio issues detected."
-    return "Audio issues:\n" + "\n".join(f"- {i}" for i in issues)
+    text = (
+        "No audio issues detected."
+        if not issues
+        else "Audio issues:\n" + "\n".join(f"- {issue}" for issue in issues)
+    )
+    return ToolOutcome(
+        text=text,
+        structured=AudioLevelCheckResult(
+            observations=observations,
+            limitations=[
+                (
+                    "Only FCPXML source and volume metadata were inspected; "
+                    "no media audio signal or loudness analysis was run."
+                )
+            ],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_check_safe_zones(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=SafeZoneCheckResult,
+)
+def fcpxml_check_safe_zones(path: str) -> ToolOutcome[SafeZoneCheckResult]:
     """Check for clips with transforms that might push content outside safe zones.
 
     Args:
@@ -2028,22 +2199,69 @@ def fcpxml_check_safe_zones(path: str) -> str:
     """
     doc = _parse_doc(path)
     issues = []
+    observations = []
 
     for clip in doc.all_clips:
         if clip.transform:
             t = clip.transform
             if abs(t.position_x) > 800 or abs(t.position_y) > 450:
-                issues.append(f"'{clip.name}': position ({t.position_x}, {t.position_y}) may be outside safe zone")
+                message = (
+                    f"'{clip.name}': position ({t.position_x}, {t.position_y}) "
+                    "may be outside safe zone"
+                )
+                issues.append(message)
+                observations.append(
+                    SafeZoneObservationRecord(
+                        clip_name=clip.name,
+                        kind="position",
+                        message=message,
+                        position_x=t.position_x,
+                        position_y=t.position_y,
+                    )
+                )
             if t.scale > 2.0 or t.scale < 0.3:
-                issues.append(f"'{clip.name}': scale {t.scale}x may cause quality issues")
+                message = (
+                    f"'{clip.name}': scale {t.scale}x may cause quality issues"
+                )
+                issues.append(message)
+                observations.append(
+                    SafeZoneObservationRecord(
+                        clip_name=clip.name,
+                        kind="scale",
+                        message=message,
+                        scale=t.scale,
+                    )
+                )
 
-    if not issues:
-        return "All clips within safe zones."
-    return "Safe zone concerns:\n" + "\n".join(f"- {i}" for i in issues)
+    text = (
+        "All clips within safe zones."
+        if not issues
+        else "Safe zone concerns:\n"
+        + "\n".join(f"- {issue}" for issue in issues)
+    )
+    return ToolOutcome(
+        text=text,
+        structured=SafeZoneCheckResult(
+            observations=observations,
+            limitations=[
+                (
+                    "Only FCPXML transform metadata was inspected; no rendered "
+                    "frames or media pixels were analyzed."
+                )
+            ],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_check_duration(path: str, target_seconds: float) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=DurationCheckResult,
+)
+def fcpxml_check_duration(
+    path: str,
+    target_seconds: float,
+) -> ToolOutcome[DurationCheckResult]:
     """Verify the timeline fits a target duration.
 
     Args:
@@ -2065,8 +2283,22 @@ def fcpxml_check_duration(path: str, target_seconds: float) -> str:
 
         diff = actual - target_seconds
         status = "ON TARGET" if abs(diff) < 1 else ("OVER" if diff > 0 else "UNDER")
-        return (f"Project '{project.name}': {actual:.1f}s / {target_seconds:.1f}s target "
-                f"({status}, diff: {diff:+.1f}s)")
+        text = (
+            f"Project '{project.name}': {actual:.1f}s / "
+            f"{target_seconds:.1f}s target "
+            f"({status}, diff: {diff:+.1f}s)"
+        )
+        return ToolOutcome(
+            text=text,
+            structured=DurationCheckResult(
+                project_name=project.name,
+                target_seconds=target_seconds,
+                actual_seconds=actual,
+                delta_seconds=diff,
+                tolerance_seconds=1.0,
+                within_tolerance=abs(diff) < 1,
+            ),
+        )
 
     raise FCPMCPError(
         ErrorCode.TARGET_NOT_FOUND,
@@ -2078,8 +2310,12 @@ def fcpxml_check_duration(path: str, target_seconds: float) -> str:
 # Category 10: Templates & Presets (6 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcp_list_motion_templates() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=MotionTemplateListResult,
+)
+def fcp_list_motion_templates() -> ToolOutcome[MotionTemplateListResult]:
     """List installed Motion templates (titles, transitions, generators, effects)."""
     from .utils.paths import motion_templates_dir
 
@@ -2091,6 +2327,7 @@ def fcp_list_motion_templates() -> str:
         )
 
     categories = {}
+    template_records = []
     for category_dir in templates_dir.iterdir():
         if not category_dir.is_dir():
             continue
@@ -2098,30 +2335,54 @@ def fcp_list_motion_templates() -> str:
         templates = []
         for template_dir in category_dir.rglob("*.motn"):
             templates.append(template_dir.stem)
+            template_records.append(
+                MotionTemplateRecord(
+                    category=cat_name,
+                    name=template_dir.stem,
+                    path=str(template_dir),
+                )
+            )
         if templates:
             categories[cat_name] = templates
 
-    return json.dumps(categories, indent=2)
+    return ToolOutcome(
+        text=json.dumps(categories, indent=2),
+        structured=MotionTemplateListResult(templates=template_records),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcp_list_share_destinations() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=ShareDestinationListResult,
+)
+def fcp_list_share_destinations() -> ToolOutcome[ShareDestinationListResult]:
     """List configured FCP share destinations."""
     from .utils.paths import fcp_destinations_dir
 
     dest_dir = fcp_destinations_dir()
     if not dest_dir.exists():
-        return json.dumps({"destinations": []}, indent=2)
+        return ToolOutcome(
+            text=json.dumps({"destinations": []}, indent=2),
+            structured=ShareDestinationListResult(destinations=[]),
+        )
 
     destinations = []
     for f in dest_dir.glob("*.fcpdestination"):
         destinations.append(f.stem)
 
-    return json.dumps({"destinations": destinations}, indent=2)
+    return ToolOutcome(
+        text=json.dumps({"destinations": destinations}, indent=2),
+        structured=ShareDestinationListResult(destinations=destinations),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcp_discover_effects() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=InstalledEffectListResult,
+)
+def fcp_discover_effects() -> ToolOutcome[InstalledEffectListResult]:
     """List available FCP effects and transitions by scanning known locations."""
     # Check Motion templates for effects
     from .utils.paths import motion_templates_dir
@@ -2148,11 +2409,24 @@ def fcp_discover_effects() -> str:
         for effect_dir in (templates_dir / "Effects.localized").rglob("*.moef") if (templates_dir / "Effects.localized").exists() else []:
             result["custom_effects"].append(effect_dir.stem)
 
-    return json.dumps(result, indent=2)
+    return ToolOutcome(
+        text=json.dumps(result, indent=2),
+        structured=InstalledEffectListResult(
+            effects=result["custom_effects"],
+            transitions=result["built_in_transitions"],
+            titles=result["built_in_titles"],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_list_templates(templates_dir: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=TemplateListResult,
+)
+def fcpxml_list_templates(
+    templates_dir: str = "",
+) -> ToolOutcome[TemplateListResult]:
     """List available FCPXML template files.
 
     Args:
@@ -2167,7 +2441,13 @@ def fcpxml_list_templates(templates_dir: str = "") -> str:
     for f in search_dir.rglob("*.fcpxml"):
         if "template" in f.stem.lower() or "preset" in f.stem.lower():
             templates.append(str(f))
-    return json.dumps({"templates": templates}, indent=2)
+    return ToolOutcome(
+        text=json.dumps({"templates": templates}, indent=2),
+        structured=TemplateListResult(
+            templates=templates,
+            directory=str(search_dir),
+        ),
+    )
 
 
 @TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)

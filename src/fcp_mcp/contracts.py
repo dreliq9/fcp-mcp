@@ -3,7 +3,16 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
+
+from .profiles import Profile
 
 
 class ErrorCode(str, Enum):
@@ -39,17 +48,17 @@ class FCPMCPError(RuntimeError):
 
 
 class DoctorCheck(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     id: str
     status: Literal["pass", "warn", "fail", "skip"]
     summary: str
-    details: dict[str, Any] = Field(default_factory=dict)
+    details: dict[str, JsonValue] = Field(default_factory=dict)
     remediation: str | None = None
 
 
 class DoctorReport(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal["1"] = "1"
     status: Literal["ready", "degraded", "blocked"]
@@ -58,6 +67,42 @@ class DoctorReport(BaseModel):
     wire_server_version: str
     protocol_target: Literal["2025-11-25"] = "2025-11-25"
     server_name: Literal["fcp-mcp"] = "fcp-mcp"
+    profile: Profile
+    tool_names: list[str]
     tool_count: int
     prompt_count: int
+    resource_count: int = 0
     checks: list[DoctorCheck]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _catalog_fields_from_checks(cls, value: object) -> object:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "profile" in data and "tool_names" in data:
+            return data
+        for raw_check in data.get("checks", []):
+            if isinstance(raw_check, DoctorCheck):
+                check_id = raw_check.id
+                details = raw_check.details
+            elif isinstance(raw_check, dict):
+                check_id = raw_check.get("id")
+                details = raw_check.get("details", {})
+            else:
+                continue
+            if check_id != "mcp_catalog" or not isinstance(details, dict):
+                continue
+            data.setdefault("profile", details.get("profile", Profile.WORKFLOW))
+            data.setdefault("tool_names", details.get("tool_names", []))
+            break
+        data.setdefault("profile", Profile.WORKFLOW)
+        data.setdefault("tool_names", [])
+        return data
+
+    @field_validator("tool_names", mode="before")
+    @classmethod
+    def _sort_tool_names(cls, value: object) -> object:
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return sorted(value)
+        return value

@@ -297,8 +297,146 @@ class FCPXMLDiffResult(BaseModel):
     summary: str
 
 
+class QCReportResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    validation: FCPXMLValidationResult
+    stats: list[TimelineStatisticsRecord]
+    gaps: list[GapRecord]
+    flash_frames: list[FlashFrameRecord]
+    duplicates: list[DuplicateGroupRecord]
+    pacing: list[PacingRecord]
+    markdown: str
+
+
+class MediaLinkCheckResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    issues: list[ValidationIssueRecord]
+    missing_count: int
+
+
+class FrameRateFormatRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    format_id: str
+    name: str
+    frame_duration: str
+    fps: float
+
+
+class FrameRateMismatchRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    format_id: str
+    expected_fps: float
+    actual_fps: float
+
+
+class FrameRateCheckResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    formats: list[FrameRateFormatRecord]
+    mismatches: list[FrameRateMismatchRecord]
+
+
+class AudioLevelObservationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    clip_name: str
+    kind: Literal["missing_audio", "high_volume", "low_volume"]
+    message: str
+    role: str
+    amount_db: float | None = None
+
+
+class AudioLevelCheckResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    verified: Literal[False] = False
+    observations: list[AudioLevelObservationRecord]
+    limitations: list[str]
+
+
+class SafeZoneObservationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    clip_name: str
+    kind: Literal["position", "scale"]
+    message: str
+    position_x: float | None = None
+    position_y: float | None = None
+    scale: float | None = None
+
+
+class SafeZoneCheckResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    verified: Literal[False] = False
+    observations: list[SafeZoneObservationRecord]
+    limitations: list[str]
+
+
+class DurationCheckResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    project_name: str
+    target_seconds: float
+    actual_seconds: float
+    delta_seconds: float
+    tolerance_seconds: float
+    within_tolerance: bool
+
+
+class MotionTemplateRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    category: str
+    name: str
+    path: str
+
+
+class MotionTemplateListResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    templates: list[MotionTemplateRecord]
+
+
+class ShareDestinationListResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destinations: list[str]
+
+
+class InstalledEffectListResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    effects: list[str]
+    transitions: list[str]
+    titles: list[str]
+
+
+class TemplateListResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    templates: list[str]
+    directory: str
+
+
 __all__ = [
     "AppliedEffectRecord",
+    "AudioLevelCheckResult",
+    "AudioLevelObservationRecord",
     "AvailableEffectRecord",
     "ClipListResult",
     "ClipRecord",
@@ -307,6 +445,7 @@ __all__ = [
     "DuplicateDetectionResult",
     "DuplicateGroupRecord",
     "DuplicateOccurrenceRecord",
+    "DurationCheckResult",
     "EffectInventoryResult",
     "EffectParameterRecord",
     "FCPXMLDiffResult",
@@ -314,17 +453,29 @@ __all__ = [
     "FCPXMLValidationResult",
     "FlashFrameDetectionResult",
     "FlashFrameRecord",
+    "FrameRateCheckResult",
+    "FrameRateFormatRecord",
+    "FrameRateMismatchRecord",
     "GapDetectionResult",
     "GapRecord",
+    "InstalledEffectListResult",
     "KeywordRecord",
     "MarkerListResult",
     "MarkerRecord",
+    "MediaLinkCheckResult",
+    "MotionTemplateListResult",
+    "MotionTemplateRecord",
     "PacingAnalysisResult",
     "PacingHistogram",
     "PacingRecord",
     "ProjectDiffRecord",
     "ProjectSummaryRecord",
+    "QCReportResult",
     "RoleListResult",
+    "SafeZoneCheckResult",
+    "SafeZoneObservationRecord",
+    "ShareDestinationListResult",
+    "TemplateListResult",
     "TimelineStatisticsRecord",
     "TimelineStatsResult",
     "ValidationIssueRecord",
