@@ -48,10 +48,25 @@ sees them in the MCP prompt list and can invoke them by name.
 
 ---
 
-## v0.3 — Production recipes
+## v0.3 — Transactional workflows
 
-**Goal:** match DareDev256's WORKFLOWS.md depth with a fcp-mcp-specific
-catalog.
+**Goal:** make multi-step FCPXML changes previewable, approvable,
+crash-recoverable, and machine-verifiable.
+
+- Default `workflow` capability profile with explicit `inspect`, `edit`, and
+  `full` alternatives
+- Meaningful typed structured outputs while preserving successful text content
+- Deterministic inspect-plan-dry-run-validate-diff-approve-commit graph
+- Durable SQLite event ledger, private hashed artifacts, and recovery tooling
+- CLI approval by default with explicit client-approval opt-in
+- Stable MCP SDK v2 migration after the final SDK/specification research gate
+
+---
+
+## v0.4 — Production recipes
+
+**Goal:** rebuild the fcp-mcp-specific recipe catalog on the transactional
+workflow surface.
 
 - `WORKFLOWS.md` — 8+ production recipes with full tool sequences:
   - Wedding/event highlight reel
@@ -65,7 +80,7 @@ catalog.
 
 ---
 
-## v0.4 — Proxy + offline media awareness
+## v0.5 — Proxy + offline media awareness
 
 **Goal:** make offline/online workflows first-class.
 
@@ -80,12 +95,11 @@ catalog.
 
 ---
 
-## v0.5 — Further policy hardening
+## v0.6 — Further policy hardening
 
 **Goal:** safe to run alongside untrusted clients.
 
-- Add capability profiles above the shipped live-control opt-in
-- Extend the shipped allowed-root policy with per-tool policy profiles
+- Extend the v0.3 capability profiles with per-tool path and execution policies
 - Rate-limit live FCP tools (AppleScript is slow; 1 call per 500ms
   naturally, but add an explicit cap)
 - Publish a consolidated security posture and adversarial trajectory
@@ -97,7 +111,7 @@ catalog.
 
 **Goal:** tool names + signatures frozen. Additions only, no renames.
 
-- Freeze the 89 v0.x tools after one full major-version shakedown
+- Freeze the shipped public tool set after one full major-version shakedown
 - Commit to 12-month deprecation window for any future removals
 - Version the MCP Prompts too — existing prompt names become stable
 - Publish `docs/STABILITY.md` stating what's covered by the pact
