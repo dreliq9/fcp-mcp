@@ -2,8 +2,8 @@
 
 **Date:** 2026-07-26
 **Applies to:** `fcp-mcp` v0.2.1
-**Research gate:** Complete
-**Next revalidation:** Before implementation starts, and again before release
+**Research gate:** Revalidated against the release candidate
+**Next revalidation:** Immediately before any authorized tag or publication
 
 ## Question
 
@@ -141,3 +141,168 @@ Decision:
 - Document the v1 wire-version limitation in release notes.
 - Re-evaluate correct wire identity through the public `MCPServer` v2 API in
   Phase 1.
+
+## Release-candidate revalidation: 2026-07-26
+
+The completed candidate was checked again against current primary sources
+before its final verification run.
+
+### Version snapshot
+
+- [PyPI](https://pypi.org/project/mcp/) reports MCP Python SDK `1.28.1` as
+  the current stable release.
+- [The official SDK releases](https://github.com/modelcontextprotocol/python-sdk/releases)
+  and [v2 documentation](https://py.sdk.modelcontextprotocol.io/v2/) report
+  `2.0.0b2` as the latest prerelease. Stable v2 is still targeted for
+  2026-07-27; it has not shipped as of this revalidation.
+- MCP `2025-11-25` remains the
+  [latest stable protocol revision](https://modelcontextprotocol.io/specification/2025-11-25).
+  `2026-07-28` is a
+  [release-candidate draft](https://github.com/modelcontextprotocol/modelcontextprotocol/releases/tag/2026-07-28-RC),
+  not a stable specification.
+
+The v1 dependency bound remains correct for a patch release. Phase 1 should
+recheck the actual stable SDK and protocol artifacts after they ship rather
+than porting against the beta or draft.
+
+### Guidance rechecked
+
+- The stable [MCP tools specification](https://modelcontextprotocol.io/specification/2025-11-25/server/tools)
+  still distinguishes malformed protocol requests from actionable tool
+  execution failures reported with `isError: true`. The candidate's coded
+  domain-error boundary matches that guidance.
+- The SDK's [v2 overview](https://py.sdk.modelcontextprotocol.io/v2/whats-new/)
+  and [migration guide](https://py.sdk.modelcontextprotocol.io/v2/migration/)
+  confirm that the migration is not a rename-only change: `FastMCP` becomes
+  `MCPServer`, Python wire fields become snake_case, server identity becomes a
+  public constructor concern, low-level validation/error behavior changes,
+  and sync handlers move to worker threads. Deferring that migration remains
+  the bounded choice for v0.2.1.
+- Python's [`tempfile.mkstemp`](https://docs.python.org/3/library/tempfile.html#tempfile.mkstemp)
+  still provides race-free secure creation and accepts an explicit directory.
+  [`os.replace`](https://docs.python.org/3/library/os.html#os.replace) is atomic
+  after a successful same-filesystem replacement and may fail across
+  filesystems. The candidate creates, validates, flushes, and replaces its
+  temporary FCPXML beside the destination.
+- The [PyPA entry-points specification](https://packaging.python.org/en/latest/specifications/entry-points/)
+  still defines a no-argument console function whose integer return becomes
+  the process exit code. The installed-wheel smoke exercises that generated
+  wrapper rather than relying on an editable install.
+- Current [PyPA publishing guidance](https://packaging.python.org/en/latest/guides/publishing-package-distribution-releases-using-github-actions-ci-cd-workflows/)
+  and the [PyPI Trusted Publishing security model](https://docs.pypi.org/trusted-publishers/security-model/)
+  prefer short-lived OIDC credentials, a protected deployment environment,
+  and a publish job limited to retrieving verified distributions and
+  publishing them.
+
+### Material change caused by revalidation
+
+The tag workflow was changed from a stored `PYPI_API_TOKEN` to isolated PyPI
+Trusted Publishing:
+
+- the unprivileged `verify` job repeats the release gates, builds the
+  distributions, smoke-tests the installed wheel, and uploads one short-lived
+  artifact;
+- the `publish` job receives `id-token: write` only at job scope and has
+  exactly two operations: download that artifact and invoke the pinned PyPA
+  publisher;
+- the job is bound to the `pypi` GitHub environment.
+
+Before anyone creates a release tag, maintainers must register
+`.github/workflows/publish.yml` and environment `pypi` as the trusted publisher
+for the PyPI project, configure required reviewers on that environment, and
+protect `v*` tags. No external release configuration or publication was
+performed during Phase 0.
+
+### Revalidation decision
+
+No source invalidated the Phase 0 execution-boundary design. The SDK v2 beta
+and draft protocol make the planned Phase 1 research gate more important, but
+do not justify expanding this patch into a migration. Subject to the clean
+verification and the external release prerequisites above, the candidate is
+ready for maintainer review.
+
+## Release-candidate verification evidence
+
+### Automated gates
+
+The following evidence was collected locally on macOS with Python 3.12.13:
+
+- Ruff passed over `src`, `tests`, and `scripts`.
+- The contract checker validated 47 executable tool-call blocks across
+  `WORKFLOWS.md` and `LLM_GUIDE.md`.
+- The complete suite passed: 243 tests.
+- Overall statement coverage was 64.46%, above the 60% floor.
+- All 11 trust-boundary modules met the 90% per-module floor.
+- `pip-audit --local` reported no known vulnerabilities. The local editable
+  `fcp-mcp` distribution was explicitly skipped because v0.2.1 is not yet on
+  PyPI; all installed third-party distributions were audited.
+- Both GitHub Actions workflows passed `actionlint`.
+- Wheel and source distribution passed `python -m build` and `twine check`.
+- A new Python 3.12 environment installed only the built wheel plus resolved
+  dependencies. Its stdio smoke initialized protocol `2025-11-25`, listed 89
+  tools and five prompts, called `fcp_doctor`, and independently reported
+  package `0.2.1`, SDK/wire `1.28.1`, and a non-blocking `degraded` status.
+
+For a reproducible surface-size measurement, the 89 tool models were dumped
+with Pydantic aliases, JSON mode, `None` fields excluded, compact separators,
+and UTF-8 encoding. The serialized catalog is 70,330 bytes with SHA-256
+`9746c4dbdae71994b3743b0717388791ab60c656cfb304e78c1a02957ac17559`.
+
+### Adversarial trajectory matrix
+
+| Required trajectory | Direct evidence | Result |
+|---|---|---|
+| Parent traversal and symlink escape | `test_parent_traversal_is_rejected`; `test_symlink_escape_is_rejected` | Pass |
+| Same-file overwrite | `test_commit_rejects_same_source_and_destination` | Pass |
+| Invalid XML preserves prior destination | `test_invalid_xml_never_replaces_existing_destination` | Pass; prior bytes unchanged and no temp remained |
+| Hostile OSA value remains data | `test_dynamic_value_is_argv_not_script_source` | Pass |
+| Missing media is an MCP error with no output | `test_missing_media_is_wire_error_and_creates_no_output` | Pass; `isError=true` |
+| Undefined template contract is explicit | `test_apply_template_fails_honestly` | Pass; `unsupported_contract` |
+| Package and wire versions are separate | `test_wire_identity_and_doctor_versions_are_truthful` | Pass |
+| Disabled live control runs nothing | `test_live_control_disabled_runs_nothing` | Pass |
+
+The nine focused tests above were also run as a separate adversarial batch;
+all nine passed.
+
+### Compatibility and design review
+
+The runtime catalog at base commit
+`a306424586955c1c5adc4a54ca7a196513ba10b1` was compared with the candidate:
+
+- base tools: 88;
+- candidate tools: 89;
+- removed tools: none;
+- added tools: `fcp_doctor`;
+- existing required input properties removed: none;
+- existing required inputs made optional: none.
+
+Every Phase 0 completion criterion has command or test evidence. The one
+accepted implementation limitation remains FastMCP v1's public wire-version
+surface, disclosed above and verified by doctor. The separate disposable-FCP
+import remains a pre-publication compatibility gate rather than a claim made
+by structural validation.
+
+### Optional live-FCP gate
+
+Final Cut Pro was initially absent. With explicit user authorization it was
+launched from the CLI using `open -a "Final Cut Pro"`. The live-control doctor
+then reported:
+
+- Final Cut Pro 12.2 installed and running;
+- macOS Accessibility trust available;
+- live control enabled for the isolated command;
+- zero open libraries.
+
+The read-only `fcp_get_app_state` query returned the same version, a false
+`frontmost` state at query time, and `libraryCount: 0`. With no user library or
+timeline open, the reversible UI exercise selected the Blade tool and restored
+the Select tool in a `finally` block:
+
+```json
+{"exercise":"Tool: blade","restored":"Tool: select"}
+```
+
+This passes live application reachability, permission, read-only query, and
+reversible automation without touching project data. It is not the separate
+authoritative disposable-project FCPXML import gate required before
+publication; no project mutation or import is claimed.
