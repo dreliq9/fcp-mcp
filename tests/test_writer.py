@@ -1,11 +1,14 @@
 """Tests for FCPXML writer/modifier."""
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from fcp_mcp.fcpxml.parser import FCPXMLParser
 from fcp_mcp.fcpxml.writer import FCPXMLModifier
+from fcp_mcp.utils.safe_xml import parse_string
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -108,6 +111,73 @@ class TestBatchOps:
 
 
 class TestSaveRoundtrip:
+    def test_serialize_is_deterministic_and_non_mutating(
+        self, modifier, sample_fcpxml_path
+    ):
+        modifier.add_marker("Interview_A", "0s", "Début 東京")
+        root_before = ET.tostring(modifier.root, encoding="utf-8")
+        source_before = sample_fcpxml_path.read_bytes()
+
+        first = modifier.serialize()
+        second = modifier.serialize()
+
+        assert first == second
+        assert first.startswith(b"<?xml version='1.0' encoding='utf-8'?>")
+        assert b"    <resources>" in first
+        assert "Début 東京".encode() in first
+        assert ET.tostring(modifier.root, encoding="utf-8") == root_before
+        assert sample_fcpxml_path.read_bytes() == source_before
+        assert parse_string(first).tag == "fcpxml"
+
+    def test_equivalent_fresh_modifiers_serialize_identically(
+        self, sample_fcpxml_path
+    ):
+        first = FCPXMLModifier(sample_fcpxml_path)
+        second = FCPXMLModifier(sample_fcpxml_path)
+
+        assert first.serialize() == second.serialize()
+
+    def test_serialize_supports_fcpxmld_bundle(
+        self, sample_fcpxml_path, tmp_path
+    ):
+        bundle = tmp_path / "Example.fcpxmld"
+        bundle.mkdir()
+        info = bundle / "Info.fcpxml"
+        info.write_bytes(sample_fcpxml_path.read_bytes())
+
+        modifier = FCPXMLModifier(bundle)
+
+        assert parse_string(modifier.serialize()).tag == "fcpxml"
+        assert info.read_bytes() == sample_fcpxml_path.read_bytes()
+
+    def test_save_passes_serialize_bytes_once_to_transaction_boundary(
+        self, modifier, monkeypatch, tmp_path
+    ):
+        destination = tmp_path / "exact.fcpxml"
+        expected = modifier.serialize()
+        calls = []
+
+        def record_commit(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(destination=destination)
+
+        monkeypatch.setattr(
+            "fcp_mcp.fcpxml.writer.commit_fcpxml_bytes",
+            record_commit,
+        )
+
+        receipt = modifier.save_with_receipt(destination, event_format="json")
+
+        assert receipt.destination == destination
+        assert len(calls) == 1
+        assert calls[0] == {
+            "source": modifier.path,
+            "destination": destination,
+            "xml_bytes": expected,
+            "event_format": "json",
+            "operation": "modifier_save",
+        }
+
     def test_save_and_reparse(self, modifier, parser, tmp_path):
         output = tmp_path / "roundtrip.fcpxml"
         modifier.add_marker("Interview_A", "0s", "Test Marker")

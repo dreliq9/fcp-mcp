@@ -12,7 +12,7 @@ from pathlib import Path
 
 from ..utils.safe_xml import parse_fcpxml
 from .time_utils import RationalTime
-from .transaction import FCPXMLTransactionReceipt, commit_fcpxml
+from .transaction import FCPXMLTransactionReceipt, commit_fcpxml_bytes
 
 
 class FCPXMLModifier:
@@ -46,15 +46,19 @@ class FCPXMLModifier:
             stem = self.path.stem
             output_path = self.path.parent / f"{stem}_modified.fcpxml"
         output_path = Path(output_path)
-        ET.indent(self.root, space="    ")
-        xml_text = ET.tostring(self.root, encoding="unicode", xml_declaration=True)
-        return commit_fcpxml(
+        return commit_fcpxml_bytes(
             source=self.path,
             destination=output_path,
-            xml_text=xml_text,
+            xml_bytes=self.serialize(),
             event_format=event_format,
             operation="modifier_save",
         )
+
+    def serialize(self) -> bytes:
+        """Serialize deterministic UTF-8 candidate bytes without mutating live state."""
+        root = copy.deepcopy(self.root)
+        ET.indent(root, space="    ")
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     # --- Markers ---
 
