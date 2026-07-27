@@ -23,12 +23,20 @@ async def _doctor() -> DoctorReport:
     except FCPMCPError as error:
         return configuration_failure_report(error)
 
-    from fcp_mcp.server import mcp
+    from fcp_mcp.server import catalog_expectations, mcp
 
     async def catalog() -> tuple[int, int]:
         return len(await mcp.list_tools()), len(await mcp.list_prompts())
 
-    return await collect_doctor(config, catalog_provider=catalog)
+    expected_tool_names, expected_prompt_count = catalog_expectations(
+        config.profile
+    )
+    return await collect_doctor(
+        config,
+        catalog_provider=catalog,
+        expected_tool_names=expected_tool_names,
+        expected_prompt_count=expected_prompt_count,
+    )
 
 
 def _render_doctor(report: DoctorReport) -> str:

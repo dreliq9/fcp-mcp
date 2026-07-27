@@ -14,10 +14,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote as url_unquote
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
-from pydantic import ValidationError
-
 from .automation import osascript as automation
 from .config import RuntimeConfig
 from .contracts import DoctorReport, ErrorCode, FCPMCPError
@@ -48,6 +44,9 @@ from .fcpxml.puppet import (
 from .fcpxml.time_utils import RationalTime
 from .fcpxml.validator import FCPXMLValidator
 from .fcpxml.writer import FCPXMLModifier
+from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
+from .profiles import Profile, ToolClass
+from .registry import PromptRegistry, ToolRegistry
 from .security.paths import PathPolicy
 from .tool_metadata import (
     DIAGNOSTIC,
@@ -61,50 +60,21 @@ from .utils.atomic_write import atomic_replace_bytes
 
 logger = logging.getLogger(__name__)
 
-
-class FCPFastMCP(FastMCP):
-    """FastMCP boundary that preserves domain codes and sanitizes defects."""
-
-    async def call_tool(
-        self,
-        name: str,
-        arguments: dict[str, Any],
-    ) -> Any:
-        try:
-            return await super().call_tool(name, arguments)
-        except ToolError as error:
-            cause = error.__cause__
-            if isinstance(cause, FCPMCPError):
-                raise
-            if isinstance(cause, ValidationError):
-                raise ToolError(
-                    f"Error executing tool {name}: "
-                    f"{ErrorCode.INVALID_ARGUMENTS.value}: "
-                    "Tool arguments did not match the schema"
-                ) from error
-            logger.exception(
-                "Unexpected failure while executing tool %s",
-                name,
-            )
-            raise ToolError(
-                f"Error executing tool {name}: "
-                f"{ErrorCode.INTERNAL_ERROR.value}: Unexpected internal failure"
-            ) from error
-
-
-mcp = FCPFastMCP(
-    "fcp-mcp",
-    instructions=(
-        "fcp-mcp v0.2.1 — FCPXML engine + live FCP control + media analysis "
-        "+ puppet animation. 89 tools across 12 categories and 5 prompts."
-    ),
-)
-
 CONFIG = RuntimeConfig.from_env()
 PATHS = PathPolicy(CONFIG)
+TOOLS = ToolRegistry()
+PROMPTS = PromptRegistry()
 
 _parser = FCPXMLParser()
 _validator = FCPXMLValidator()
+
+
+def catalog_expectations(profile: Profile) -> tuple[frozenset[str], int]:
+    visible_tools = TOOLS.for_profile(profile)
+    visible_tool_names = frozenset(
+        definition.name for definition in visible_tools
+    )
+    return visible_tool_names, len(PROMPTS.for_tools(visible_tool_names))
 
 
 def _resolve_input(
@@ -306,21 +276,29 @@ def _serializable(obj: Any) -> Any:
 # Category 0: Runtime diagnostics (1 tool)
 # ============================================================================
 
-@mcp.tool(annotations=DIAGNOSTIC)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=DIAGNOSTIC)
 async def fcp_doctor() -> DoctorReport:
     """Report structured runtime readiness without prompting or mutating user data."""
 
     async def catalog() -> tuple[int, int]:
         return len(await mcp.list_tools()), len(await mcp.list_prompts())
 
-    return await collect_doctor(CONFIG, catalog_provider=catalog)
+    visible_tool_names, visible_prompt_count = catalog_expectations(
+        CONFIG.profile
+    )
+    return await collect_doctor(
+        CONFIG,
+        catalog_provider=catalog,
+        expected_tool_names=visible_tool_names,
+        expected_prompt_count=visible_prompt_count,
+    )
 
 
 # ============================================================================
 # Category 2: FCPXML Analysis (12 tools)
 # ============================================================================
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_parse(path: str) -> str:
     """Parse an FCPXML file and return a structure summary.
 
@@ -347,7 +325,7 @@ def fcpxml_parse(path: str) -> str:
     return json.dumps(summary, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_list_clips(path: str, project_name: str = "") -> str:
     """List all clips in the timeline with timecodes, durations, and roles.
 
@@ -383,7 +361,7 @@ def fcpxml_list_clips(path: str, project_name: str = "") -> str:
     return json.dumps(clips_data, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_list_markers(path: str) -> str:
     """List all markers, chapter markers, and keywords across all clips.
 
@@ -419,7 +397,7 @@ def fcpxml_list_markers(path: str) -> str:
     return json.dumps(markers, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_analyze_pacing(path: str) -> str:
     """Analyze shot pacing — average/median shot length, distribution histogram.
 
@@ -431,7 +409,7 @@ def fcpxml_analyze_pacing(path: str) -> str:
     return json.dumps([_serializable(r) for r in results], indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_detect_gaps(path: str) -> str:
     """Find all gaps in the timeline.
 
@@ -443,7 +421,7 @@ def fcpxml_detect_gaps(path: str) -> str:
     return json.dumps([_serializable(g) for g in gaps], indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_detect_flash_frames(path: str, max_frames: int = 2) -> str:
     """Find clips shorter than max_frames (potential flash frames / accidental edits).
 
@@ -456,7 +434,7 @@ def fcpxml_detect_flash_frames(path: str, max_frames: int = 2) -> str:
     return json.dumps([_serializable(f) for f in flashes], indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_detect_duplicates(path: str) -> str:
     """Find clips that use the same source media.
 
@@ -468,7 +446,7 @@ def fcpxml_detect_duplicates(path: str) -> str:
     return json.dumps([_serializable(d) for d in dupes], indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_validate(path: str) -> str:
     """Validate FCPXML structure and report errors/warnings.
 
@@ -481,7 +459,7 @@ def fcpxml_validate(path: str) -> str:
     return result.summary()
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_list_effects(path: str) -> str:
     """List all effects and transitions applied to clips.
 
@@ -507,7 +485,7 @@ def fcpxml_list_effects(path: str) -> str:
     return json.dumps({"applied": effects, "available": resources}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_list_roles(path: str) -> str:
     """List all roles and subroles used in the timeline.
 
@@ -525,7 +503,7 @@ def fcpxml_list_roles(path: str) -> str:
     return json.dumps({"roles": sorted(roles)}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_timeline_stats(path: str) -> str:
     """Get comprehensive timeline statistics — duration, clip count, resolution, pacing, etc.
 
@@ -537,7 +515,7 @@ def fcpxml_timeline_stats(path: str) -> str:
     return json.dumps([_serializable(s) for s in stats], indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_diff(path_a: str, path_b: str) -> str:
     """Compare two FCPXML files and show differences.
 
@@ -556,7 +534,7 @@ def fcpxml_diff(path_a: str, path_b: str) -> str:
 # Category 3: FCPXML Editing (12 tools)
 # ============================================================================
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_add_marker(
     path: str,
     clip_name: str,
@@ -593,7 +571,7 @@ def fcpxml_add_marker(
     return f"Marker added. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_batch_add_markers(path: str, markers_json: str, output_path: str = "") -> str:
     """Add multiple markers at once.
 
@@ -639,7 +617,7 @@ def fcpxml_batch_add_markers(path: str, markers_json: str, output_path: str = ""
     return f"{count}/{len(markers)} markers added. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_add_keyword(
     path: str, clip_name: str, value: str, start: str = "0s",
     duration: str = "", output_path: str = "",
@@ -667,7 +645,7 @@ def fcpxml_add_keyword(
     return f"Keyword '{value}' added. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_trim_clip(
     path: str, clip_name: str,
     new_start: str = "", new_duration: str = "",
@@ -696,7 +674,7 @@ def fcpxml_trim_clip(
     return f"Clip trimmed. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_split_clip(path: str, clip_name: str, split_at: str, output_path: str = "") -> str:
     """Split a clip at a given offset within the clip.
 
@@ -722,7 +700,7 @@ def fcpxml_split_clip(path: str, clip_name: str, split_at: str, output_path: str
     return f"Clip split. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_delete_clips(path: str, clip_names_json: str, output_path: str = "") -> str:
     """Remove clips from the timeline by name.
 
@@ -748,7 +726,7 @@ def fcpxml_delete_clips(path: str, clip_names_json: str, output_path: str = "") 
     return f"{count}/{len(names)} clips deleted. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_reorder_clips(path: str, clip_names_json: str, output_path: str = "") -> str:
     """Reorder clips in the primary spine to match the given name order.
 
@@ -783,7 +761,7 @@ def fcpxml_reorder_clips(path: str, clip_names_json: str, output_path: str = "")
     return f"Clips reordered. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_add_transition(
     path: str, after_clip_name: str,
     duration: str = "30030/30000s", name: str = "Cross Dissolve",
@@ -809,7 +787,7 @@ def fcpxml_add_transition(
     return f"Transition added. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_change_speed(
     path: str, clip_name: str, speed_factor: float,
     output_path: str = "",
@@ -837,7 +815,7 @@ def fcpxml_change_speed(
     return f"Speed changed to {speed_factor}x. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_assign_role(
     path: str, clip_name: str, role: str, output_path: str = "",
 ) -> str:
@@ -859,7 +837,7 @@ def fcpxml_assign_role(
     return f"Role '{role}' assigned. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_add_title(
     path: str,
     text: str,
@@ -950,7 +928,7 @@ def fcpxml_add_title(
     return f"Title '{text}' added. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_add_audio(
     path: str,
     audio_src: str,
@@ -1038,7 +1016,7 @@ def fcpxml_add_audio(
 # Category 4: FCPXML Generation (8 tools)
 # ============================================================================
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_create_project(
     name: str = "Untitled Project",
     format_name: str = "FFVideoFormat1080p2997",
@@ -1073,7 +1051,7 @@ def fcpxml_create_project(
     return f"Project created: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_create_timeline(
     clips_json: str,
     project_name: str = "Generated Timeline",
@@ -1104,7 +1082,7 @@ def fcpxml_create_timeline(
     return f"Timeline created with {len(clips)} clips: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_auto_rough_cut(
     clips_json: str,
     target_duration: str = "",
@@ -1190,7 +1168,7 @@ def fcpxml_auto_rough_cut(
     return f"Rough cut created ({running_total.to_seconds():.1f}s): {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_generate_montage(
     clips_json: str,
     clip_duration: str = "90090/30000s",
@@ -1243,7 +1221,7 @@ def fcpxml_generate_montage(
     return f"Montage created ({len(clips)} shots): {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_import_srt(
     path: str,
     srt_path: str,
@@ -1338,7 +1316,7 @@ def fcpxml_import_srt(
     return f"{len(subtitles)} subtitles added. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_import_edl(
     edl_path: str,
     media_dir: str = "",
@@ -1405,7 +1383,7 @@ def fcpxml_import_edl(
     return f"EDL imported ({clip_count} clips): {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_reformat(
     path: str,
     target_width: int = 1080,
@@ -1446,7 +1424,7 @@ def fcpxml_reformat(
 # Category 8: Batch Operations (6 tools)
 # ============================================================================
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_fix_flash_frames(
     path: str,
     min_frames: int = 3,
@@ -1468,7 +1446,7 @@ def fcpxml_fix_flash_frames(
     return f"{count} flash frames fixed. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_fill_gaps(
     path: str,
     fill_asset_ref: str,
@@ -1497,7 +1475,7 @@ def fcpxml_fill_gaps(
     return f"{count} gaps filled. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_remove_silence(
     path: str,
     silence_threshold_seconds: float = 2.0,
@@ -1529,7 +1507,7 @@ def fcpxml_remove_silence(
     return f"{count} gaps removed. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_batch_rename_clips(
     path: str, pattern: str, replacement: str, output_path: str = "",
 ) -> str:
@@ -1557,7 +1535,7 @@ def fcpxml_batch_rename_clips(
     return f"{count} clips renamed. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_batch_assign_roles(
     path: str, rules_json: str, output_path: str = "",
 ) -> str:
@@ -1590,7 +1568,7 @@ def fcpxml_batch_assign_roles(
     return f"{count} roles assigned. Saved to: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_batch_apply_transition(
     path: str,
     duration: str = "30030/30000s",
@@ -1621,7 +1599,7 @@ def fcpxml_batch_apply_transition(
 # Category 9: QC & Validation (6 tools)
 # ============================================================================
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_qc_report(path: str) -> str:
     """Generate a comprehensive quality check report for the timeline.
 
@@ -1687,7 +1665,7 @@ def fcpxml_qc_report(path: str) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_check_media_links(path: str) -> str:
     """Verify all referenced media files exist on disk.
 
@@ -1704,7 +1682,7 @@ def fcpxml_check_media_links(path: str) -> str:
     return result.summary()
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_check_frame_rates(path: str) -> str:
     """Detect mixed frame rate issues in the timeline.
 
@@ -1723,7 +1701,7 @@ def fcpxml_check_frame_rates(path: str) -> str:
     return f"MIXED FRAME RATES DETECTED: {', '.join(f'{r:.2f}fps' for r in sorted(frame_rates))}"
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_check_audio_levels(path: str) -> str:
     """Flag clips with potential audio issues (volume adjustments, missing audio).
 
@@ -1761,7 +1739,7 @@ def fcpxml_check_audio_levels(path: str) -> str:
     return "Audio issues:\n" + "\n".join(f"- {i}" for i in issues)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_check_safe_zones(path: str) -> str:
     """Check for clips with transforms that might push content outside safe zones.
 
@@ -1784,7 +1762,7 @@ def fcpxml_check_safe_zones(path: str) -> str:
     return "Safe zone concerns:\n" + "\n".join(f"- {i}" for i in issues)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_check_duration(path: str, target_seconds: float) -> str:
     """Verify the timeline fits a target duration.
 
@@ -1820,7 +1798,7 @@ def fcpxml_check_duration(path: str, target_seconds: float) -> str:
 # Category 10: Templates & Presets (6 tools)
 # ============================================================================
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcp_list_motion_templates() -> str:
     """List installed Motion templates (titles, transitions, generators, effects)."""
     from .utils.paths import motion_templates_dir
@@ -1846,7 +1824,7 @@ def fcp_list_motion_templates() -> str:
     return json.dumps(categories, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcp_list_share_destinations() -> str:
     """List configured FCP share destinations."""
     from .utils.paths import fcp_destinations_dir
@@ -1862,7 +1840,7 @@ def fcp_list_share_destinations() -> str:
     return json.dumps({"destinations": destinations}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcp_discover_effects() -> str:
     """List available FCP effects and transitions by scanning known locations."""
     # Check Motion templates for effects
@@ -1893,7 +1871,7 @@ def fcp_discover_effects() -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def fcpxml_list_templates(templates_dir: str = "") -> str:
     """List available FCPXML template files.
 
@@ -1912,7 +1890,7 @@ def fcpxml_list_templates(templates_dir: str = "") -> str:
     return json.dumps({"templates": templates}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_apply_template(
     template_path: str,
     clips_json: str,
@@ -1938,7 +1916,7 @@ def fcpxml_apply_template(
     )
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_save_template(
     path: str,
     template_name: str,
@@ -1971,7 +1949,7 @@ def fcpxml_save_template(
 # Category 1: Library Inspection — live FCP (6 tools)
 # ============================================================================
 
-@mcp.tool(annotations=LIVE_READ)
+@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
 def fcp_is_running() -> str:
     """Check if Final Cut Pro is currently running."""
     try:
@@ -2018,7 +1996,7 @@ def fcp_is_running() -> str:
     return json.dumps({"running": state == "true"})
 
 
-@mcp.tool(annotations=LIVE_READ)
+@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
 def fcp_get_libraries() -> str:
     """Get all open libraries in Final Cut Pro (requires FCP to be running)."""
     return automation.run_osascript(
@@ -2027,7 +2005,7 @@ def fcp_get_libraries() -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_READ)
+@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
 def fcp_get_events(library_name: str = "") -> str:
     """Get events in a library (or all libraries if name not specified).
 
@@ -2041,7 +2019,7 @@ def fcp_get_events(library_name: str = "") -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_READ)
+@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
 def fcp_get_projects(event_name: str = "") -> str:
     """Get projects in an event (or all events if name not specified).
 
@@ -2055,7 +2033,7 @@ def fcp_get_projects(event_name: str = "") -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_READ)
+@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
 def fcp_get_timeline_info() -> str:
     """Get info about the current/first timeline in FCP."""
     result = automation.run_osascript(
@@ -2074,7 +2052,7 @@ def fcp_get_timeline_info() -> str:
     return result
 
 
-@mcp.tool(annotations=LIVE_READ)
+@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
 def fcp_get_app_state() -> str:
     """Get FCP application state — version, frontmost status."""
     return automation.run_osascript(
@@ -2087,7 +2065,7 @@ def fcp_get_app_state() -> str:
 # Category 6: FCP Live Control (10 tools)
 # ============================================================================
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_open_library(library_path: str) -> str:
     """Open a FCP library file.
 
@@ -2115,7 +2093,7 @@ def fcp_open_library(library_path: str) -> str:
         ) from error
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_import_xml(fcpxml_path: str) -> str:
     """Import an FCPXML file into Final Cut Pro.
 
@@ -2139,7 +2117,7 @@ def fcp_import_xml(fcpxml_path: str) -> str:
         ) from error
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_export_xml() -> str:
     """Trigger XML export in FCP via menu automation (requires Accessibility permissions)."""
     return automation.run_osascript(
@@ -2149,7 +2127,7 @@ def fcp_export_xml() -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_playback(action: str = "toggle") -> str:
     """Control FCP playback.
 
@@ -2175,7 +2153,7 @@ def fcp_playback(action: str = "toggle") -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_navigate(timecode: str = "") -> str:
     """Navigate to a specific timecode in FCP.
 
@@ -2195,7 +2173,7 @@ def fcp_navigate(timecode: str = "") -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_select_tool(tool: str = "select") -> str:
     """Switch FCP editing tool.
 
@@ -2219,7 +2197,7 @@ def fcp_select_tool(tool: str = "select") -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_undo() -> str:
     """Undo the last action in FCP."""
     return automation.run_osascript(
@@ -2229,7 +2207,7 @@ def fcp_undo() -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_redo() -> str:
     """Redo the last undone action in FCP."""
     return automation.run_osascript(
@@ -2239,7 +2217,7 @@ def fcp_redo() -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_menu_command(menu_path: str) -> str:
     """Execute any FCP menu command by path.
 
@@ -2261,7 +2239,7 @@ def fcp_menu_command(menu_path: str) -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_keyboard_shortcut(keys: str) -> str:
     """Send a keyboard shortcut to FCP.
 
@@ -2281,7 +2259,7 @@ def fcp_keyboard_shortcut(keys: str) -> str:
 # Category 7: Export & Encoding (6 tools)
 # ============================================================================
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def fcp_share(destination: str = "") -> str:
     """Trigger a share/export from FCP.
 
@@ -2296,7 +2274,7 @@ def fcp_share(destination: str = "") -> str:
     )
 
 
-@mcp.tool(annotations=LIVE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.LIVE_WRITE, safety_hints=LIVE_WRITE)
 def compressor_encode(
     input_path: str,
     setting_path: str = "",
@@ -2343,7 +2321,7 @@ def compressor_encode(
     return f"Compressor encode started: {result.stdout or result.stderr}"
 
 
-@mcp.tool(annotations=LIVE_READ)
+@TOOLS.tool(tool_class=ToolClass.LIVE_READ, safety_hints=LIVE_READ)
 def compressor_list_settings() -> str:
     """List available Compressor encoding presets."""
     from .media.ffprobe import _run_checked
@@ -2370,7 +2348,7 @@ def compressor_list_settings() -> str:
     return json.dumps({"custom_presets": custom, "cli_info": built_in}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
     """Convert FCPXML to DaVinci Resolve-compatible format (FCPXML v1.9).
 
@@ -2398,7 +2376,7 @@ def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
     return f"Resolve-compatible FCPXML saved: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
     """Convert FCPXML to FCP7 XML format (compatible with Premiere Pro and Avid).
 
@@ -2489,7 +2467,7 @@ def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
     return f"FCP7 XML saved: {destination}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def fcpxml_export_edl(path: str, output_path: str = "") -> str:
     """Export timeline as EDL (Edit Decision List).
 
@@ -2546,7 +2524,7 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
 # Category 5: Media Analysis — FFmpeg (8 tools)
 # ============================================================================
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def media_info(path: str) -> str:
     """Get detailed media file info (codec, resolution, duration, bitrate, etc.).
 
@@ -2590,7 +2568,7 @@ def media_info(path: str) -> str:
     return json.dumps(summary, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def media_detect_silence(
     path: str,
     noise_threshold: str = "-30dB",
@@ -2616,7 +2594,7 @@ def media_detect_silence(
     return json.dumps(silences, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def media_detect_beats(path: str) -> str:
     """Detect beat positions in audio/music files.
 
@@ -2632,7 +2610,7 @@ def media_detect_beats(path: str) -> str:
     return json.dumps({"beat_count": len(beats), "beats": beats}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def media_loudness(path: str) -> str:
     """Analyze audio loudness (EBU R128 / LUFS).
 
@@ -2653,7 +2631,7 @@ def media_loudness(path: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def media_extract_thumbnail(
     path: str,
     time: float = 0.0,
@@ -2686,7 +2664,7 @@ def media_extract_thumbnail(
     return f"Thumbnail saved: {out}"
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def media_extract_thumbnails(
     path: str,
     interval: float = 5.0,
@@ -2717,7 +2695,7 @@ def media_extract_thumbnails(
     return json.dumps({"count": len(thumbs), "thumbnails": thumbs}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def media_list_streams(path: str) -> str:
     """List all audio, video, and subtitle streams in a media file.
 
@@ -2740,7 +2718,7 @@ def media_list_streams(path: str) -> str:
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def media_scene_detect(path: str, threshold: float = 0.3) -> str:
     """Detect scene changes in video.
 
@@ -2757,7 +2735,7 @@ def media_scene_detect(path: str, threshold: float = 0.3) -> str:
     return json.dumps({"scene_count": len(scenes), "scenes": scenes}, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def media_extract_audio(
     path: str,
     output_path: str = "",
@@ -2812,7 +2790,7 @@ def media_extract_audio(
     }, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_WRITE)
+@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
 def media_audio_to_midi(
     path: str,
     output_path: str = "",
@@ -2915,7 +2893,7 @@ def media_audio_to_midi(
 # Category 11: Puppet Animation (7 tools)
 # ============================================================================
 
-@mcp.tool(annotations=STATEFUL_WRITE)
+@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
 def puppet_create_rig(
     rig_json: str,
 ) -> str:
@@ -2970,7 +2948,7 @@ def puppet_create_rig(
     }, indent=2)
 
 
-@mcp.tool(annotations=STATEFUL_WRITE)
+@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
 def puppet_create_humanoid_rig(
     name: str,
     image_dir: str,
@@ -3020,7 +2998,7 @@ def puppet_create_humanoid_rig(
     return json.dumps(result, indent=2)
 
 
-@mcp.tool(annotations=STATEFUL_WRITE)
+@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
 def puppet_build_scene(
     rigs_json: str,
     duration: str = "300300/30000s",
@@ -3066,7 +3044,7 @@ def puppet_build_scene(
     }, indent=2)
 
 
-@mcp.tool(annotations=STATEFUL_WRITE)
+@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
 def puppet_animate(
     rigs_json: str,
     animations_json: str,
@@ -3231,7 +3209,7 @@ def puppet_animate(
     }, indent=2)
 
 
-@mcp.tool(annotations=STATEFUL_WRITE)
+@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
 def puppet_preset_motion(
     rig_json: str,
     preset: str = "idle",
@@ -3329,7 +3307,7 @@ def puppet_preset_motion(
     }, indent=2)
 
 
-@mcp.tool(annotations=STATEFUL_WRITE)
+@TOOLS.tool(tool_class=ToolClass.STATEFUL_WRITE, safety_hints=STATEFUL_WRITE)
 def puppet_multi_scene(
     rigs_json: str,
     scenes_json: str,
@@ -3432,7 +3410,7 @@ def puppet_multi_scene(
     }, indent=2)
 
 
-@mcp.tool(annotations=OFFLINE_READ)
+@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
 def puppet_list_presets() -> str:
     """List all available puppet animation presets with descriptions.
 
@@ -3489,9 +3467,10 @@ def _tool_call_block(name: str, arguments: dict[str, Any]) -> str:
     return f"```tool-call\n{payload}\n```"
 
 
-@mcp.prompt(
+@PROMPTS.prompt(
     name="qc-check",
     description="Run the structural FCPXML QC report and interpret its Markdown results.",
+    dependencies={"fcpxml_qc_report"},
 )
 def prompt_qc_check(path: str) -> str:
     """Run qc report, then explain what needs attention."""
@@ -3509,9 +3488,10 @@ def prompt_qc_check(path: str) -> str:
     )
 
 
-@mcp.prompt(
+@PROMPTS.prompt(
     name="rough-cut",
     description="Assemble a rough cut from a list of clips, optionally target a duration.",
+    dependencies={"fcpxml_auto_rough_cut", "fcpxml_qc_report"},
 )
 def prompt_rough_cut(clips_json: str, target_duration: str = "") -> str:
     """Auto-assemble a rough cut, then QC it."""
@@ -3543,9 +3523,14 @@ def prompt_rough_cut(clips_json: str, target_duration: str = "") -> str:
     )
 
 
-@mcp.prompt(
+@PROMPTS.prompt(
     name="cleanup",
     description="Extend flash frames, replace gaps with a chosen asset, then re-run QC.",
+    dependencies={
+        "fcpxml_fix_flash_frames",
+        "fcpxml_fill_gaps",
+        "fcpxml_qc_report",
+    },
 )
 def prompt_cleanup(
     path: str,
@@ -3589,9 +3574,10 @@ def prompt_cleanup(
     )
 
 
-@mcp.prompt(
+@PROMPTS.prompt(
     name="youtube-chapters",
     description="Extract FCPXML markers and emit a YouTube chapter timestamp blob.",
+    dependencies={"fcpxml_list_markers"},
 )
 def prompt_youtube_chapters(path: str) -> str:
     """Convert FCPXML markers to a YouTube description chapter blob."""
@@ -3614,9 +3600,10 @@ def prompt_youtube_chapters(path: str) -> str:
     )
 
 
-@mcp.prompt(
+@PROMPTS.prompt(
     name="beat-sync",
     description="Detect beats and use their median cadence for an approximate rough cut.",
+    dependencies={"media_detect_beats", "fcpxml_auto_rough_cut"},
 )
 def prompt_beat_sync(audio_path: str, clips_json: str, project_name: str = "Beat Sync") -> str:
     """Detect beats and use their cadence to constrain rough-cut clip length."""
@@ -3668,6 +3655,9 @@ def prompt_beat_sync(audio_path: str, clips_json: str, project_name: str = "Beat
 # ============================================================================
 # Entry point
 # ============================================================================
+
+mcp = build_mcp_server(CONFIG, TOOLS, PROMPTS)
+
 
 def main():
     """Run the MCP server."""

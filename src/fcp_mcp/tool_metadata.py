@@ -1,49 +1,58 @@
-"""Reusable MCP tool annotation presets for the public catalog."""
+"""SDK-neutral safety metadata for the public tool catalog."""
 
 from __future__ import annotations
 
-from mcp.types import ToolAnnotations
+from dataclasses import dataclass
 
-OFFLINE_READ = ToolAnnotations(
-    readOnlyHint=True,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
+
+@dataclass(frozen=True)
+class SafetyHints:
+    read_only: bool
+    destructive: bool
+    idempotent: bool
+    open_world: bool
+
+
+OFFLINE_READ = SafetyHints(
+    read_only=True,
+    destructive=False,
+    idempotent=True,
+    open_world=False,
 )
 
-OFFLINE_WRITE = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=True,
-    idempotentHint=False,
-    openWorldHint=False,
+OFFLINE_WRITE = SafetyHints(
+    read_only=False,
+    destructive=True,
+    idempotent=False,
+    open_world=False,
 )
 
-LIVE_READ = ToolAnnotations(
-    readOnlyHint=True,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=True,
+LIVE_READ = SafetyHints(
+    read_only=True,
+    destructive=False,
+    idempotent=True,
+    open_world=True,
 )
 
-LIVE_WRITE = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=True,
-    idempotentHint=False,
-    openWorldHint=True,
+LIVE_WRITE = SafetyHints(
+    read_only=False,
+    destructive=True,
+    idempotent=False,
+    open_world=True,
 )
 
-STATEFUL_WRITE = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=False,
-    openWorldHint=False,
+STATEFUL_WRITE = SafetyHints(
+    read_only=False,
+    destructive=False,
+    idempotent=False,
+    open_world=False,
 )
 
-DIAGNOSTIC = ToolAnnotations(
-    readOnlyHint=False,
-    destructiveHint=False,
-    idempotentHint=True,
-    openWorldHint=False,
+DIAGNOSTIC = SafetyHints(
+    read_only=False,
+    destructive=False,
+    idempotent=True,
+    open_world=False,
 )
 
 
@@ -54,4 +63,5 @@ __all__ = [
     "OFFLINE_READ",
     "OFFLINE_WRITE",
     "STATEFUL_WRITE",
+    "SafetyHints",
 ]

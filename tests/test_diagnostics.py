@@ -19,7 +19,12 @@ async def test_doctor_has_stable_schema_and_catalog(tmp_path: Path):
     async def catalog():
         return 89, 5
 
-    report = await collect_doctor(config, catalog_provider=catalog)
+    report = await collect_doctor(
+        config,
+        catalog_provider=catalog,
+        expected_tool_names={"second", "first"} | {f"tool-{i}" for i in range(87)},
+        expected_prompt_count=5,
+    )
     assert report.schema_version == "1"
     assert report.package_version == "0.2.1"
     assert report.server_name == "fcp-mcp"
@@ -37,6 +42,11 @@ async def test_doctor_has_stable_schema_and_catalog(tmp_path: Path):
         "compressor",
     }
     assert list(tmp_path.glob(".fcp-mcp-doctor-*")) == []
+    catalog_check = next(check for check in report.checks if check.id == "mcp_catalog")
+    assert catalog_check.details["profile"] == "workflow"
+    assert catalog_check.details["tool_names"] == sorted(
+        ["first", "second", *[f"tool-{i}" for i in range(87)]]
+    )
 
 
 @pytest.mark.asyncio
@@ -50,7 +60,12 @@ async def test_missing_output_directory_blocks_doctor(tmp_path: Path):
     async def catalog():
         return 89, 5
 
-    report = await collect_doctor(config, catalog_provider=catalog)
+    report = await collect_doctor(
+        config,
+        catalog_provider=catalog,
+        expected_tool_names={f"tool-{i}" for i in range(89)},
+        expected_prompt_count=5,
+    )
     output_check = next(check for check in report.checks if check.id == "output_writable")
     assert report.status == "blocked"
     assert output_check.status == "fail"
@@ -67,7 +82,12 @@ async def test_catalog_mismatch_blocks_doctor(tmp_path: Path):
     async def catalog():
         return 88, 5
 
-    report = await collect_doctor(config, catalog_provider=catalog)
+    report = await collect_doctor(
+        config,
+        catalog_provider=catalog,
+        expected_tool_names={f"tool-{i}" for i in range(89)},
+        expected_prompt_count=5,
+    )
     catalog_check = next(check for check in report.checks if check.id == "mcp_catalog")
     assert report.status == "blocked"
     assert catalog_check.status == "fail"
@@ -192,9 +212,18 @@ async def test_catalog_provider_failure_blocks_doctor(tmp_path: Path):
     async def broken_catalog():
         raise RuntimeError("catalog exploded")
 
-    report = await collect_doctor(config, catalog_provider=broken_catalog)
+    report = await collect_doctor(
+        config,
+        catalog_provider=broken_catalog,
+        expected_tool_names={f"tool-{i}" for i in range(89)},
+        expected_prompt_count=5,
+    )
     catalog_check = next(check for check in report.checks if check.id == "mcp_catalog")
 
     assert report.status == "blocked"
     assert catalog_check.status == "fail"
     assert catalog_check.details["error"] == "catalog exploded"
+    assert catalog_check.details["profile"] == "workflow"
+    assert catalog_check.details["tool_names"] == sorted(
+        f"tool-{index}" for index in range(89)
+    )

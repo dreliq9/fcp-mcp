@@ -1,11 +1,14 @@
 """Shared test fixtures."""
 
+import os
 from pathlib import Path
 
 import pytest
 
 from fcp_mcp.fcpxml.models import FCPXMLDocument
 from fcp_mcp.fcpxml.parser import FCPXMLParser
+
+os.environ.setdefault("FCP_MCP_PROFILE", "full")
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 

@@ -5,7 +5,7 @@ import os
 import platform
 import subprocess
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from pathlib import Path
 
 from fcp_mcp.config import RuntimeConfig
@@ -278,10 +278,14 @@ def configuration_failure_report(error: FCPMCPError) -> DoctorReport:
 async def collect_doctor(
     config: RuntimeConfig,
     catalog_provider: CatalogProvider,
+    *,
+    expected_tool_names: Collection[str] | None = None,
+    expected_prompt_count: int | None = None,
 ) -> DoctorReport:
     checks = [_configuration_check(config), _output_check(config)]
     tool_count = 0
     prompt_count = 0
+    tool_names = sorted(expected_tool_names or ())
     try:
         tool_count, prompt_count = await catalog_provider()
     except Exception as error:  # noqa: BLE001 - diagnostics must report provider failures
@@ -290,21 +294,44 @@ async def collect_doctor(
                 id="mcp_catalog",
                 status="fail",
                 summary="MCP catalog could not be built",
-                details={"error": str(error)},
+                details={
+                    "error": str(error),
+                    "profile": config.profile.value,
+                    "tool_names": tool_names,
+                },
             )
         )
     else:
-        catalog_valid = tool_count == 89 and prompt_count == 5
+        expected_tool_count = (
+            len(tool_names)
+            if expected_tool_names is not None
+            else tool_count
+        )
+        expected_prompts = (
+            expected_prompt_count
+            if expected_prompt_count is not None
+            else prompt_count
+        )
+        catalog_valid = (
+            tool_count == expected_tool_count
+            and prompt_count == expected_prompts
+        )
         checks.append(
             DoctorCheck(
                 id="mcp_catalog",
                 status="pass" if catalog_valid else "fail",
                 summary=(
-                    "MCP catalog contains 89 tools and 5 prompts"
+                    f"MCP catalog contains {tool_count} tools and "
+                    f"{prompt_count} prompts"
                     if catalog_valid
                     else f"Unexpected MCP catalog: {tool_count} tools, {prompt_count} prompts"
                 ),
-                details={"tool_count": tool_count, "prompt_count": prompt_count},
+                details={
+                    "tool_count": tool_count,
+                    "prompt_count": prompt_count,
+                    "profile": config.profile.value,
+                    "tool_names": tool_names,
+                },
                 remediation=(
                     None
                     if catalog_valid

@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from fcp_mcp.server import (
+    PROMPTS,
     mcp,
     prompt_beat_sync,
     prompt_cleanup,
@@ -30,6 +31,31 @@ def test_all_five_prompts_registered():
     assert EXPECTED_PROMPT_NAMES.issubset(names), (
         f"missing prompts: {EXPECTED_PROMPT_NAMES - names}"
     )
+
+
+def test_prompt_dependencies_are_exact_and_frozen():
+    dependencies = {
+        name: definition.dependencies
+        for name, definition in PROMPTS.definitions.items()
+    }
+    assert dependencies == {
+        "qc-check": frozenset({"fcpxml_qc_report"}),
+        "rough-cut": frozenset(
+            {"fcpxml_auto_rough_cut", "fcpxml_qc_report"}
+        ),
+        "cleanup": frozenset(
+            {
+                "fcpxml_fix_flash_frames",
+                "fcpxml_fill_gaps",
+                "fcpxml_qc_report",
+            }
+        ),
+        "youtube-chapters": frozenset({"fcpxml_list_markers"}),
+        "beat-sync": frozenset(
+            {"media_detect_beats", "fcpxml_auto_rough_cut"}
+        ),
+    }
+    assert all(isinstance(item, frozenset) for item in dependencies.values())
 
 
 def test_cleanup_prompt_requires_fill_asset_ref():

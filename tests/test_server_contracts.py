@@ -264,6 +264,7 @@ async def test_missing_clip_is_wire_error(tmp_path: Path, sample_fcpxml_path: Pa
         {
             "FCP_MCP_OUTPUT_DIR": str(tmp_path),
             "FCP_MCP_ALLOWED_ROOTS": str(tmp_path),
+            "FCP_MCP_PROFILE": "full",
         }
     )
     parameters = StdioServerParameters(
@@ -463,6 +464,7 @@ async def test_missing_media_is_wire_error_and_creates_no_output(tmp_path: Path)
         {
             "FCP_MCP_OUTPUT_DIR": str(tmp_path),
             "FCP_MCP_ALLOWED_ROOTS": str(tmp_path),
+            "FCP_MCP_PROFILE": "full",
         }
     )
     parameters = StdioServerParameters(

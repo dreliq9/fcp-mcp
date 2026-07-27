@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import subprocess
+import sys
 
 from fcp_mcp.server import mcp
 
@@ -104,3 +108,33 @@ def test_catalog_is_exactly_89_annotated_tools():
     assert {tool.name for tool in tools} == EXPECTED_TOOLS
     assert len(tools) == 89
     assert all(tool.annotations is not None for tool in tools)
+
+
+def test_real_no_environment_default_exposes_workflow_safe_catalog():
+    environment = os.environ.copy()
+    environment.pop("FCP_MCP_PROFILE", None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import asyncio, json; from fcp_mcp.server import mcp; "
+                "print(json.dumps({"
+                "'tools': [item.name for item in asyncio.run(mcp.list_tools())], "
+                "'prompts': [item.name for item in asyncio.run(mcp.list_prompts())]"
+                "}))"
+            ),
+        ],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    catalog = json.loads(completed.stdout)
+
+    assert len(catalog["tools"]) == 30
+    assert catalog["tools"][0] == "fcp_doctor"
+    assert catalog["tools"][-1] == "puppet_list_presets"
+    assert "fcpxml_add_marker" not in catalog["tools"]
+    assert "fcp_open_library" not in catalog["tools"]
+    assert catalog["prompts"] == ["qc-check", "youtube-chapters"]
