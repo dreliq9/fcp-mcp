@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import json
-import subprocess
+import ast
 from pathlib import Path
 
 import pytest
 import tomllib
+from ruamel.yaml import YAML
 
 ROOT = Path(__file__).resolve().parents[2]
 FULL_PROFILE_CHECK = "FCP_MCP_PROFILE=full python scripts/check_contracts.py"
@@ -35,25 +35,27 @@ PUBLISH_STEPS = [
 ]
 
 
+def test_workflow_parser_is_declared_dev_only_and_does_not_shell_out():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    assert "ruamel.yaml>=0.18.6,<0.20" in project["project"][
+        "optional-dependencies"
+    ]["dev"]
+
+    module = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    imported_modules = {
+        alias.name
+        for node in ast.walk(module)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "subprocess" not in imported_modules
+
+
 def _load_workflow(relative: str) -> dict[str, object]:
-    rendered = subprocess.run(
-        [
-            "ruby",
-            "-rjson",
-            "-ryaml",
-            "-e",
-            (
-                "puts JSON.generate("
-                "Psych.safe_load(File.read(ARGV.fetch(0)), aliases: true)"
-                ")"
-            ),
-            str(ROOT / relative),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return json.loads(rendered.stdout)
+    parser = YAML(typ="safe", pure=True)
+    workflow = parser.load((ROOT / relative).read_text(encoding="utf-8"))
+    assert isinstance(workflow, dict)
+    return workflow
 
 
 def _assert_isolated_publish_job(publish: dict[str, object]) -> None:
