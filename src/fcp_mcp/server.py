@@ -7,9 +7,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+from collections.abc import Collection
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote as url_unquote
 
 from mcp.server.fastmcp import FastMCP
 
@@ -43,6 +45,8 @@ from .fcpxml.puppet import (
 from .fcpxml.time_utils import RationalTime
 from .fcpxml.validator import FCPXMLValidator
 from .fcpxml.writer import FCPXMLModifier
+from .security.paths import PathPolicy
+from .utils.atomic_write import atomic_replace_bytes
 
 mcp = FastMCP(
     "fcp-mcp",
@@ -53,23 +57,89 @@ mcp = FastMCP(
 )
 
 CONFIG = RuntimeConfig.from_env()
-PROJECTS_DIR = CONFIG.output_dir
+PATHS = PathPolicy(CONFIG)
 
 _parser = FCPXMLParser()
 _validator = FCPXMLValidator()
 
 
-def _resolve_path(path: str) -> Path:
-    """Resolve a path, checking PROJECTS_DIR if not absolute."""
-    p = Path(path)
-    if p.is_absolute():
-        return p
-    return PROJECTS_DIR / p
+def _resolve_input(
+    path: str,
+    *,
+    suffixes: Collection[str] = (),
+    kind: str = "file",
+) -> Path:
+    return PATHS.resolve_input(path, suffixes=suffixes, kind=kind)
+
+
+def _resolve_output(
+    output_path: str,
+    *,
+    input_path: Path | None = None,
+    default_name: str | None = None,
+    suffixes: Collection[str] = (),
+) -> Path:
+    return PATHS.resolve_output(
+        output_path or None,
+        input_path=input_path,
+        default_name=default_name,
+        suffixes=suffixes,
+    )
+
+
+def _save_modifier(modifier: FCPXMLModifier, output_path: str = "") -> Path:
+    destination = _resolve_output(
+        output_path,
+        input_path=modifier.path,
+        suffixes={".fcpxml"},
+    )
+    return modifier.save(destination, event_format=CONFIG.log_format)
+
+
+def _save_generator(
+    generator: FCPXMLGenerator,
+    output_path: str,
+    *,
+    default_name: str,
+) -> Path:
+    destination = _resolve_output(
+        output_path,
+        default_name=default_name,
+        suffixes={".fcpxml"},
+    )
+    return generator.save(destination, event_format=CONFIG.log_format)
+
+
+def _resolve_clip_sources(
+    clips: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    resolved_clips = []
+    for clip in clips:
+        resolved = dict(clip)
+        resolved["src"] = str(_resolve_input(str(clip["src"])))
+        resolved_clips.append(resolved)
+    return resolved_clips
+
+
+def _resolve_rig_images(data: dict[str, Any]) -> dict[str, Any]:
+    resolved = dict(data)
+    resolved_parts = []
+    for part in data.get("parts", []):
+        resolved_part = dict(part)
+        resolved_part["image"] = str(
+            _resolve_input(
+                str(part["image"]),
+                suffixes={".png", ".jpg", ".jpeg", ".tif", ".tiff"},
+            )
+        )
+        resolved_parts.append(resolved_part)
+    resolved["parts"] = resolved_parts
+    return resolved
 
 
 def _parse_doc(path: str) -> FCPXMLDocument:
     """Parse an FCPXML file and return the document."""
-    return _parser.parse(_resolve_path(path))
+    return _parser.parse(_resolve_input(path, suffixes={".fcpxml"}))
 
 
 def _serializable(obj: Any) -> Any:
@@ -138,7 +208,7 @@ def fcpxml_list_clips(path: str, project_name: str = "") -> str:
         project_name: Optional project name filter (uses first project if empty)
     """
     doc = _parse_doc(path)
-    fmt = list(doc.formats.values())[0] if doc.formats else None
+    fmt = next(iter(doc.formats.values())) if doc.formats else None
     fps = fmt.fps if fmt else 29.97
 
     clips_data = []
@@ -173,7 +243,7 @@ def fcpxml_list_markers(path: str) -> str:
         path: Path to .fcpxml file
     """
     doc = _parse_doc(path)
-    fmt = list(doc.formats.values())[0] if doc.formats else None
+    fmt = next(iter(doc.formats.values())) if doc.formats else None
     fps = fmt.fps if fmt else 29.97
 
     markers = []
@@ -257,7 +327,9 @@ def fcpxml_validate(path: str) -> str:
     Args:
         path: Path to .fcpxml file
     """
-    result = _validator.validate_file(_resolve_path(path))
+    result = _validator.validate_file(
+        _resolve_input(path, suffixes={".fcpxml"})
+    )
     return result.summary()
 
 
@@ -325,7 +397,10 @@ def fcpxml_diff(path_a: str, path_b: str) -> str:
         path_a: Path to first .fcpxml file
         path_b: Path to second .fcpxml file
     """
-    results = diff_files(_resolve_path(path_a), _resolve_path(path_b))
+    results = diff_files(
+        _resolve_input(path_a, suffixes={".fcpxml"}),
+        _resolve_input(path_b, suffixes={".fcpxml"}),
+    )
     return "\n\n".join(r.summary() for r in results)
 
 
@@ -354,10 +429,10 @@ def fcpxml_add_marker(
         marker_type: "standard" or "chapter"
         output_path: Output file path (default: adds _modified suffix)
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.add_marker(clip_name, start, value, note, marker_type):
         return f"Clip '{clip_name}' not found"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Marker added. Saved to: {out}"
 
 
@@ -371,9 +446,9 @@ def fcpxml_batch_add_markers(path: str, markers_json: str, output_path: str = ""
         output_path: Output file path (default: adds _modified suffix)
     """
     markers = json.loads(markers_json)
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_add_markers(markers)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count}/{len(markers)} markers added. Saved to: {out}"
 
 
@@ -392,10 +467,10 @@ def fcpxml_add_keyword(
         duration: Duration of keyword range (optional)
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.add_keyword(clip_name, value, start, duration or None):
         return f"Clip '{clip_name}' not found"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Keyword '{value}' added. Saved to: {out}"
 
 
@@ -414,10 +489,10 @@ def fcpxml_trim_clip(
         new_duration: New duration (optional)
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.trim_clip(clip_name, new_start or None, new_duration or None):
         return f"Clip '{clip_name}' not found"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Clip trimmed. Saved to: {out}"
 
 
@@ -431,10 +506,10 @@ def fcpxml_split_clip(path: str, clip_name: str, split_at: str, output_path: str
         split_at: Offset within the clip to split at (FCPXML time)
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.split_clip(clip_name, split_at):
         return f"Could not split clip '{clip_name}' at {split_at}"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Clip split. Saved to: {out}"
 
 
@@ -448,9 +523,9 @@ def fcpxml_delete_clips(path: str, clip_names_json: str, output_path: str = "") 
         output_path: Output file path
     """
     names = json.loads(clip_names_json)
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.delete_clips(names)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count}/{len(names)} clips deleted. Saved to: {out}"
 
 
@@ -464,10 +539,10 @@ def fcpxml_reorder_clips(path: str, clip_names_json: str, output_path: str = "")
         output_path: Output file path
     """
     names = json.loads(clip_names_json)
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.reorder_clips(names):
         return "Could not reorder clips (no spine found)"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Clips reordered. Saved to: {out}"
 
 
@@ -486,10 +561,10 @@ def fcpxml_add_transition(
         name: Transition name
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.add_transition(after_clip_name, duration, name):
         return f"Clip '{after_clip_name}' not found"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Transition added. Saved to: {out}"
 
 
@@ -506,10 +581,10 @@ def fcpxml_change_speed(
         speed_factor: Speed multiplier (2.0 = 2x fast, 0.5 = half speed)
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.change_speed(clip_name, speed_factor):
         return f"Could not change speed of '{clip_name}'"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Speed changed to {speed_factor}x. Saved to: {out}"
 
 
@@ -525,10 +600,10 @@ def fcpxml_assign_role(
         role: Role name
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     if not mod.assign_role(clip_name, role):
         return f"Clip '{clip_name}' not found"
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Role '{role}' assigned. Saved to: {out}"
 
 
@@ -550,7 +625,7 @@ def fcpxml_add_title(
         output_path: Output file path
     """
     # For titles we need to generate a title element referencing Basic Title
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
 
     # Find or create a title effect resource
     title_ref = ""
@@ -604,7 +679,7 @@ def fcpxml_add_title(
     # Recalculate offsets
     mod._recalculate_offsets(spine)
 
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Title '{text}' added. Saved to: {out}"
 
 
@@ -629,8 +704,8 @@ def fcpxml_add_audio(
     """
     import xml.etree.ElementTree as ET
 
-    mod = FCPXMLModifier(_resolve_path(path))
-    audio_path = Path(audio_src).resolve()
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    audio_path = _resolve_input(audio_src)
 
     if not name:
         name = audio_path.stem
@@ -664,7 +739,7 @@ def fcpxml_add_audio(
         spine.append(clip)
 
     mod._recalculate_offsets(spine)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Audio '{name}' added. Saved to: {out}"
 
 
@@ -698,9 +773,11 @@ def fcpxml_create_project(
                               frame_duration=frame_duration)
     gen.create_project(name=name, format_ref=fmt_ref, event_name=event_name)
 
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{name}.fcpxml",
+    )
     return f"Project created: {out}"
 
 
@@ -721,13 +798,15 @@ def fcpxml_create_timeline(
         event_name: Event name
         output_path: Where to save
     """
-    clips = json.loads(clips_json)
+    clips = _resolve_clip_sources(json.loads(clips_json))
     gen = FCPXMLGenerator()
     gen.build_timeline_from_clips(clips, project_name=project_name,
                                    format_name=format_name, event_name=event_name)
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{project_name}.fcpxml",
+    )
     return f"Timeline created with {len(clips)} clips: {out}"
 
 
@@ -750,7 +829,7 @@ def fcpxml_auto_rough_cut(
         project_name: Project name
         output_path: Where to save
     """
-    clips = json.loads(clips_json)
+    clips = _resolve_clip_sources(json.loads(clips_json))
     gen = FCPXMLGenerator()
     fmt_ref = gen.add_format()
 
@@ -796,9 +875,11 @@ def fcpxml_auto_rough_cut(
 
         running_total = running_total + clip_dur
 
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{project_name}.fcpxml",
+    )
     return f"Rough cut created ({running_total.to_seconds():.1f}s): {out}"
 
 
@@ -819,7 +900,7 @@ def fcpxml_generate_montage(
         project_name: Project name
         output_path: Where to save
     """
-    clips = json.loads(clips_json)
+    clips = _resolve_clip_sources(json.loads(clips_json))
     gen = FCPXMLGenerator()
     fmt_ref = gen.add_format()
     trans_ref = gen.add_effect("Cross Dissolve")
@@ -843,9 +924,11 @@ def fcpxml_generate_montage(
             gen.add_transition(spine, duration=transition_duration,
                                 effect_ref=trans_ref)
 
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{project_name}.fcpxml",
+    )
     return f"Montage created ({len(clips)} shots): {out}"
 
 
@@ -864,10 +947,7 @@ def fcpxml_import_srt(
     """
     import re
 
-    srt_file = Path(srt_path)
-    if not srt_file.exists():
-        return f"SRT file not found: {srt_path}"
-
+    srt_file = _resolve_input(srt_path, suffixes={".srt"})
     content = srt_file.read_text(encoding="utf-8")
 
     # Parse SRT
@@ -890,7 +970,7 @@ def fcpxml_import_srt(
     if not subtitles:
         return "No subtitles found in SRT file"
 
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     import xml.etree.ElementTree as ET
 
     # Find or create title effect
@@ -934,7 +1014,7 @@ def fcpxml_import_srt(
         param.set("key", "Text")
         param.set("value", sub["text"])
 
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{len(subtitles)} subtitles added. Saved to: {out}"
 
 
@@ -953,10 +1033,12 @@ def fcpxml_import_edl(
         project_name: Project name
         output_path: Where to save
     """
-    edl_file = Path(edl_path)
-    if not edl_file.exists():
-        return f"EDL file not found: {edl_path}"
-
+    edl_file = _resolve_input(edl_path, suffixes={".edl"})
+    media_path = (
+        _resolve_input(media_dir, kind="dir")
+        if media_dir
+        else None
+    )
     lines = edl_file.read_text().splitlines()
     gen = FCPXMLGenerator()
     fmt_ref = gen.add_format()
@@ -969,8 +1051,7 @@ def fcpxml_import_edl(
             reel = parts[1]
             # Try to find media file
             src = ""
-            if media_dir:
-                media_path = Path(media_dir)
+            if media_path is not None:
                 for ext in (".mov", ".mp4", ".mxf", ".avi"):
                     candidate = media_path / f"{reel}{ext}"
                     if candidate.exists():
@@ -991,9 +1072,11 @@ def fcpxml_import_edl(
                                    duration=duration)
             clip_count += 1
 
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{project_name}.fcpxml",
+    )
     return f"EDL imported ({clip_count} clips): {out}"
 
 
@@ -1015,7 +1098,7 @@ def fcpxml_reformat(
         output_path: Output file path
     """
 
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
 
     # Update format
     for fmt_el in mod.root.iter("format"):
@@ -1024,7 +1107,7 @@ def fcpxml_reformat(
         fmt_el.set("name", target_format_name)
         break
 
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Reformatted to {target_width}x{target_height}. Saved to: {out}"
 
 
@@ -1047,9 +1130,9 @@ def fcpxml_fix_flash_frames(
         frame_duration: Frame duration for calculating frame count
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.fix_flash_frames(min_frames, frame_duration)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count} flash frames fixed. Saved to: {out}"
 
 
@@ -1068,9 +1151,9 @@ def fcpxml_fill_gaps(
         fill_name: Name for the fill clips
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.fill_gaps(fill_asset_ref, fill_name)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count} gaps filled. Saved to: {out}"
 
 
@@ -1087,7 +1170,7 @@ def fcpxml_remove_silence(
         silence_threshold_seconds: Minimum gap duration to remove (seconds)
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = 0
     for spine_el in mod.root.iter("spine"):
         for gap_el in list(spine_el.findall("gap")):
@@ -1097,7 +1180,7 @@ def fcpxml_remove_silence(
                 count += 1
         if count > 0:
             mod._recalculate_offsets(spine_el)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count} gaps removed. Saved to: {out}"
 
 
@@ -1113,9 +1196,9 @@ def fcpxml_batch_rename_clips(
         replacement: Text to replace with
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_rename_clips(pattern, replacement)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count} clips renamed. Saved to: {out}"
 
 
@@ -1131,9 +1214,9 @@ def fcpxml_batch_assign_roles(
         output_path: Output file path
     """
     rules = json.loads(rules_json)
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_assign_roles(rules)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count} roles assigned. Saved to: {out}"
 
 
@@ -1152,9 +1235,9 @@ def fcpxml_batch_apply_transition(
         name: Transition name
         output_path: Output file path
     """
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.batch_apply_transition(duration, name)
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"{count} transitions added. Saved to: {out}"
 
 
@@ -1236,6 +1319,9 @@ def fcpxml_check_media_links(path: str) -> str:
         path: Path to .fcpxml file
     """
     doc = _parse_doc(path)
+    for asset in doc.assets.values():
+        if asset.src.startswith("file://"):
+            PATHS.resolve_reference(url_unquote(asset.src[7:]))
     result = _validator.check_media_links(doc)
     if not result.issues:
         return "All media files found."
@@ -1427,7 +1513,11 @@ def fcpxml_list_templates(templates_dir: str = "") -> str:
     Args:
         templates_dir: Directory to search (default: FCP_PROJECTS_DIR)
     """
-    search_dir = Path(templates_dir) if templates_dir else PROJECTS_DIR
+    search_dir = (
+        _resolve_input(templates_dir, kind="dir")
+        if templates_dir
+        else CONFIG.output_dir
+    )
     templates = []
     for f in search_dir.rglob("*.fcpxml"):
         if "template" in f.stem.lower() or "preset" in f.stem.lower():
@@ -1453,14 +1543,14 @@ def fcpxml_apply_template(
         output_path: Where to save
     """
     clips = json.loads(clips_json)
-    mod = FCPXMLModifier(_resolve_path(template_path))
+    mod = FCPXMLModifier(_resolve_input(template_path, suffixes={".fcpxml"}))
 
     # Update project name
     for project_el in mod.root.iter("project"):
         project_el.set("name", project_name)
         break
 
-    out = mod.save(output_path if output_path else None)
+    out = _save_modifier(mod, output_path)
     return f"Template applied. Saved to: {out}"
 
 
@@ -1477,12 +1567,19 @@ def fcpxml_save_template(
         template_name: Name for the template
         output_dir: Directory to save template (default: FCP_PROJECTS_DIR)
     """
-    import shutil
-
-    src = _resolve_path(path)
-    dest_dir = Path(output_dir) if output_dir else PROJECTS_DIR
-    dest = dest_dir / f"template_{template_name}.fcpxml"
-    shutil.copy2(src, dest)
+    src = _resolve_input(path, suffixes={".fcpxml"})
+    filename = f"template_{template_name}.fcpxml"
+    requested = str(Path(output_dir) / filename) if output_dir else filename
+    dest = _resolve_output(
+        requested,
+        input_path=src,
+        suffixes={".fcpxml"},
+    )
+    atomic_replace_bytes(
+        dest,
+        src.read_bytes(),
+        event_format=CONFIG.log_format,
+    )
     return f"Template saved: {dest}"
 
 
@@ -1571,9 +1668,11 @@ def fcp_open_library(library_path: str) -> str:
         library_path: Path to .fcpbundle file
     """
     automation.require_live_control(CONFIG)
-    path = Path(library_path).expanduser().resolve()
-    if not path.exists():
-        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"Library not found: {path}")
+    path = _resolve_input(
+        library_path,
+        kind="dir",
+        suffixes={".fcpbundle"},
+    )
     try:
         subprocess.run(["open", str(path)], check=True, timeout=10)
         return f"Opening library: {path}"
@@ -1597,9 +1696,7 @@ def fcp_import_xml(fcpxml_path: str) -> str:
         fcpxml_path: Path to .fcpxml file
     """
     automation.require_live_control(CONFIG)
-    path = Path(fcpxml_path).expanduser().resolve()
-    if not path.exists():
-        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"FCPXML file not found: {path}")
+    path = _resolve_input(fcpxml_path, suffixes={".fcpxml"})
     try:
         subprocess.run(["open", "-a", "Final Cut Pro", str(path)], check=True, timeout=10)
         return f"Importing FCPXML: {path}"
@@ -1787,8 +1884,8 @@ def compressor_encode(
         output_dir: Output directory
         batch_name: Batch name for Compressor
     """
-    from .utils.paths import compressor_binary
     from .media.ffprobe import _run_checked
+    from .utils.paths import compressor_binary
 
     automation.require_live_control(CONFIG)
     comp = compressor_binary()
@@ -1798,23 +1895,16 @@ def compressor_encode(
             f"Compressor not found at {comp}",
         )
 
-    source = Path(input_path).expanduser().resolve()
-    if not source.is_file():
-        raise FCPMCPError(
-            ErrorCode.SOURCE_NOT_FOUND,
-            f"Compressor input not found: {source}",
-        )
+    source = _resolve_input(input_path)
     cmd = [str(comp), "-batchName", batch_name, "-jobpath", str(source)]
     if setting_path:
-        setting = Path(setting_path).expanduser().resolve()
-        if not setting.is_file():
-            raise FCPMCPError(
-                ErrorCode.SOURCE_NOT_FOUND,
-                f"Compressor setting not found: {setting}",
-            )
+        setting = _resolve_input(setting_path, suffixes={".cmprstng"})
         cmd.extend(["-settingpath", str(setting)])
     if output_dir:
-        destination = Path(output_dir).expanduser().resolve()
+        destination = _resolve_output(
+            output_dir,
+            input_path=source,
+        )
         if not destination.is_dir():
             raise FCPMCPError(
                 ErrorCode.INVALID_PATH,
@@ -1829,7 +1919,7 @@ def compressor_encode(
 @mcp.tool()
 def compressor_list_settings() -> str:
     """List available Compressor encoding presets."""
-    from .utils.paths import compressor_settings_dir, compressor_binary
+    from .utils.paths import compressor_binary, compressor_settings_dir
 
     # Built-in settings from Compressor
     settings_dir = compressor_settings_dir()
@@ -1860,7 +1950,7 @@ def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
         output_path: Output file path
     """
 
-    mod = FCPXMLModifier(_resolve_path(path))
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     # Downgrade version for Resolve compatibility
     mod.root.set("version", "1.9")
 
@@ -1872,9 +1962,10 @@ def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
                 pass
 
     if not output_path:
-        stem = Path(path).stem
-        output_path = str(_resolve_path(path).parent / f"{stem}_resolve.fcpxml")
-    out = mod.save(output_path)
+        output_path = str(
+            mod.path.parent / f"{mod.path.stem}_resolve.fcpxml"
+        )
+    out = _save_modifier(mod, output_path)
     return f"Resolve-compatible FCPXML saved: {out}"
 
 
@@ -1888,7 +1979,8 @@ def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
     """
     import xml.etree.ElementTree as ET
 
-    doc = _parse_doc(path)
+    source = _resolve_input(path, suffixes={".fcpxml"})
+    doc = _parser.parse(source)
 
     # Build FCP7 XMEML
     xmeml = ET.Element("xmeml")
@@ -1949,14 +2041,23 @@ def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
                 pathurl = ET.SubElement(file_el, "pathurl")
                 pathurl.text = asset.src
 
-    if not output_path:
-        stem = Path(path).stem
-        output_path = str(_resolve_path(path).parent / f"{stem}_fcp7.xml")
-
-    tree = ET.ElementTree(xmeml)
+    destination = _resolve_output(
+        output_path or str(source.parent / f"{source.stem}_fcp7.xml"),
+        input_path=source,
+        suffixes={".xml"},
+    )
     ET.indent(xmeml, space="    ")
-    tree.write(output_path, encoding="unicode", xml_declaration=True)
-    return f"FCP7 XML saved: {output_path}"
+    xml_text = ET.tostring(
+        xmeml,
+        encoding="unicode",
+        xml_declaration=True,
+    )
+    atomic_replace_bytes(
+        destination,
+        f"{xml_text}\n".encode(),
+        event_format=CONFIG.log_format,
+    )
+    return f"FCP7 XML saved: {destination}"
 
 
 @mcp.tool()
@@ -1967,8 +2068,9 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
         path: Path to .fcpxml file
         output_path: Output .edl file path
     """
-    doc = _parse_doc(path)
-    fmt = list(doc.formats.values())[0] if doc.formats else None
+    source = _resolve_input(path, suffixes={".fcpxml"})
+    doc = _parser.parse(source)
+    fmt = next(iter(doc.formats.values())) if doc.formats else None
     fps = fmt.fps if fmt else 29.97
 
     lines = ["TITLE: " + (doc.all_projects[0].name if doc.all_projects else "Untitled")]
@@ -1998,12 +2100,17 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
 
     edl_content = "\n".join(lines)
 
-    if not output_path:
-        stem = Path(path).stem
-        output_path = str(_resolve_path(path).parent / f"{stem}.edl")
-
-    Path(output_path).write_text(edl_content)
-    return f"EDL exported ({edit_num - 1} edits): {output_path}"
+    destination = _resolve_output(
+        output_path or str(source.parent / f"{source.stem}.edl"),
+        input_path=source,
+        suffixes={".edl"},
+    )
+    atomic_replace_bytes(
+        destination,
+        edl_content.encode(),
+        event_format=CONFIG.log_format,
+    )
+    return f"EDL exported ({edit_num - 1} edits): {destination}"
 
 
 # ============================================================================
@@ -2019,7 +2126,8 @@ def media_info(path: str) -> str:
     """
     from .media.ffprobe import probe_file
 
-    info = probe_file(path)
+    source = _resolve_input(path)
+    info = probe_file(str(source))
     # Simplify for readability
     fmt = info.get("format", {})
     streams = info.get("streams", [])
@@ -2068,7 +2176,12 @@ def media_detect_silence(
     """
     from .media.ffprobe import detect_silence
 
-    silences = detect_silence(path, noise_threshold, min_duration)
+    source = _resolve_input(path)
+    silences = detect_silence(
+        str(source),
+        noise_threshold,
+        min_duration,
+    )
     if not silences:
         return "No silent sections detected."
     return json.dumps(silences, indent=2)
@@ -2085,7 +2198,8 @@ def media_detect_beats(path: str) -> str:
     """
     from .media.ffprobe import detect_beats
 
-    beats = detect_beats(path)
+    source = _resolve_input(path)
+    beats = detect_beats(str(source))
     return json.dumps({"beat_count": len(beats), "beats": beats}, indent=2)
 
 
@@ -2100,7 +2214,8 @@ def media_loudness(path: str) -> str:
     """
     from .media.ffprobe import analyze_loudness
 
-    result = analyze_loudness(path)
+    source = _resolve_input(path)
+    result = analyze_loudness(str(source))
     if not result:
         raise FCPMCPError(
             ErrorCode.OUTPUT_MISSING,
@@ -2126,7 +2241,19 @@ def media_extract_thumbnail(
     """
     from .media.ffprobe import extract_thumbnail
 
-    out = extract_thumbnail(path, time, output_path or None, width)
+    source = _resolve_input(path)
+    destination = _resolve_output(
+        output_path
+        or str(source.parent / f"{source.stem}_thumb_{time:.0f}s.jpg"),
+        input_path=source,
+        suffixes={".jpg", ".jpeg", ".png"},
+    )
+    out = extract_thumbnail(
+        str(source),
+        time,
+        str(destination),
+        width,
+    )
     return f"Thumbnail saved: {out}"
 
 
@@ -2147,7 +2274,17 @@ def media_extract_thumbnails(
     """
     from .media.ffprobe import extract_thumbnails
 
-    thumbs = extract_thumbnails(path, interval, output_dir or None, width)
+    source = _resolve_input(path)
+    destination = _resolve_output(
+        output_dir or str(source.parent / f"{source.stem}_thumbs"),
+        input_path=source,
+    )
+    thumbs = extract_thumbnails(
+        str(source),
+        interval,
+        str(destination),
+        width,
+    )
     return json.dumps({"count": len(thumbs), "thumbnails": thumbs}, indent=2)
 
 
@@ -2160,7 +2297,8 @@ def media_list_streams(path: str) -> str:
     """
     from .media.ffprobe import get_streams
 
-    streams = get_streams(path)
+    source = _resolve_input(path)
+    streams = get_streams(str(source))
     result = []
     for index, stream in enumerate(streams):
         result.append({
@@ -2185,7 +2323,8 @@ def media_scene_detect(path: str, threshold: float = 0.3) -> str:
     """
     from .media.ffprobe import detect_scenes
 
-    scenes = detect_scenes(path, threshold)
+    source = _resolve_input(path)
+    scenes = detect_scenes(str(source), threshold)
     return json.dumps({"scene_count": len(scenes), "scenes": scenes}, indent=2)
 
 
@@ -2207,24 +2346,18 @@ def media_extract_audio(
     """
     from .media.ffprobe import _find_ffmpeg, _run_checked
 
-    source = _resolve_path(path).expanduser().resolve()
-    if not source.is_file():
-        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"Media file not found: {source}")
+    source = _resolve_input(path)
     if format not in {"wav", "mp3", "flac"}:
         raise FCPMCPError(
             ErrorCode.INVALID_ARGUMENTS,
             f"Unsupported audio format: {format}",
         )
 
-    if not output_path:
-        output = source.with_suffix(f".{format}")
-    else:
-        output = Path(output_path).expanduser().resolve()
-    if output == source:
-        raise FCPMCPError(
-            ErrorCode.SAME_FILE_FORBIDDEN,
-            "Input and output must be different files",
-        )
+    output = _resolve_output(
+        output_path or str(source.with_suffix(f".{format}")),
+        input_path=source,
+        suffixes={f".{format}"},
+    )
 
     cmd = [_find_ffmpeg(), "-y", "-i", str(source), "-vn"]
     if format == "wav":
@@ -2268,15 +2401,17 @@ def media_audio_to_midi(
     """
     from .media.ffprobe import _find_ffmpeg, _run_checked
 
-    source = _resolve_path(path).expanduser().resolve()
-    if not source.is_file():
-        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"Media file not found: {source}")
+    source = _resolve_input(path)
     inference_source = source
 
     # If video, extract audio first
     video_exts = {'.mp4', '.mov', '.avi', '.mkv', '.webm'}
     if source.suffix.lower() in video_exts:
-        wav_path = source.with_suffix('.wav')
+        wav_path = _resolve_output(
+            str(source.with_suffix(".wav")),
+            input_path=source,
+            suffixes={".wav"},
+        )
         _run_checked(
             [
                 _find_ffmpeg(),
@@ -2294,17 +2429,18 @@ def media_audio_to_midi(
         inference_source = wav_path
 
     try:
-        from basic_pitch.inference import predict
         from basic_pitch import ICASSP_2022_MODEL_PATH
+        from basic_pitch.inference import predict
 
         _model_output, midi_data, note_events = predict(
             str(inference_source), model_or_model_path=ICASSP_2022_MODEL_PATH,
         )
 
-        if not output_path:
-            output = inference_source.with_suffix('.mid')
-        else:
-            output = Path(output_path).expanduser().resolve()
+        output = _resolve_output(
+            output_path or str(inference_source.with_suffix(".mid")),
+            input_path=source,
+            suffixes={".mid", ".midi"},
+        )
 
         midi_data.write(str(output))
         if not output.is_file() or output.stat().st_size == 0:
@@ -2383,7 +2519,7 @@ def puppet_create_rig(
     Returns:
         JSON summary of the rig (use this to verify before building a scene).
     """
-    data = json.loads(rig_json)
+    data = _resolve_rig_images(json.loads(rig_json))
     rig = rig_from_json(data)
     return json.dumps({
         "name": rig.name,
@@ -2426,7 +2562,13 @@ def puppet_create_humanoid_rig(
         position_y: Y position on screen (0 = center)
         scale: Overall scale multiplier
     """
-    rig = standard_humanoid_rig(name, image_dir, position=(position_x, position_y), scale=scale)
+    resolved_image_dir = _resolve_input(image_dir, kind="dir")
+    rig = standard_humanoid_rig(
+        name,
+        str(resolved_image_dir),
+        position=(position_x, position_y),
+        scale=scale,
+    )
     if not rig.parts:
         return f"No part images found in {image_dir}. Expected: head.png, body.png, left_arm.png, right_arm.png, left_leg.png, right_leg.png"
     found = [p.name for p in rig.parts]
@@ -2463,6 +2605,7 @@ def puppet_build_scene(
     rigs_data = json.loads(rigs_json)
     if isinstance(rigs_data, dict):
         rigs_data = [rigs_data]  # Single rig passed as object
+    rigs_data = [_resolve_rig_images(data) for data in rigs_data]
 
     builder = PuppetSceneBuilder(duration=duration)
 
@@ -2472,9 +2615,11 @@ def puppet_build_scene(
 
     gen = builder.build(project_name=project_name)
 
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{project_name}.fcpxml",
+    )
 
     total_parts = sum(len(rig_from_json(rd).parts) for rd in rigs_data)
     return json.dumps({
@@ -2528,6 +2673,7 @@ def puppet_animate(
     rigs_data = json.loads(rigs_json)
     if isinstance(rigs_data, dict):
         rigs_data = [rigs_data]
+    rigs_data = [_resolve_rig_images(data) for data in rigs_data]
     anims_data = json.loads(animations_json)
 
     builder = PuppetSceneBuilder(duration=duration)
@@ -2556,9 +2702,11 @@ def puppet_animate(
 
     gen = builder.build(project_name=project_name)
 
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{project_name}.fcpxml",
+    )
 
     return json.dumps({
         "file": str(out),
@@ -2597,7 +2745,7 @@ def puppet_preset_motion(
         cycles: Number of motion cycles (more = faster movement)
         intensity: Scale factor for motion amplitude (0.5 = subtle, 2.0 = exaggerated)
     """
-    rig_data = json.loads(rig_json)
+    rig_data = _resolve_rig_images(json.loads(rig_json))
     rig = rig_from_json(rig_data)
 
     builder = PuppetSceneBuilder(duration=duration)
@@ -2632,9 +2780,11 @@ def puppet_preset_motion(
 
     gen = builder.build(project_name=project_name)
 
-    if not output_path:
-        output_path = str(PROJECTS_DIR / f"{project_name}.fcpxml")
-    out = gen.save(output_path)
+    out = _save_generator(
+        gen,
+        output_path,
+        default_name=f"{project_name}.fcpxml",
+    )
 
     return json.dumps({
         "file": str(out),
@@ -2671,9 +2821,15 @@ def puppet_multi_scene(
     rigs_data = json.loads(rigs_json)
     if isinstance(rigs_data, dict):
         rigs_data = [rigs_data]
+    rigs_data = [_resolve_rig_images(data) for data in rigs_data]
     scenes_data = json.loads(scenes_json)
 
-    out_dir = Path(output_path) if output_path else PROJECTS_DIR
+    out_dir = _resolve_output(output_path or str(CONFIG.output_dir))
+    if not out_dir.is_dir():
+        raise FCPMCPError(
+            ErrorCode.INVALID_PATH,
+            f"Expected an existing output directory: {out_dir}",
+        )
     results = []
 
     for i, scene in enumerate(scenes_data):
@@ -2710,7 +2866,11 @@ def puppet_multi_scene(
 
         full_name = f"{project_name}_{scene_name}"
         gen = builder.build(project_name=full_name)
-        out = gen.save(out_dir / f"{full_name}.fcpxml")
+        out = _save_generator(
+            gen,
+            str(out_dir / f"{full_name}.fcpxml"),
+            default_name=f"{full_name}.fcpxml",
+        )
         results.append({"scene": scene_name, "file": str(out), "preset": scene_preset})
 
     return json.dumps({

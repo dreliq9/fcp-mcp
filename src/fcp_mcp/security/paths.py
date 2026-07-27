@@ -22,15 +22,7 @@ class PathPolicy:
         kind: str = "file",
         suffixes: Collection[str] = (),
     ) -> Path:
-        candidate = Path(raw).expanduser()
-        if not candidate.is_absolute():
-            candidate = self.config.output_dir / candidate
-        resolved = candidate.resolve()
-        if not self._contained(resolved, self.config.allowed_roots):
-            raise FCPMCPError(
-                ErrorCode.PATH_OUTSIDE_SCOPE,
-                f"Input path is outside FCP_MCP_ALLOWED_ROOTS: {resolved}",
-            )
+        resolved = self.resolve_reference(raw, suffixes=suffixes)
         if not resolved.exists():
             raise FCPMCPError(
                 ErrorCode.SOURCE_NOT_FOUND,
@@ -40,6 +32,24 @@ class PathPolicy:
             raise FCPMCPError(ErrorCode.INVALID_PATH, f"Expected a file: {resolved}")
         if kind == "dir" and not resolved.is_dir():
             raise FCPMCPError(ErrorCode.INVALID_PATH, f"Expected a directory: {resolved}")
+        return resolved
+
+    def resolve_reference(
+        self,
+        raw: str,
+        *,
+        suffixes: Collection[str] = (),
+    ) -> Path:
+        """Resolve a scoped reference that may be missing for link diagnostics."""
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.config.output_dir / candidate
+        resolved = candidate.resolve()
+        if not self._contained(resolved, self.config.allowed_roots):
+            raise FCPMCPError(
+                ErrorCode.PATH_OUTSIDE_SCOPE,
+                f"Input path is outside FCP_MCP_ALLOWED_ROOTS: {resolved}",
+            )
         if suffixes and resolved.suffix.lower() not in {suffix.lower() for suffix in suffixes}:
             raise FCPMCPError(
                 ErrorCode.INVALID_PATH,
