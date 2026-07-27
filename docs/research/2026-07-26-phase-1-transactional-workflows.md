@@ -131,6 +131,14 @@ Two isolated SDK probes were also run without changing project dependencies:
 
 ## Findings
 
+### Frozen v0.2.1 public contract
+
+`tests/contracts/v0_2_1_catalog.json` is the checked-in v0.2.1 baseline for
+the 89-tool, five-prompt catalog. It captures each tool's name, input schema,
+legacy output schema, and annotations. Regenerate it only intentionally with
+`scripts/snapshot_tool_contracts.py`; the contract test compares current tool
+names, input schemas, annotations, and prompt names against this baseline.
+
 ### 1. The correct graph is bounded and code-defined
 
 FCPXML modification has a known critical path:
