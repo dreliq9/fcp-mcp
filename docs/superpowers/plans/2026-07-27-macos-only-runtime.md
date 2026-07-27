@@ -150,7 +150,7 @@ Read and record the binding implications of:
 Write the result to:
 
 ```text
-.superpowers/sdd/2026-07-26-v0.3.0-transactional-workflows/
+.superpowers/sdd/2026-07-27-macos-only-runtime/
 task-macos-1-platform-boundary-brief.md
 ```
 
@@ -362,7 +362,7 @@ Record the current requirements from:
 Write:
 
 ```text
-.superpowers/sdd/2026-07-26-v0.3.0-transactional-workflows/
+.superpowers/sdd/2026-07-27-macos-only-runtime/
 task-macos-2-distribution-brief.md
 ```
 
@@ -512,7 +512,7 @@ Online Backup, and `SQLITE_FCNTL_HAS_MOVED`. Record which prior findings remain
 binding after Windows removal in:
 
 ```text
-.superpowers/sdd/2026-07-26-v0.3.0-transactional-workflows/
+.superpowers/sdd/2026-07-27-macos-only-runtime/
 task-macos-3-ledger-brief.md
 ```
 
@@ -747,7 +747,7 @@ Review Apple's Application Support guidance, Python 3.10 `os.open`/`dir_fd`,
 `fcntl.flock`, and the existing Task 13 adversarial report. Write:
 
 ```text
-.superpowers/sdd/2026-07-26-v0.3.0-transactional-workflows/
+.superpowers/sdd/2026-07-27-macos-only-runtime/
 task-macos-4-artifact-brief.md
 ```
 
@@ -866,7 +866,7 @@ Recheck the installed wheel metadata, current GitHub workflow syntax, and all
 active support surfaces after Tasks 1-4. Write:
 
 ```text
-.superpowers/sdd/2026-07-26-v0.3.0-transactional-workflows/
+.superpowers/sdd/2026-07-27-macos-only-runtime/
 task-macos-5-architecture-gate-brief.md
 ```
 
