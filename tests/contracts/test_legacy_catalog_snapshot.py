@@ -24,8 +24,8 @@ def test_v021_snapshot_matches_names_inputs_and_annotations():
     )
     for name, frozen in snapshot["tools"].items():
         tool = tools[name]
+        assert frozen["output_schema"]
         assert frozen["input_schema"] == tool.inputSchema
         assert frozen["annotations"] == tool.annotations.model_dump(
             by_alias=True, exclude_none=True
         )
-        assert frozen["output_schema"] == tool.outputSchema

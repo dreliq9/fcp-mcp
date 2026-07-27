@@ -47,6 +47,31 @@ from .fcpxml.writer import FCPXMLModifier
 from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
 from .profiles import Profile, ToolClass
 from .registry import PromptRegistry, ToolRegistry
+from .result_models.common import ToolOutcome
+from .result_models.fcpxml import (
+    AppliedEffectRecord,
+    ClipListResult,
+    ClipRecord,
+    DiffChangeRecord,
+    DiffCountsRecord,
+    DuplicateDetectionResult,
+    EffectInventoryResult,
+    EffectParameterRecord,
+    FCPXMLDiffResult,
+    FCPXMLSummaryResult,
+    FCPXMLValidationResult,
+    FlashFrameDetectionResult,
+    GapDetectionResult,
+    KeywordRecord,
+    MarkerListResult,
+    MarkerRecord,
+    PacingAnalysisResult,
+    PacingHistogram,
+    PacingRecord,
+    ProjectDiffRecord,
+    RoleListResult,
+    TimelineStatsResult,
+)
 from .security.paths import PathPolicy
 from .tool_metadata import (
     DIAGNOSTIC,
@@ -309,8 +334,12 @@ async def fcp_doctor() -> DoctorReport:
 # Category 2: FCPXML Analysis (12 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_parse(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=FCPXMLSummaryResult,
+)
+def fcpxml_parse(path: str) -> ToolOutcome[FCPXMLSummaryResult]:
     """Parse an FCPXML file and return a structure summary.
 
     Args:
@@ -333,11 +362,21 @@ def fcpxml_parse(path: str) -> str:
             for p in projects
         ],
     }
-    return json.dumps(summary, indent=2)
+    return ToolOutcome(
+        text=json.dumps(summary, indent=2),
+        structured=FCPXMLSummaryResult.model_validate(summary),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_list_clips(path: str, project_name: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=ClipListResult,
+)
+def fcpxml_list_clips(
+    path: str,
+    project_name: str = "",
+) -> ToolOutcome[ClipListResult]:
     """List all clips in the timeline with timecodes, durations, and roles.
 
     Args:
@@ -349,31 +388,57 @@ def fcpxml_list_clips(path: str, project_name: str = "") -> str:
     fps = fmt.fps if fmt else 29.97
 
     clips_data = []
+    clip_records = []
     for project in doc.all_projects:
         if project_name and project.name != project_name:
             continue
         if not project.sequence or not project.sequence.spine:
             continue
         for i, clip in enumerate(project.sequence.spine.clips):
-            clips_data.append({
-                "index": i,
-                "name": clip.name,
-                "type": clip.clip_type.value,
-                "offset": clip.offset.to_timecode(fps),
-                "offset_raw": clip.offset.to_fcpxml(),
-                "start": clip.start.to_fcpxml(),
-                "duration": f"{clip.duration.to_seconds():.3f}s",
-                "duration_raw": clip.duration.to_fcpxml(),
-                "role": clip.role,
-                "ref": clip.ref,
-                "connected_clips": len(clip.connected_clips),
-                "markers": len(clip.markers),
-            })
-    return json.dumps(clips_data, indent=2)
+            clips_data.append(
+                {
+                    "index": i,
+                    "name": clip.name,
+                    "type": clip.clip_type.value,
+                    "offset": clip.offset.to_timecode(fps),
+                    "offset_raw": clip.offset.to_fcpxml(),
+                    "start": clip.start.to_fcpxml(),
+                    "duration": f"{clip.duration.to_seconds():.3f}s",
+                    "duration_raw": clip.duration.to_fcpxml(),
+                    "role": clip.role,
+                    "ref": clip.ref,
+                    "connected_clips": len(clip.connected_clips),
+                    "markers": len(clip.markers),
+                }
+            )
+            clip_records.append(
+                ClipRecord(
+                    index=i,
+                    name=clip.name,
+                    clip_type=clip.clip_type.value,
+                    offset=clip.offset.to_timecode(fps),
+                    offset_raw=clip.offset.to_fcpxml(),
+                    start=clip.start.to_fcpxml(),
+                    duration_seconds=clip.duration.to_seconds(),
+                    duration_raw=clip.duration.to_fcpxml(),
+                    role=clip.role,
+                    ref=clip.ref,
+                    connected_clip_count=len(clip.connected_clips),
+                    marker_count=len(clip.markers),
+                )
+            )
+    return ToolOutcome(
+        text=json.dumps(clips_data, indent=2),
+        structured=ClipListResult(clips=clip_records),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_list_markers(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=MarkerListResult,
+)
+def fcpxml_list_markers(path: str) -> ToolOutcome[MarkerListResult]:
     """List all markers, chapter markers, and keywords across all clips.
 
     Args:
@@ -384,32 +449,66 @@ def fcpxml_list_markers(path: str) -> str:
     fps = fmt.fps if fmt else 29.97
 
     markers = []
+    marker_records = []
+    keyword_records = []
     for project in doc.all_projects:
         if not project.sequence or not project.sequence.spine:
             continue
         for clip in project.sequence.spine.clips:
             for m in clip.markers:
-                markers.append({
-                    "clip": clip.name,
-                    "type": m.marker_type.value,
-                    "value": m.value,
-                    "note": m.note,
-                    "start": m.start.to_timecode(fps),
-                    "start_raw": m.start.to_fcpxml(),
-                })
+                markers.append(
+                    {
+                        "clip": clip.name,
+                        "type": m.marker_type.value,
+                        "value": m.value,
+                        "note": m.note,
+                        "start": m.start.to_timecode(fps),
+                        "start_raw": m.start.to_fcpxml(),
+                    }
+                )
+                marker_records.append(
+                    MarkerRecord(
+                        clip=clip.name,
+                        marker_type=m.marker_type.value,
+                        value=m.value,
+                        note=m.note,
+                        start_timecode=m.start.to_timecode(fps),
+                        start_raw=m.start.to_fcpxml(),
+                    )
+                )
             for kw in clip.keywords:
-                markers.append({
-                    "clip": clip.name,
-                    "type": "keyword",
-                    "value": kw.value,
-                    "start": kw.start.to_fcpxml(),
-                    "duration": kw.duration.to_fcpxml(),
-                })
-    return json.dumps(markers, indent=2)
+                markers.append(
+                    {
+                        "clip": clip.name,
+                        "type": "keyword",
+                        "value": kw.value,
+                        "start": kw.start.to_fcpxml(),
+                        "duration": kw.duration.to_fcpxml(),
+                    }
+                )
+                keyword_records.append(
+                    KeywordRecord(
+                        clip=clip.name,
+                        value=kw.value,
+                        start_raw=kw.start.to_fcpxml(),
+                        duration_raw=kw.duration.to_fcpxml(),
+                    )
+                )
+    return ToolOutcome(
+        text=json.dumps(markers, indent=2),
+        structured=MarkerListResult(
+            markers=marker_records,
+            keywords=keyword_records,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_analyze_pacing(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=PacingAnalysisResult,
+)
+def fcpxml_analyze_pacing(path: str) -> ToolOutcome[PacingAnalysisResult]:
     """Analyze shot pacing — average/median shot length, distribution histogram.
 
     Args:
@@ -417,11 +516,38 @@ def fcpxml_analyze_pacing(path: str) -> str:
     """
     doc = _parse_doc(path)
     results = analyze_pacing(doc)
-    return json.dumps([_serializable(r) for r in results], indent=2)
+    legacy_payload = [_serializable(result) for result in results]
+    analyses = [
+        PacingRecord(
+            average_shot_length=result.average_shot_length,
+            median_shot_length=result.median_shot_length,
+            std_deviation=result.std_deviation,
+            shortest_shot=result.shortest_shot,
+            longest_shot=result.longest_shot,
+            pacing_curve=result.pacing_curve,
+            histogram=PacingHistogram(
+                under_one_second=result.histogram.get("< 1s", 0),
+                one_to_three_seconds=result.histogram.get("1-3s", 0),
+                three_to_five_seconds=result.histogram.get("3-5s", 0),
+                five_to_ten_seconds=result.histogram.get("5-10s", 0),
+                ten_to_thirty_seconds=result.histogram.get("10-30s", 0),
+                thirty_seconds_or_more=result.histogram.get("30s+", 0),
+            ),
+        )
+        for result in results
+    ]
+    return ToolOutcome(
+        text=json.dumps(legacy_payload, indent=2),
+        structured=PacingAnalysisResult(analyses=analyses),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_detect_gaps(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=GapDetectionResult,
+)
+def fcpxml_detect_gaps(path: str) -> ToolOutcome[GapDetectionResult]:
     """Find all gaps in the timeline.
 
     Args:
@@ -429,11 +555,25 @@ def fcpxml_detect_gaps(path: str) -> str:
     """
     doc = _parse_doc(path)
     gaps = detect_gaps(doc)
-    return json.dumps([_serializable(g) for g in gaps], indent=2)
+    legacy_payload = [_serializable(gap) for gap in gaps]
+    return ToolOutcome(
+        text=json.dumps(legacy_payload, indent=2),
+        structured=GapDetectionResult(
+            count=len(legacy_payload),
+            gaps=legacy_payload,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_detect_flash_frames(path: str, max_frames: int = 2) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=FlashFrameDetectionResult,
+)
+def fcpxml_detect_flash_frames(
+    path: str,
+    max_frames: int = 2,
+) -> ToolOutcome[FlashFrameDetectionResult]:
     """Find clips shorter than max_frames (potential flash frames / accidental edits).
 
     Args:
@@ -442,11 +582,25 @@ def fcpxml_detect_flash_frames(path: str, max_frames: int = 2) -> str:
     """
     doc = _parse_doc(path)
     flashes = detect_flash_frames(doc, max_frames=max_frames)
-    return json.dumps([_serializable(f) for f in flashes], indent=2)
+    legacy_payload = [_serializable(flash) for flash in flashes]
+    return ToolOutcome(
+        text=json.dumps(legacy_payload, indent=2),
+        structured=FlashFrameDetectionResult(
+            max_frames=max_frames,
+            count=len(legacy_payload),
+            items=legacy_payload,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_detect_duplicates(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=DuplicateDetectionResult,
+)
+def fcpxml_detect_duplicates(
+    path: str,
+) -> ToolOutcome[DuplicateDetectionResult]:
     """Find clips that use the same source media.
 
     Args:
@@ -454,11 +608,19 @@ def fcpxml_detect_duplicates(path: str) -> str:
     """
     doc = _parse_doc(path)
     dupes = detect_duplicates(doc)
-    return json.dumps([_serializable(d) for d in dupes], indent=2)
+    legacy_payload = [_serializable(dupe) for dupe in dupes]
+    return ToolOutcome(
+        text=json.dumps(legacy_payload, indent=2),
+        structured=DuplicateDetectionResult(groups=legacy_payload),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_validate(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=FCPXMLValidationResult,
+)
+def fcpxml_validate(path: str) -> ToolOutcome[FCPXMLValidationResult]:
     """Validate FCPXML structure and report errors/warnings.
 
     Args:
@@ -467,11 +629,28 @@ def fcpxml_validate(path: str) -> str:
     result = _validator.validate_file(
         _resolve_input(path, suffixes={".fcpxml"})
     )
-    return result.summary()
+    summary = result.summary()
+    return ToolOutcome(
+        text=summary,
+        structured=FCPXMLValidationResult(
+            valid=result.valid,
+            issues=[_serializable(issue) for issue in result.issues],
+            error_count=len(result.errors),
+            warning_count=len(result.warnings),
+            info_count=(
+                len(result.issues) - len(result.errors) - len(result.warnings)
+            ),
+            summary=summary,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_list_effects(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=EffectInventoryResult,
+)
+def fcpxml_list_effects(path: str) -> ToolOutcome[EffectInventoryResult]:
     """List all effects and transitions applied to clips.
 
     Args:
@@ -479,25 +658,51 @@ def fcpxml_list_effects(path: str) -> str:
     """
     doc = _parse_doc(path)
     effects = []
+    applied_records = []
     for project in doc.all_projects:
         if not project.sequence or not project.sequence.spine:
             continue
         for clip in project.sequence.spine.clips:
             for effect in clip.effects:
-                effects.append({
-                    "clip": clip.name,
-                    "effect_name": effect.name,
-                    "effect_ref": effect.ref,
-                    "enabled": effect.enabled,
-                    "parameters": effect.parameters,
-                })
+                effects.append(
+                    {
+                        "clip": clip.name,
+                        "effect_name": effect.name,
+                        "effect_ref": effect.ref,
+                        "enabled": effect.enabled,
+                        "parameters": effect.parameters,
+                    }
+                )
+                applied_records.append(
+                    AppliedEffectRecord(
+                        clip=clip.name,
+                        effect_name=effect.name,
+                        effect_ref=effect.ref,
+                        enabled=effect.enabled,
+                        parameters=[
+                            EffectParameterRecord(name=name, value=value)
+                            for name, value in effect.parameters.items()
+                        ],
+                    )
+                )
     # Also list effect resources
     resources = [{"id": k, "name": v.name, "uid": v.uid} for k, v in doc.effects.items()]
-    return json.dumps({"applied": effects, "available": resources}, indent=2)
+    legacy_payload = {"applied": effects, "available": resources}
+    return ToolOutcome(
+        text=json.dumps(legacy_payload, indent=2),
+        structured=EffectInventoryResult(
+            applied=applied_records,
+            available=resources,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_list_roles(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=RoleListResult,
+)
+def fcpxml_list_roles(path: str) -> ToolOutcome[RoleListResult]:
     """List all roles and subroles used in the timeline.
 
     Args:
@@ -511,11 +716,19 @@ def fcpxml_list_roles(path: str) -> str:
         for cc in clip.connected_clips:
             if cc.role:
                 roles.add(cc.role)
-    return json.dumps({"roles": sorted(roles)}, indent=2)
+    legacy_payload = {"roles": sorted(roles)}
+    return ToolOutcome(
+        text=json.dumps(legacy_payload, indent=2),
+        structured=RoleListResult.model_validate(legacy_payload),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_timeline_stats(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=TimelineStatsResult,
+)
+def fcpxml_timeline_stats(path: str) -> ToolOutcome[TimelineStatsResult]:
     """Get comprehensive timeline statistics — duration, clip count, resolution, pacing, etc.
 
     Args:
@@ -523,11 +736,22 @@ def fcpxml_timeline_stats(path: str) -> str:
     """
     doc = _parse_doc(path)
     stats = analyze_timeline_stats(doc)
-    return json.dumps([_serializable(s) for s in stats], indent=2)
+    legacy_payload = [_serializable(project_stats) for project_stats in stats]
+    return ToolOutcome(
+        text=json.dumps(legacy_payload, indent=2),
+        structured=TimelineStatsResult(projects=legacy_payload),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def fcpxml_diff(path_a: str, path_b: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=FCPXMLDiffResult,
+)
+def fcpxml_diff(
+    path_a: str,
+    path_b: str,
+) -> ToolOutcome[FCPXMLDiffResult]:
     """Compare two FCPXML files and show differences.
 
     Args:
@@ -538,7 +762,52 @@ def fcpxml_diff(path_a: str, path_b: str) -> str:
         _resolve_input(path_a, suffixes={".fcpxml"}),
         _resolve_input(path_b, suffixes={".fcpxml"}),
     )
-    return "\n\n".join(r.summary() for r in results)
+    summary = "\n\n".join(result.summary() for result in results)
+    project_records = []
+    all_changes = []
+    for result in results:
+        changes = [
+            DiffChangeRecord(
+                project_a=result.project_a,
+                project_b=result.project_b,
+                change_type=change.change_type,
+                clip_name=change.clip_name,
+                details=change.details,
+            )
+            for change in result.changes
+        ]
+        counts = DiffCountsRecord(
+            added=result.clips_added,
+            removed=result.clips_removed,
+            moved=result.clips_moved,
+            trimmed=result.clips_trimmed,
+            unchanged=result.clips_unchanged,
+        )
+        project_records.append(
+            ProjectDiffRecord(
+                project_a=result.project_a,
+                project_b=result.project_b,
+                changes=changes,
+                counts=counts,
+            )
+        )
+        all_changes.extend(changes)
+    aggregate_counts = DiffCountsRecord(
+        added=sum(result.clips_added for result in results),
+        removed=sum(result.clips_removed for result in results),
+        moved=sum(result.clips_moved for result in results),
+        trimmed=sum(result.clips_trimmed for result in results),
+        unchanged=sum(result.clips_unchanged for result in results),
+    )
+    return ToolOutcome(
+        text=summary,
+        structured=FCPXMLDiffResult(
+            projects=project_records,
+            changes=all_changes,
+            counts=aggregate_counts,
+            summary=summary,
+        ),
+    )
 
 
 # ============================================================================
