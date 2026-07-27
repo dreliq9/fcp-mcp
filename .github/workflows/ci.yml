@@ -55,7 +55,7 @@ jobs:
       - name: Ruff
         run: ruff check src tests scripts
       - name: Validate documented calls
-        run: python scripts/check_contracts.py
+        run: FCP_MCP_PROFILE=full python scripts/check_contracts.py
 
   coverage:
     name: Coverage floors

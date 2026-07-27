@@ -74,7 +74,7 @@ policy and side effects to the focused modules under `src/fcp_mcp/`.
 ```bash
 source .venv/bin/activate
 ruff check src tests scripts
-python scripts/check_contracts.py
+FCP_MCP_PROFILE=full python scripts/check_contracts.py
 pytest -v
 ```
 

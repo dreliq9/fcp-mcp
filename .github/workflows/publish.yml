@@ -30,7 +30,7 @@ jobs:
       - name: Re-run release gates
         run: |
           ruff check src tests scripts
-          python scripts/check_contracts.py
+          FCP_MCP_PROFILE=full python scripts/check_contracts.py
           python -m pytest -q
           pip-audit --local
       - name: Rebuild distributions from tag
