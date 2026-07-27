@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
+from .common import ArtifactReference
+
 
 class ProjectSummaryRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -316,6 +318,177 @@ class MediaLinkCheckResult(BaseModel):
     schema_version: Literal["1"] = "1"
     issues: list[ValidationIssueRecord]
     missing_count: int
+
+
+class TransactionReceiptResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    transaction_id: str
+    source: str | None
+    destination: str
+    backup_path: str | None
+    input_sha256: str | None
+    prior_sha256: str | None
+    output_sha256: str
+    validation_warnings: list[str]
+    elapsed_ms: int
+    disposition: Literal["committed"]
+
+
+class MarkerMutationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    clip_name: str
+    marker_type: Literal["standard", "chapter"]
+    start: str
+    duration: str
+    value: str
+    note: str
+
+
+class MarkerMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    marker: MarkerMutationRecord
+
+
+class MarkerBatchMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    requested_count: int
+    changed_count: int
+    markers: list[MarkerMutationRecord]
+
+
+class KeywordMutationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    clip_name: str
+    value: str
+    start: str
+    duration: str | None
+
+
+class KeywordMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    keyword: KeywordMutationRecord
+
+
+class ClipMutationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    element_type: str
+    offset: str
+    start: str
+    duration: str
+    role: str
+    ref: str
+
+
+class ClipFieldMutationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    field: Literal["start", "duration", "offset", "role", "time_map"]
+    before: str | None
+    after: str | None
+
+
+class ClipMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    operation: Literal["trim", "split", "change_speed"]
+    clip: ClipMutationRecord
+    created_clip: ClipMutationRecord | None
+    changed_fields: list[ClipFieldMutationRecord]
+    speed_factor: float | None
+
+
+class ClipBatchMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    operation: Literal["delete", "reorder"]
+    requested_count: int
+    changed_count: int
+    requested_names: list[str]
+    deleted_names: list[str]
+    requested_order: list[str]
+    resulting_order: list[str]
+
+
+class TransitionMutationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    after_clip_name: str
+    name: str
+    duration: str
+    offset: str
+    ref: str
+
+
+class TransitionMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    transition: TransitionMutationRecord
+
+
+class RoleMutationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    clip_name: str
+    role: str
+
+
+class RoleMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    assignment: RoleMutationRecord
+
+
+class TimelineElementMutationRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: Literal["title", "audio"]
+    name: str
+    ref: str
+    position: str
+    source: str | None
+    lane: int
+    offset: str
+    start: str | None
+    duration: str
+    role: str
+
+
+class TimelineElementMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+    element: TimelineElementMutationRecord
 
 
 class FrameRateFormatRecord(BaseModel):

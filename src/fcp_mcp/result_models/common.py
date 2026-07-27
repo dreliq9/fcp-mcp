@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
@@ -19,9 +19,34 @@ class LegacyTextResult(BaseModel):
     result: str
 
 
-@dataclass(frozen=True)
+class ArtifactReference(BaseModel):
+    """A committed artifact whose identity is bound to its bytes."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    path: str
+    media_type: Literal["application/vnd.apple.fcpxml+xml"]
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True, eq=False)
 class ToolOutcome(Generic[ResultT]):
     """One tool result represented on both MCP output channels."""
 
     text: str
     structured: ResultT
+
+    def __str__(self) -> str:
+        """Preserve the direct-call text view while carrying structured data."""
+        return self.text
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.text == other
+        if isinstance(other, ToolOutcome):
+            return (
+                self.text == other.text
+                and self.structured == other.structured
+            )
+        return NotImplemented

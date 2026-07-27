@@ -5,6 +5,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.fcpxml.validator import FCPXMLValidator, ValidationResult
@@ -23,7 +24,7 @@ class FCPXMLTransactionReceipt:
     output_sha256: str
     validation_warnings: tuple[str, ...]
     elapsed_ms: int
-    disposition: str = "committed"
+    disposition: Literal["committed"] = "committed"
 
 
 def _sha256(path: Path) -> str:

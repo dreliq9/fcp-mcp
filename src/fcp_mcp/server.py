@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import xml.etree.ElementTree as ET
 from collections.abc import Collection
 from dataclasses import asdict
 from itertools import pairwise
@@ -44,17 +45,22 @@ from .fcpxml.puppet import (
     standard_humanoid_rig,
 )
 from .fcpxml.time_utils import RationalTime
+from .fcpxml.transaction import FCPXMLTransactionReceipt
 from .fcpxml.validator import FCPXMLValidator
 from .fcpxml.writer import FCPXMLModifier
 from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
 from .profiles import Profile, ToolClass
 from .registry import PromptRegistry, ToolRegistry
-from .result_models.common import ToolOutcome
+from .result_models.common import ArtifactReference, ToolOutcome
 from .result_models.fcpxml import (
     AppliedEffectRecord,
     AudioLevelCheckResult,
     AudioLevelObservationRecord,
+    ClipBatchMutationResult,
+    ClipFieldMutationRecord,
     ClipListResult,
+    ClipMutationRecord,
+    ClipMutationResult,
     ClipRecord,
     DiffChangeRecord,
     DiffCountsRecord,
@@ -71,8 +77,13 @@ from .result_models.fcpxml import (
     FrameRateMismatchRecord,
     GapDetectionResult,
     InstalledEffectListResult,
+    KeywordMutationRecord,
+    KeywordMutationResult,
     KeywordRecord,
+    MarkerBatchMutationResult,
     MarkerListResult,
+    MarkerMutationRecord,
+    MarkerMutationResult,
     MarkerRecord,
     MediaLinkCheckResult,
     MotionTemplateListResult,
@@ -83,11 +94,18 @@ from .result_models.fcpxml import (
     ProjectDiffRecord,
     QCReportResult,
     RoleListResult,
+    RoleMutationRecord,
+    RoleMutationResult,
     SafeZoneCheckResult,
     SafeZoneObservationRecord,
     ShareDestinationListResult,
     TemplateListResult,
+    TimelineElementMutationRecord,
+    TimelineElementMutationResult,
     TimelineStatsResult,
+    TransactionReceiptResult,
+    TransitionMutationRecord,
+    TransitionMutationResult,
 )
 from .result_models.media import (
     AudioStreamRecord,
@@ -179,6 +197,103 @@ def _save_modifier(modifier: FCPXMLModifier, output_path: str = "") -> Path:
         suffixes={".fcpxml"},
     )
     return modifier.save(destination, event_format=CONFIG.log_format)
+
+
+def _save_modifier_receipt(
+    modifier: FCPXMLModifier,
+    output_path: str = "",
+) -> FCPXMLTransactionReceipt:
+    destination = _resolve_output(
+        output_path,
+        input_path=modifier.path,
+        suffixes={".fcpxml"},
+    )
+    return modifier.save_with_receipt(
+        destination,
+        event_format=CONFIG.log_format,
+    )
+
+
+def _receipt_result(
+    receipt: FCPXMLTransactionReceipt,
+) -> TransactionReceiptResult:
+    return TransactionReceiptResult(
+        transaction_id=receipt.transaction_id,
+        source=str(receipt.source) if receipt.source is not None else None,
+        destination=str(receipt.destination),
+        backup_path=(
+            str(receipt.backup_path)
+            if receipt.backup_path is not None
+            else None
+        ),
+        input_sha256=receipt.input_sha256,
+        prior_sha256=receipt.prior_sha256,
+        output_sha256=receipt.output_sha256,
+        validation_warnings=list(receipt.validation_warnings),
+        elapsed_ms=receipt.elapsed_ms,
+        disposition=receipt.disposition,
+    )
+
+
+def _artifact_reference(
+    receipt: FCPXMLTransactionReceipt,
+) -> ArtifactReference:
+    return ArtifactReference(
+        path=str(receipt.destination),
+        media_type="application/vnd.apple.fcpxml+xml",
+        sha256=receipt.output_sha256,
+        size_bytes=receipt.destination.stat().st_size,
+    )
+
+
+def _committed_root(
+    receipt: FCPXMLTransactionReceipt,
+) -> ET.Element:
+    return ET.parse(receipt.destination).getroot()
+
+
+def _committed_named_element(
+    root: ET.Element,
+    *,
+    name: str,
+    tags: Collection[str],
+) -> ET.Element:
+    element = next(
+        (
+            candidate
+            for candidate in root.iter()
+            if candidate.tag in tags and candidate.get("name") == name
+        ),
+        None,
+    )
+    if element is None:
+        raise RuntimeError(
+            f"Committed FCPXML is missing expected entity '{name}'"
+        )
+    return element
+
+
+def _clip_mutation_record(element: ET.Element) -> ClipMutationRecord:
+    return ClipMutationRecord(
+        name=element.get("name", ""),
+        element_type=element.tag,
+        offset=element.get("offset", ""),
+        start=element.get("start", ""),
+        duration=element.get("duration", ""),
+        role=element.get("role", ""),
+        ref=element.get("ref", ""),
+    )
+
+
+def _spine_clip_names(root: ET.Element) -> list[str]:
+    spine = root.find(".//spine")
+    if spine is None:
+        raise RuntimeError("Committed FCPXML is missing its timeline spine")
+    return [
+        child.get("name", "")
+        for child in spine
+        if child.tag != "transition"
+    ]
 
 
 def _save_generator(
@@ -854,7 +969,11 @@ def fcpxml_diff(
 # Category 3: FCPXML Editing (12 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=MarkerMutationResult,
+)
 def fcpxml_add_marker(
     path: str,
     clip_name: str,
@@ -863,7 +982,7 @@ def fcpxml_add_marker(
     note: str = "",
     marker_type: str = "standard",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[MarkerMutationResult]:
     """Add a marker to a clip.
 
     Args:
@@ -887,12 +1006,54 @@ def fcpxml_add_marker(
             ErrorCode.TARGET_NOT_FOUND,
             f"Clip '{clip_name}' not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Marker added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    clip = _committed_named_element(
+        root,
+        name=clip_name,
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    tag = "chapter-marker" if marker_type == "chapter" else "marker"
+    marker = next(
+        (
+            candidate
+            for candidate in clip.findall(tag)
+            if candidate.get("start") == start
+            and candidate.get("value") == value
+            and candidate.get("note", "") == note
+        ),
+        None,
+    )
+    if marker is None:
+        raise RuntimeError("Committed FCPXML is missing the added marker")
+    text = f"Marker added. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text,
+        structured=MarkerMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            marker=MarkerMutationRecord(
+                clip_name=clip_name,
+                marker_type=marker_type,
+                start=marker.get("start", ""),
+                duration=marker.get("duration", ""),
+                value=marker.get("value", ""),
+                note=marker.get("note", ""),
+            ),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
-def fcpxml_batch_add_markers(path: str, markers_json: str, output_path: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=MarkerBatchMutationResult,
+)
+def fcpxml_batch_add_markers(
+    path: str,
+    markers_json: str,
+    output_path: str = "",
+) -> ToolOutcome[MarkerBatchMutationResult]:
     """Add multiple markers at once.
 
     Args:
@@ -933,15 +1094,70 @@ def fcpxml_batch_add_markers(path: str, markers_json: str, output_path: str = ""
             ErrorCode.TARGET_NOT_FOUND,
             f"{len(markers) - count} marker target(s) were not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"{count}/{len(markers)} markers added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    marker_records = []
+    for requested in markers:
+        requested_type = requested.get("type", "standard")
+        clip = _committed_named_element(
+            root,
+            name=requested["clip_name"],
+            tags={"asset-clip", "clip", "title", "audio", "video"},
+        )
+        tag = (
+            "chapter-marker"
+            if requested_type == "chapter"
+            else "marker"
+        )
+        committed = next(
+            (
+                candidate
+                for candidate in clip.findall(tag)
+                if candidate.get("start") == requested["start"]
+                and candidate.get("value") == requested["value"]
+                and candidate.get("note", "") == requested.get("note", "")
+            ),
+            None,
+        )
+        if committed is None:
+            raise RuntimeError(
+                "Committed FCPXML is missing a batch-added marker"
+            )
+        marker_records.append(
+            MarkerMutationRecord(
+                clip_name=requested["clip_name"],
+                marker_type=requested_type,
+                start=committed.get("start", ""),
+                duration=committed.get("duration", ""),
+                value=committed.get("value", ""),
+                note=committed.get("note", ""),
+            )
+        )
+    text = (
+        f"{count}/{len(markers)} markers added. "
+        f"Saved to: {receipt.destination}"
+    )
+    return ToolOutcome(
+        text=text,
+        structured=MarkerBatchMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            requested_count=len(markers),
+            changed_count=count,
+            markers=marker_records,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=KeywordMutationResult,
+)
 def fcpxml_add_keyword(
     path: str, clip_name: str, value: str, start: str = "0s",
     duration: str = "", output_path: str = "",
-) -> str:
+) -> ToolOutcome[KeywordMutationResult]:
     """Add a keyword to a clip.
 
     Args:
@@ -961,16 +1177,51 @@ def fcpxml_add_keyword(
             ErrorCode.TARGET_NOT_FOUND,
             f"Clip '{clip_name}' not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Keyword '{value}' added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    clip = _committed_named_element(
+        root,
+        name=clip_name,
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    keyword = next(
+        (
+            candidate
+            for candidate in clip.findall("keyword")
+            if candidate.get("start") == start
+            and candidate.get("value") == value
+            and candidate.get("duration") == (duration or None)
+        ),
+        None,
+    )
+    if keyword is None:
+        raise RuntimeError("Committed FCPXML is missing the added keyword")
+    text = f"Keyword '{value}' added. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text,
+        structured=KeywordMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            keyword=KeywordMutationRecord(
+                clip_name=clip_name,
+                value=keyword.get("value", ""),
+                start=keyword.get("start", ""),
+                duration=keyword.get("duration"),
+            ),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ClipMutationResult,
+)
 def fcpxml_trim_clip(
     path: str, clip_name: str,
     new_start: str = "", new_duration: str = "",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[ClipMutationResult]:
     """Trim a clip's source in/out points.
 
     Args:
@@ -985,17 +1236,68 @@ def fcpxml_trim_clip(
     if new_duration:
         _parse_time(new_duration, "new_duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    original = mod._find_clip_by_name(clip_name)
+    before_start = original.get("start", "") if original is not None else ""
+    before_duration = (
+        original.get("duration", "") if original is not None else ""
+    )
     if not mod.trim_clip(clip_name, new_start or None, new_duration or None):
         raise FCPMCPError(
             ErrorCode.TARGET_NOT_FOUND,
             f"Clip '{clip_name}' not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Clip trimmed. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed = _committed_named_element(
+        root,
+        name=clip_name,
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    changes = []
+    after_start = committed.get("start", "")
+    after_duration = committed.get("duration", "")
+    if before_start != after_start:
+        changes.append(
+            ClipFieldMutationRecord(
+                field="start",
+                before=before_start,
+                after=after_start,
+            )
+        )
+    if before_duration != after_duration:
+        changes.append(
+            ClipFieldMutationRecord(
+                field="duration",
+                before=before_duration,
+                after=after_duration,
+            )
+        )
+    text = f"Clip trimmed. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text,
+        structured=ClipMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            operation="trim",
+            clip=_clip_mutation_record(committed),
+            created_clip=None,
+            changed_fields=changes,
+            speed_factor=None,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
-def fcpxml_split_clip(path: str, clip_name: str, split_at: str, output_path: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ClipMutationResult,
+)
+def fcpxml_split_clip(
+    path: str,
+    clip_name: str,
+    split_at: str,
+    output_path: str = "",
+) -> ToolOutcome[ClipMutationResult]:
     """Split a clip at a given offset within the clip.
 
     Args:
@@ -1006,22 +1308,62 @@ def fcpxml_split_clip(path: str, clip_name: str, split_at: str, output_path: str
     """
     _parse_time(split_at, "split_at")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
-    if mod._find_clip_by_name(clip_name) is None:
+    original = mod._find_clip_by_name(clip_name)
+    if original is None:
         raise FCPMCPError(
             ErrorCode.TARGET_NOT_FOUND,
             f"Clip '{clip_name}' not found",
         )
+    before_duration = original.get("duration", "")
     if not mod.split_clip(clip_name, split_at):
         raise FCPMCPError(
             ErrorCode.INVALID_ARGUMENTS,
             f"split_at must fall strictly inside clip '{clip_name}'",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Clip split. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed_original = _committed_named_element(
+        root,
+        name=clip_name,
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    committed_created = _committed_named_element(
+        root,
+        name=f"{clip_name}_split",
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    after_duration = committed_original.get("duration", "")
+    text = f"Clip split. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text,
+        structured=ClipMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            operation="split",
+            clip=_clip_mutation_record(committed_original),
+            created_clip=_clip_mutation_record(committed_created),
+            changed_fields=[
+                ClipFieldMutationRecord(
+                    field="duration",
+                    before=before_duration,
+                    after=after_duration,
+                )
+            ],
+            speed_factor=None,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
-def fcpxml_delete_clips(path: str, clip_names_json: str, output_path: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ClipBatchMutationResult,
+)
+def fcpxml_delete_clips(
+    path: str,
+    clip_names_json: str,
+    output_path: str = "",
+) -> ToolOutcome[ClipBatchMutationResult]:
     """Remove clips from the timeline by name.
 
     Args:
@@ -1042,12 +1384,43 @@ def fcpxml_delete_clips(path: str, clip_names_json: str, output_path: str = "") 
             ErrorCode.TARGET_NOT_FOUND,
             f"{len(names) - count} clip target(s) were not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"{count}/{len(names)} clips deleted. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    remaining = _spine_clip_names(root)
+    if any(name in remaining for name in names):
+        raise RuntimeError(
+            "Committed FCPXML still contains a deleted clip target"
+        )
+    text = (
+        f"{count}/{len(names)} clips deleted. "
+        f"Saved to: {receipt.destination}"
+    )
+    return ToolOutcome(
+        text=text,
+        structured=ClipBatchMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            operation="delete",
+            requested_count=len(names),
+            changed_count=count,
+            requested_names=names,
+            deleted_names=names,
+            requested_order=[],
+            resulting_order=remaining,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
-def fcpxml_reorder_clips(path: str, clip_names_json: str, output_path: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ClipBatchMutationResult,
+)
+def fcpxml_reorder_clips(
+    path: str,
+    clip_names_json: str,
+    output_path: str = "",
+) -> ToolOutcome[ClipBatchMutationResult]:
     """Reorder clips in the primary spine to match the given name order.
 
     Args:
@@ -1077,16 +1450,40 @@ def fcpxml_reorder_clips(path: str, clip_names_json: str, output_path: str = "")
             ErrorCode.TARGET_NOT_FOUND,
             "Timeline spine not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Clips reordered. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    resulting_order = _spine_clip_names(root)
+    if resulting_order[:len(names)] != names:
+        raise RuntimeError(
+            "Committed FCPXML does not contain the requested clip order"
+        )
+    text = f"Clips reordered. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text,
+        structured=ClipBatchMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            operation="reorder",
+            requested_count=len(names),
+            changed_count=len(names),
+            requested_names=names,
+            deleted_names=[],
+            requested_order=names,
+            resulting_order=resulting_order,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=TransitionMutationResult,
+)
 def fcpxml_add_transition(
     path: str, after_clip_name: str,
     duration: str = "30030/30000s", name: str = "Cross Dissolve",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[TransitionMutationResult]:
     """Insert a transition after a clip.
 
     Args:
@@ -1103,15 +1500,63 @@ def fcpxml_add_transition(
             ErrorCode.TARGET_NOT_FOUND,
             f"Clip '{after_clip_name}' not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Transition added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    after_clip = _committed_named_element(
+        root,
+        name=after_clip_name,
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    parent = next(
+        (
+            candidate
+            for candidate in root.iter()
+            if after_clip in list(candidate)
+        ),
+        None,
+    )
+    transition = None
+    if parent is not None:
+        children = list(parent)
+        index = children.index(after_clip)
+        if index + 1 < len(children):
+            candidate = children[index + 1]
+            if (
+                candidate.tag == "transition"
+                and candidate.get("name") == name
+                and candidate.get("duration") == duration
+            ):
+                transition = candidate
+    if transition is None:
+        raise RuntimeError(
+            "Committed FCPXML is missing the added transition"
+        )
+    text = f"Transition added. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text,
+        structured=TransitionMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            transition=TransitionMutationRecord(
+                after_clip_name=after_clip_name,
+                name=transition.get("name", ""),
+                duration=transition.get("duration", ""),
+                offset=transition.get("offset", ""),
+                ref=transition.get("ref", ""),
+            ),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ClipMutationResult,
+)
 def fcpxml_change_speed(
     path: str, clip_name: str, speed_factor: float,
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[ClipMutationResult]:
     """Change clip playback speed.
 
     Args:
@@ -1126,19 +1571,59 @@ def fcpxml_change_speed(
             "speed_factor must be greater than zero",
         )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    original = mod._find_clip_by_name(clip_name)
+    before_duration = (
+        original.get("duration", "") if original is not None else ""
+    )
     if not mod.change_speed(clip_name, speed_factor):
         raise FCPMCPError(
             ErrorCode.TARGET_NOT_FOUND,
             f"Clip '{clip_name}' not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Speed changed to {speed_factor}x. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed = _committed_named_element(
+        root,
+        name=clip_name,
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    if len(committed.findall("./timeMap/timept")) != 2:
+        raise RuntimeError(
+            "Committed FCPXML is missing the speed time map"
+        )
+    after_duration = committed.get("duration", "")
+    text = (
+        f"Speed changed to {speed_factor}x. "
+        f"Saved to: {receipt.destination}"
+    )
+    return ToolOutcome(
+        text=text,
+        structured=ClipMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            operation="change_speed",
+            clip=_clip_mutation_record(committed),
+            created_clip=None,
+            changed_fields=[
+                ClipFieldMutationRecord(
+                    field="duration",
+                    before=before_duration,
+                    after=after_duration,
+                )
+            ],
+            speed_factor=speed_factor,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=RoleMutationResult,
+)
 def fcpxml_assign_role(
     path: str, clip_name: str, role: str, output_path: str = "",
-) -> str:
+) -> ToolOutcome[RoleMutationResult]:
     """Set the role on a clip (e.g., "Dialogue", "Video", "Music", "Effects").
 
     Args:
@@ -1153,18 +1638,43 @@ def fcpxml_assign_role(
             ErrorCode.TARGET_NOT_FOUND,
             f"Clip '{clip_name}' not found",
         )
-    out = _save_modifier(mod, output_path)
-    return f"Role '{role}' assigned. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed = _committed_named_element(
+        root,
+        name=clip_name,
+        tags={"asset-clip", "clip", "title", "audio", "video"},
+    )
+    if committed.get("role") != role:
+        raise RuntimeError(
+            "Committed FCPXML is missing the assigned role"
+        )
+    text = f"Role '{role}' assigned. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text,
+        structured=RoleMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            assignment=RoleMutationRecord(
+                clip_name=clip_name,
+                role=committed.get("role", ""),
+            ),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=TimelineElementMutationResult,
+)
 def fcpxml_add_title(
     path: str,
     text: str,
     duration: str = "150150/30000s",
     position: str = "end",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[TimelineElementMutationResult]:
     """Add a title clip to the timeline.
 
     Args:
@@ -1180,14 +1690,15 @@ def fcpxml_add_title(
 
     # Find or create a title effect resource
     title_ref = ""
-    for el in mod.root.find("resources") or []:
-        if el.tag == "effect" and "Title" in el.get("name", ""):
-            title_ref = el.get("id", "")
-            break
+    title_resources = mod.root.find("resources")
+    if title_resources is not None:
+        for el in title_resources:
+            if el.tag == "effect" and "Title" in el.get("name", ""):
+                title_ref = el.get("id", "")
+                break
 
     if not title_ref:
         # Add a Basic Title effect resource
-        import xml.etree.ElementTree as ET
         resources = mod.root.find("resources")
         if resources is None:
             raise FCPMCPError(
@@ -1207,7 +1718,6 @@ def fcpxml_add_title(
             "Timeline spine not found",
         )
 
-    import xml.etree.ElementTree as ET
     title_el = ET.Element("title")
     title_el.set("ref", title_ref)
     title_el.set("name", text)
@@ -1244,11 +1754,67 @@ def fcpxml_add_title(
     # Recalculate offsets
     mod._recalculate_offsets(spine)
 
-    out = _save_modifier(mod, output_path)
-    return f"Title '{text}' added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed_spine = root.find(".//spine")
+    if committed_spine is None:
+        raise RuntimeError("Committed FCPXML is missing its timeline spine")
+    committed_title = next(
+        (
+            candidate
+            for candidate in committed_spine.findall("title")
+            if candidate.get("name") == text
+            and candidate.get("duration") == duration
+            and candidate.get("ref") == title_ref
+            and candidate.find("param") is not None
+            and candidate.find("param").get("value") == text
+        ),
+        None,
+    )
+    if committed_title is None:
+        raise RuntimeError("Committed FCPXML is missing the added title")
+    children = list(committed_spine)
+    title_index = children.index(committed_title)
+    if position == "start":
+        positioned = title_index == 0
+    elif position == "end":
+        positioned = title_index == len(children) - 1
+    else:
+        positioned = (
+            title_index > 0
+            and children[title_index - 1].get("name") == position
+        )
+    if not positioned:
+        raise RuntimeError(
+            "Committed FCPXML title is not in the requested position"
+        )
+    text_result = f"Title '{text}' added. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text_result,
+        structured=TimelineElementMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            element=TimelineElementMutationRecord(
+                kind="title",
+                name=committed_title.get("name", ""),
+                ref=committed_title.get("ref", ""),
+                position=position,
+                source=None,
+                lane=int(committed_title.get("lane", "0")),
+                offset=committed_title.get("offset", ""),
+                start=committed_title.get("start"),
+                duration=committed_title.get("duration", ""),
+                role=committed_title.get("role", ""),
+            ),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=TimelineElementMutationResult,
+)
 def fcpxml_add_audio(
     path: str,
     audio_src: str,
@@ -1256,7 +1822,7 @@ def fcpxml_add_audio(
     duration: str = "",
     position: str = "end",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[TimelineElementMutationResult]:
     """Add an audio clip to the timeline.
 
     Args:
@@ -1267,8 +1833,6 @@ def fcpxml_add_audio(
         position: "start", "end", or clip name to insert after
         output_path: Output file path
     """
-    import xml.etree.ElementTree as ET
-
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     audio_path = _resolve_input(audio_src)
     if duration:
@@ -1328,8 +1892,68 @@ def fcpxml_add_audio(
         parent.insert(list(parent).index(target) + 1, clip)
 
     mod._recalculate_offsets(spine)
-    out = _save_modifier(mod, output_path)
-    return f"Audio '{name}' added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed_spine = root.find(".//spine")
+    if committed_spine is None:
+        raise RuntimeError("Committed FCPXML is missing its timeline spine")
+    committed_clip = next(
+        (
+            candidate
+            for candidate in committed_spine.findall("asset-clip")
+            if candidate.get("name") == name
+            and candidate.get("ref") == asset_id
+            and candidate.get("duration") == (duration or "0s")
+        ),
+        None,
+    )
+    committed_asset = next(
+        (
+            candidate
+            for candidate in root.iter("asset")
+            if candidate.get("id") == asset_id
+            and candidate.get("name") == name
+            and candidate.get("src") == f"file://{audio_path}"
+        ),
+        None,
+    )
+    if committed_clip is None or committed_asset is None:
+        raise RuntimeError("Committed FCPXML is missing the added audio")
+    children = list(committed_spine)
+    clip_index = children.index(committed_clip)
+    if position == "start":
+        positioned = clip_index == 0
+    elif position == "end":
+        positioned = clip_index == len(children) - 1
+    else:
+        positioned = (
+            clip_index > 0
+            and children[clip_index - 1].get("name") == position
+        )
+    if not positioned:
+        raise RuntimeError(
+            "Committed FCPXML audio is not in the requested position"
+        )
+    text_result = f"Audio '{name}' added. Saved to: {receipt.destination}"
+    return ToolOutcome(
+        text=text_result,
+        structured=TimelineElementMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            element=TimelineElementMutationRecord(
+                kind="audio",
+                name=committed_clip.get("name", ""),
+                ref=committed_clip.get("ref", ""),
+                position=position,
+                source=str(audio_path),
+                lane=int(committed_clip.get("lane", "0")),
+                offset=committed_clip.get("offset", ""),
+                start=committed_clip.get("start"),
+                duration=committed_clip.get("duration", ""),
+                role=committed_clip.get("role", ""),
+            ),
+        ),
+    )
 
 
 # ============================================================================
