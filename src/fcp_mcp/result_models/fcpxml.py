@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from .common import ArtifactReference
 
@@ -335,6 +335,62 @@ class TransactionReceiptResult(BaseModel):
     disposition: Literal["committed"]
 
 
+class FCPXMLGenerationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    project: str
+    selected_clip_count: int
+    target_duration_seconds: float
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+
+
+class SubtitleImportResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    cue_count: int
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+
+
+class EDLImportResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    event_count: int
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+
+
+class FCPXMLMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    source_version: str
+    target_version: str
+    target_width: int
+    target_height: int
+    target_format_name: str
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+
+
+class CleanupMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    action: Literal[
+        "fix_flash_frames",
+        "fill_gaps",
+        "remove_silence",
+    ]
+    changed_count: int
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+
+
 class MarkerMutationRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -423,13 +479,64 @@ class ClipBatchMutationResult(BaseModel):
     schema_version: Literal["1"] = "1"
     destination: ArtifactReference
     receipt: TransactionReceiptResult
-    operation: Literal["delete", "reorder"]
-    requested_count: int
+    operation: Literal["delete", "reorder", "rename"]
+    requested_count: int | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     changed_count: int
-    requested_names: list[str]
-    deleted_names: list[str]
-    requested_order: list[str]
-    resulting_order: list[str]
+    requested_names: list[str] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    deleted_names: list[str] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    requested_order: list[str] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    resulting_order: list[str] | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    pattern: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    replacement: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+
+
+class RoleRuleRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    match: str
+    role: str
+
+
+class RoleBatchMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    rules: list[RoleRuleRecord]
+    changed_count: int
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+
+
+class TransitionBatchMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    name: str
+    duration: str
+    changed_count: int
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
 
 
 class TransitionMutationRecord(BaseModel):
@@ -606,11 +713,49 @@ class TemplateListResult(BaseModel):
     directory: str
 
 
+class UnsupportedToolResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    supported: Literal[False] = False
+    reason_code: Literal["unsupported_contract"] = "unsupported_contract"
+    reason: Literal[
+        "Template clip replacement has no stable clip substitution schema "
+        "in v0.2.1"
+    ] = (
+        "Template clip replacement has no stable clip substitution schema "
+        "in v0.2.1"
+    )
+
+
+class TemplateSaveResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    template: ArtifactReference
+    source_path: str
+    source_sha256: str
+    backup_path: str | None
+    receipt: TransactionReceiptResult
+
+
+class ExportResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1"] = "1"
+    format: Literal["resolve", "fcp7", "edl"]
+    source: ArtifactReference
+    artifact: ArtifactReference
+    receipt: TransactionReceiptResult | None
+
+
 __all__ = [
     "AppliedEffectRecord",
     "AudioLevelCheckResult",
     "AudioLevelObservationRecord",
     "AvailableEffectRecord",
+    "CleanupMutationResult",
+    "ClipBatchMutationResult",
     "ClipListResult",
     "ClipRecord",
     "DiffChangeRecord",
@@ -619,9 +764,13 @@ __all__ = [
     "DuplicateGroupRecord",
     "DuplicateOccurrenceRecord",
     "DurationCheckResult",
+    "EDLImportResult",
     "EffectInventoryResult",
     "EffectParameterRecord",
+    "ExportResult",
     "FCPXMLDiffResult",
+    "FCPXMLGenerationResult",
+    "FCPXMLMutationResult",
     "FCPXMLSummaryResult",
     "FCPXMLValidationResult",
     "FlashFrameDetectionResult",
@@ -644,12 +793,19 @@ __all__ = [
     "ProjectDiffRecord",
     "ProjectSummaryRecord",
     "QCReportResult",
+    "RoleBatchMutationResult",
     "RoleListResult",
+    "RoleRuleRecord",
     "SafeZoneCheckResult",
     "SafeZoneObservationRecord",
     "ShareDestinationListResult",
+    "SubtitleImportResult",
     "TemplateListResult",
+    "TemplateSaveResult",
     "TimelineStatisticsRecord",
     "TimelineStatsResult",
+    "TransactionReceiptResult",
+    "TransitionBatchMutationResult",
+    "UnsupportedToolResult",
     "ValidationIssueRecord",
 ]

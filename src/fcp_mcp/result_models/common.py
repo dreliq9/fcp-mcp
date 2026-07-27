@@ -3,11 +3,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Generic, Literal, TypeVar
+from typing import Annotated, Generic, TypeVar
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, StringConstraints
 
 ResultT = TypeVar("ResultT", bound=BaseModel)
+MediaType = Annotated[
+    str,
+    StringConstraints(
+        strict=True,
+        min_length=3,
+        max_length=127,
+        pattern=(
+            r"^[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}/"
+            r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,62}$"
+        ),
+    ),
+]
 
 
 class LegacyTextResult(BaseModel):
@@ -25,7 +37,7 @@ class ArtifactReference(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     path: str
-    media_type: Literal["application/vnd.apple.fcpxml+xml"]
+    media_type: MediaType
     sha256: str
     size_bytes: int
 

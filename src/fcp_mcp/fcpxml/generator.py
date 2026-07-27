@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import quote as url_quote
 
 from .time_utils import FORMAT_FRAME_DURATIONS, RationalTime
-from .transaction import commit_fcpxml
+from .transaction import FCPXMLTransactionReceipt, commit_fcpxml
 
 
 class FCPXMLGenerator:
@@ -367,15 +367,25 @@ class FCPXMLGenerator:
         event_format: str = "text",
     ) -> Path:
         """Write FCPXML to file."""
-        path = Path(path)
-        receipt = commit_fcpxml(
+        return self.save_with_receipt(
+            path,
+            event_format=event_format,
+        ).destination
+
+    def save_with_receipt(
+        self,
+        path: str | Path,
+        *,
+        event_format: str = "text",
+    ) -> FCPXMLTransactionReceipt:
+        """Write FCPXML atomically and return its complete receipt."""
+        return commit_fcpxml(
             source=None,
-            destination=path,
+            destination=Path(path),
             xml_text=f"{self.to_string()}\n",
             event_format=event_format,
             operation="generator_save",
         )
-        return receipt.destination
 
     def to_string(self) -> str:
         """Return FCPXML as string."""

@@ -5,6 +5,7 @@ The most capable FCP MCP server: FCPXML engine + live FCP control + media analys
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import subprocess
@@ -45,7 +46,7 @@ from .fcpxml.puppet import (
     standard_humanoid_rig,
 )
 from .fcpxml.time_utils import RationalTime
-from .fcpxml.transaction import FCPXMLTransactionReceipt
+from .fcpxml.transaction import FCPXMLTransactionReceipt, commit_fcpxml
 from .fcpxml.validator import FCPXMLValidator
 from .fcpxml.writer import FCPXMLModifier
 from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
@@ -56,6 +57,7 @@ from .result_models.fcpxml import (
     AppliedEffectRecord,
     AudioLevelCheckResult,
     AudioLevelObservationRecord,
+    CleanupMutationResult,
     ClipBatchMutationResult,
     ClipFieldMutationRecord,
     ClipListResult,
@@ -66,9 +68,13 @@ from .result_models.fcpxml import (
     DiffCountsRecord,
     DuplicateDetectionResult,
     DurationCheckResult,
+    EDLImportResult,
     EffectInventoryResult,
     EffectParameterRecord,
+    ExportResult,
     FCPXMLDiffResult,
+    FCPXMLGenerationResult,
+    FCPXMLMutationResult,
     FCPXMLSummaryResult,
     FCPXMLValidationResult,
     FlashFrameDetectionResult,
@@ -93,19 +99,25 @@ from .result_models.fcpxml import (
     PacingRecord,
     ProjectDiffRecord,
     QCReportResult,
+    RoleBatchMutationResult,
     RoleListResult,
     RoleMutationRecord,
     RoleMutationResult,
+    RoleRuleRecord,
     SafeZoneCheckResult,
     SafeZoneObservationRecord,
     ShareDestinationListResult,
+    SubtitleImportResult,
     TemplateListResult,
+    TemplateSaveResult,
     TimelineElementMutationRecord,
     TimelineElementMutationResult,
     TimelineStatsResult,
     TransactionReceiptResult,
+    TransitionBatchMutationResult,
     TransitionMutationRecord,
     TransitionMutationResult,
+    UnsupportedToolResult,
 )
 from .result_models.media import (
     AudioStreamRecord,
@@ -246,6 +258,24 @@ def _artifact_reference(
     )
 
 
+def _artifact_reference_for_path(
+    path: Path,
+    *,
+    media_type: str = "application/vnd.apple.fcpxml+xml",
+) -> ArtifactReference:
+    resolved = path.resolve()
+    digest = hashlib.sha256()
+    with resolved.open("rb") as artifact:
+        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return ArtifactReference(
+        path=str(resolved),
+        media_type=media_type,
+        sha256=digest.hexdigest(),
+        size_bytes=resolved.stat().st_size,
+    )
+
+
 def _committed_root(
     receipt: FCPXMLTransactionReceipt,
 ) -> ET.Element:
@@ -308,6 +338,47 @@ def _save_generator(
         suffixes={".fcpxml"},
     )
     return generator.save(destination, event_format=CONFIG.log_format)
+
+
+def _save_generator_receipt(
+    generator: FCPXMLGenerator,
+    output_path: str,
+    *,
+    default_name: str,
+) -> FCPXMLTransactionReceipt:
+    destination = _resolve_output(
+        output_path,
+        default_name=default_name,
+        suffixes={".fcpxml"},
+    )
+    return generator.save_with_receipt(
+        destination,
+        event_format=CONFIG.log_format,
+    )
+
+
+def _generation_result(
+    receipt: FCPXMLTransactionReceipt,
+) -> FCPXMLGenerationResult:
+    root = _committed_root(receipt)
+    project = next(root.iter("project"), None)
+    spine = root.find(".//spine")
+    if project is None or spine is None:
+        raise RuntimeError("Committed FCPXML is missing generation evidence")
+    selected = [child for child in spine if child.tag != "transition"]
+    duration_seconds = sum(
+        RationalTime.from_fcpxml(
+            child.get("duration", "0s")
+        ).to_seconds()
+        for child in selected
+    )
+    return FCPXMLGenerationResult(
+        project=project.get("name", ""),
+        selected_clip_count=len(selected),
+        target_duration_seconds=duration_seconds,
+        destination=_artifact_reference(receipt),
+        receipt=_receipt_result(receipt),
+    )
 
 
 def _load_json(raw: str, label: str) -> Any:
@@ -1987,7 +2058,11 @@ def fcpxml_add_audio(
 # Category 4: FCPXML Generation (8 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=FCPXMLGenerationResult,
+)
 def fcpxml_create_project(
     name: str = "Untitled Project",
     format_name: str = "FFVideoFormat1080p2997",
@@ -1996,7 +2071,7 @@ def fcpxml_create_project(
     frame_duration: str = "1001/30000s",
     event_name: str = "Default Event",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[FCPXMLGenerationResult]:
     """Create a new empty FCPXML project file.
 
     Args:
@@ -2014,22 +2089,30 @@ def fcpxml_create_project(
                               frame_duration=frame_duration)
     gen.create_project(name=name, format_ref=fmt_ref, event_name=event_name)
 
-    out = _save_generator(
+    receipt = _save_generator_receipt(
         gen,
         output_path,
         default_name=f"{name}.fcpxml",
     )
-    return f"Project created: {out}"
+    structured = _generation_result(receipt)
+    return ToolOutcome(
+        text=f"Project created: {receipt.destination}",
+        structured=structured,
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=FCPXMLGenerationResult,
+)
 def fcpxml_create_timeline(
     clips_json: str,
     project_name: str = "Generated Timeline",
     format_name: str = "FFVideoFormat1080p2997",
     event_name: str = "Generated",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[FCPXMLGenerationResult]:
     """Build a timeline from a list of clip definitions.
 
     Args:
@@ -2045,15 +2128,26 @@ def fcpxml_create_timeline(
     gen = FCPXMLGenerator()
     gen.build_timeline_from_clips(clips, project_name=project_name,
                                    format_name=format_name, event_name=event_name)
-    out = _save_generator(
+    receipt = _save_generator_receipt(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
     )
-    return f"Timeline created with {len(clips)} clips: {out}"
+    structured = _generation_result(receipt)
+    return ToolOutcome(
+        text=(
+            f"Timeline created with {structured.selected_clip_count} clips: "
+            f"{receipt.destination}"
+        ),
+        structured=structured,
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=FCPXMLGenerationResult,
+)
 def fcpxml_auto_rough_cut(
     clips_json: str,
     target_duration: str = "",
@@ -2061,7 +2155,7 @@ def fcpxml_auto_rough_cut(
     transition_duration: str = "",
     project_name: str = "Rough Cut",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[FCPXMLGenerationResult]:
     """Auto-assemble clips into a rough cut timeline.
 
     Args:
@@ -2131,22 +2225,34 @@ def fcpxml_auto_rough_cut(
 
         running_total = running_total + clip_dur
 
-    out = _save_generator(
+    receipt = _save_generator_receipt(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
     )
-    return f"Rough cut created ({running_total.to_seconds():.1f}s): {out}"
+    structured = _generation_result(receipt)
+    return ToolOutcome(
+        text=(
+            "Rough cut created "
+            f"({structured.target_duration_seconds:.1f}s): "
+            f"{receipt.destination}"
+        ),
+        structured=structured,
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=FCPXMLGenerationResult,
+)
 def fcpxml_generate_montage(
     clips_json: str,
     clip_duration: str = "90090/30000s",
     transition_duration: str = "30030/30000s",
     project_name: str = "Montage",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[FCPXMLGenerationResult]:
     """Generate a montage/highlight reel with uniform clip durations and transitions.
 
     Args:
@@ -2184,20 +2290,31 @@ def fcpxml_generate_montage(
             gen.add_transition(spine, duration=transition_duration,
                                 effect_ref=trans_ref)
 
-    out = _save_generator(
+    receipt = _save_generator_receipt(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
     )
-    return f"Montage created ({len(clips)} shots): {out}"
+    structured = _generation_result(receipt)
+    return ToolOutcome(
+        text=(
+            f"Montage created ({structured.selected_clip_count} shots): "
+            f"{receipt.destination}"
+        ),
+        structured=structured,
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=SubtitleImportResult,
+)
 def fcpxml_import_srt(
     path: str,
     srt_path: str,
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[SubtitleImportResult]:
     """Convert SRT subtitles to title clips and add to timeline.
 
     Args:
@@ -2238,10 +2355,12 @@ def fcpxml_import_srt(
 
     # Find or create title effect
     title_ref = ""
-    for el in mod.root.find("resources") or []:
-        if el.tag == "effect" and "Title" in el.get("name", ""):
-            title_ref = el.get("id", "")
-            break
+    resources = mod.root.find("resources")
+    if resources is not None:
+        for el in resources:
+            if el.tag == "effect" and "Title" in el.get("name", ""):
+                title_ref = el.get("id", "")
+                break
     if not title_ref:
         resources = mod.root.find("resources")
         effect = ET.SubElement(resources, "effect")
@@ -2283,17 +2402,39 @@ def fcpxml_import_srt(
         param.set("key", "Text")
         param.set("value", sub["text"])
 
-    out = _save_modifier(mod, output_path)
-    return f"{len(subtitles)} subtitles added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    cue_count = len(
+        root.findall(".//title[@role='Titles.Subtitle']")
+    )
+    if cue_count != len(subtitles):
+        raise RuntimeError(
+            "Committed FCPXML subtitle count does not match the import"
+        )
+    return ToolOutcome(
+        text=(
+            f"{cue_count} subtitles added. Saved to: "
+            f"{receipt.destination}"
+        ),
+        structured=SubtitleImportResult(
+            cue_count=cue_count,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=EDLImportResult,
+)
 def fcpxml_import_edl(
     edl_path: str,
     media_dir: str = "",
     project_name: str = "EDL Import",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[EDLImportResult]:
     """Convert an EDL (Edit Decision List) to FCPXML.
 
     Args:
@@ -2346,22 +2487,39 @@ def fcpxml_import_edl(
             ErrorCode.INVALID_ARGUMENTS,
             "EDL contains no parseable edit events",
         )
-    out = _save_generator(
+    receipt = _save_generator_receipt(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
     )
-    return f"EDL imported ({clip_count} clips): {out}"
+    root = _committed_root(receipt)
+    event_count = len(root.findall(".//spine/asset-clip"))
+    if event_count != clip_count:
+        raise RuntimeError(
+            "Committed FCPXML event count does not match the EDL import"
+        )
+    return ToolOutcome(
+        text=f"EDL imported ({event_count} clips): {receipt.destination}",
+        structured=EDLImportResult(
+            event_count=event_count,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=FCPXMLMutationResult,
+)
 def fcpxml_reformat(
     path: str,
     target_width: int = 1080,
     target_height: int = 1920,
     target_format_name: str = "FFVideoFormat1080x1920p2997",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[FCPXMLMutationResult]:
     """Reformat a timeline for a different aspect ratio (e.g., 16:9 → 9:16 for vertical).
 
     Args:
@@ -2373,6 +2531,8 @@ def fcpxml_reformat(
     """
 
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+
+    source_version = mod.root.get("version", "")
 
     # Update format
     format_element = next(mod.root.iter("format"), None)
@@ -2387,21 +2547,52 @@ def fcpxml_reformat(
         fmt_el.set("name", target_format_name)
         break
 
-    out = _save_modifier(mod, output_path)
-    return f"Reformatted to {target_width}x{target_height}. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed_format = next(root.iter("format"), None)
+    if committed_format is None:
+        raise RuntimeError("Committed FCPXML format resource is missing")
+    committed_width = int(committed_format.get("width", "0"))
+    committed_height = int(committed_format.get("height", "0"))
+    committed_name = committed_format.get("name", "")
+    if (
+        committed_width != target_width
+        or committed_height != target_height
+        or committed_name != target_format_name
+    ):
+        raise RuntimeError("Committed FCPXML format does not match reformat")
+    return ToolOutcome(
+        text=(
+            f"Reformatted to {committed_width}x{committed_height}. "
+            f"Saved to: {receipt.destination}"
+        ),
+        structured=FCPXMLMutationResult(
+            source_version=source_version,
+            target_version=root.get("version", ""),
+            target_width=committed_width,
+            target_height=committed_height,
+            target_format_name=committed_name,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
 # ============================================================================
 # Category 8: Batch Operations (6 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=CleanupMutationResult,
+)
 def fcpxml_fix_flash_frames(
     path: str,
     min_frames: int = 3,
     frame_duration: str = "1001/30000s",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[CleanupMutationResult]:
     """Auto-fix flash frames by extending very short clips to minimum duration.
 
     Args:
@@ -2413,17 +2604,48 @@ def fcpxml_fix_flash_frames(
     _parse_time(frame_duration, "frame_duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
     count = mod.fix_flash_frames(min_frames, frame_duration)
-    out = _save_modifier(mod, output_path)
-    return f"{count} flash frames fixed. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    minimum = RationalTime.from_fcpxml(frame_duration) * min_frames
+    remaining = [
+        element
+        for spine in root.iter("spine")
+        for element in spine
+        if element.tag not in {"gap", "transition"}
+        and not RationalTime.from_fcpxml(
+            element.get("duration", "0s")
+        ).is_zero
+        and RationalTime.from_fcpxml(
+            element.get("duration", "0s")
+        ) < minimum
+    ]
+    if remaining:
+        raise RuntimeError("Committed FCPXML still contains flash frames")
+    return ToolOutcome(
+        text=(
+            f"{count} flash frames fixed. Saved to: "
+            f"{receipt.destination}"
+        ),
+        structured=CleanupMutationResult(
+            action="fix_flash_frames",
+            changed_count=count,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=CleanupMutationResult,
+)
 def fcpxml_fill_gaps(
     path: str,
     fill_asset_ref: str,
     fill_name: str = "Fill",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[CleanupMutationResult]:
     """Replace all gaps in the timeline with clips from a specified asset.
 
     Args:
@@ -2441,17 +2663,40 @@ def fcpxml_fill_gaps(
             ErrorCode.TARGET_NOT_FOUND,
             f"Asset resource '{fill_asset_ref}' not found",
         )
+    prior_gap_count = sum(
+        len(spine.findall("gap"))
+        for spine in mod.root.iter("spine")
+    )
     count = mod.fill_gaps(fill_asset_ref, fill_name)
-    out = _save_modifier(mod, output_path)
-    return f"{count} gaps filled. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed_gap_count = sum(
+        len(spine.findall("gap"))
+        for spine in root.iter("spine")
+    )
+    if prior_gap_count - committed_gap_count != count:
+        raise RuntimeError("Committed FCPXML gap count does not match fill")
+    return ToolOutcome(
+        text=f"{count} gaps filled. Saved to: {receipt.destination}",
+        structured=CleanupMutationResult(
+            action="fill_gaps",
+            changed_count=count,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=CleanupMutationResult,
+)
 def fcpxml_remove_silence(
     path: str,
     silence_threshold_seconds: float = 2.0,
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[CleanupMutationResult]:
     """Remove gaps longer than the threshold from the timeline.
 
     Args:
@@ -2465,6 +2710,10 @@ def fcpxml_remove_silence(
             "silence_threshold_seconds must be nonnegative",
         )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    prior_gap_count = sum(
+        len(spine.findall("gap"))
+        for spine in mod.root.iter("spine")
+    )
     count = 0
     for spine_el in mod.root.iter("spine"):
         for gap_el in list(spine_el.findall("gap")):
@@ -2474,14 +2723,35 @@ def fcpxml_remove_silence(
                 count += 1
         if count > 0:
             mod._recalculate_offsets(spine_el)
-    out = _save_modifier(mod, output_path)
-    return f"{count} gaps removed. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    root = _committed_root(receipt)
+    committed_gap_count = sum(
+        len(spine.findall("gap"))
+        for spine in root.iter("spine")
+    )
+    if prior_gap_count - committed_gap_count != count:
+        raise RuntimeError(
+            "Committed FCPXML gap count does not match silence removal"
+        )
+    return ToolOutcome(
+        text=f"{count} gaps removed. Saved to: {receipt.destination}",
+        structured=CleanupMutationResult(
+            action="remove_silence",
+            changed_count=count,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ClipBatchMutationResult,
+)
 def fcpxml_batch_rename_clips(
     path: str, pattern: str, replacement: str, output_path: str = "",
-) -> str:
+) -> ToolOutcome[ClipBatchMutationResult]:
     """Rename clips matching a pattern (substring replacement).
 
     Args:
@@ -2496,20 +2766,52 @@ def fcpxml_batch_rename_clips(
             "pattern must not be empty",
         )
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    prior_names = [
+        element.get("name")
+        for element in mod.root.iter()
+    ]
     count = mod.batch_rename_clips(pattern, replacement)
     if count == 0:
         raise FCPMCPError(
             ErrorCode.TARGET_NOT_FOUND,
             f"No clip name contains pattern '{pattern}'",
         )
-    out = _save_modifier(mod, output_path)
-    return f"{count} clips renamed. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    committed_names = [
+        element.get("name")
+        for element in _committed_root(receipt).iter()
+    ]
+    verified_count = sum(
+        before != after
+        for before, after in zip(
+            prior_names,
+            committed_names,
+            strict=True,
+        )
+    )
+    if verified_count != count:
+        raise RuntimeError("Committed FCPXML rename count is inconsistent")
+    return ToolOutcome(
+        text=f"{count} clips renamed. Saved to: {receipt.destination}",
+        structured=ClipBatchMutationResult(
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+            operation="rename",
+            changed_count=count,
+            pattern=pattern,
+            replacement=replacement,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=RoleBatchMutationResult,
+)
 def fcpxml_batch_assign_roles(
     path: str, rules_json: str, output_path: str = "",
-) -> str:
+) -> ToolOutcome[RoleBatchMutationResult]:
     """Assign roles to clips based on name matching rules.
 
     Args:
@@ -2535,17 +2837,62 @@ def fcpxml_batch_assign_roles(
             ErrorCode.TARGET_NOT_FOUND,
             "No clips matched the supplied role rules",
         )
-    out = _save_modifier(mod, output_path)
-    return f"{count} roles assigned. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    committed_matches = 0
+    for element in _committed_root(receipt).iter():
+        if element.tag not in {
+            "asset-clip",
+            "clip",
+            "title",
+            "audio",
+            "video",
+        }:
+            continue
+        element_name = element.get("name", "")
+        matching_rule = next(
+            (
+                rule
+                for rule in rules
+                if rule["match"].lower() in element_name.lower()
+            ),
+            None,
+        )
+        if matching_rule is not None:
+            if element.get("role") != matching_rule["role"]:
+                raise RuntimeError(
+                    "Committed FCPXML role does not match assignment"
+                )
+            committed_matches += 1
+    if committed_matches != count:
+        raise RuntimeError("Committed FCPXML role count is inconsistent")
+    return ToolOutcome(
+        text=f"{count} roles assigned. Saved to: {receipt.destination}",
+        structured=RoleBatchMutationResult(
+            rules=[
+                RoleRuleRecord(
+                    match=rule["match"],
+                    role=rule["role"],
+                )
+                for rule in rules
+            ],
+            changed_count=count,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=TransitionBatchMutationResult,
+)
 def fcpxml_batch_apply_transition(
     path: str,
     duration: str = "30030/30000s",
     name: str = "Cross Dissolve",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[TransitionBatchMutationResult]:
     """Add transitions between all adjacent clips in the timeline.
 
     Args:
@@ -2556,14 +2903,40 @@ def fcpxml_batch_apply_transition(
     """
     _parse_time(duration, "duration")
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    prior_matching = sum(
+        element.get("name") == name
+        and element.get("duration") == duration
+        for element in mod.root.iter("transition")
+    )
     count = mod.batch_apply_transition(duration, name)
     if count == 0:
         raise FCPMCPError(
             ErrorCode.TARGET_NOT_FOUND,
             "No adjacent clips were available for transitions",
         )
-    out = _save_modifier(mod, output_path)
-    return f"{count} transitions added. Saved to: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    committed_matching = sum(
+        element.get("name") == name
+        and element.get("duration") == duration
+        for element in _committed_root(receipt).iter("transition")
+    )
+    if committed_matching - prior_matching != count:
+        raise RuntimeError(
+            "Committed FCPXML transition count is inconsistent"
+        )
+    return ToolOutcome(
+        text=(
+            f"{count} transitions added. Saved to: "
+            f"{receipt.destination}"
+        ),
+        structured=TransitionBatchMutationResult(
+            name=name,
+            duration=duration,
+            changed_count=count,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
 # ============================================================================
@@ -3144,13 +3517,17 @@ def fcpxml_list_templates(
     )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=UnsupportedToolResult,
+)
 def fcpxml_apply_template(
     template_path: str,
     clips_json: str,
     project_name: str = "From Template",
     output_path: str = "",
-) -> str:
+) -> ToolOutcome[UnsupportedToolResult]:
     """Apply an FCPXML template to a set of clips.
 
     Clip substitution is intentionally unavailable until a stable schema exists.
@@ -3170,12 +3547,16 @@ def fcpxml_apply_template(
     )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=TemplateSaveResult,
+)
 def fcpxml_save_template(
     path: str,
     template_name: str,
     output_dir: str = "",
-) -> str:
+) -> ToolOutcome[TemplateSaveResult]:
     """Save the current FCPXML structure as a reusable template.
 
     Args:
@@ -3191,12 +3572,31 @@ def fcpxml_save_template(
         input_path=src,
         suffixes={".fcpxml"},
     )
-    atomic_replace_bytes(
-        dest,
-        src.read_bytes(),
+    source_reference = _artifact_reference_for_path(src)
+    receipt = commit_fcpxml(
+        source=src,
+        destination=dest,
+        xml_text=src.read_text(encoding="utf-8"),
         event_format=CONFIG.log_format,
+        operation="save_template",
     )
-    return f"Template saved: {dest}"
+    template_reference = _artifact_reference_for_path(receipt.destination)
+    if template_reference.sha256 != source_reference.sha256:
+        raise RuntimeError("Committed template does not match its source")
+    return ToolOutcome(
+        text=f"Template saved: {receipt.destination}",
+        structured=TemplateSaveResult(
+            template=template_reference,
+            source_path=source_reference.path,
+            source_sha256=source_reference.sha256,
+            backup_path=(
+                str(receipt.backup_path.resolve())
+                if receipt.backup_path is not None
+                else None
+            ),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
 # ============================================================================
@@ -3602,8 +4002,15 @@ def compressor_list_settings() -> str:
     return json.dumps({"custom_presets": custom, "cli_info": built_in}, indent=2)
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
-def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ExportResult,
+)
+def fcpxml_export_resolve(
+    path: str,
+    output_path: str = "",
+) -> ToolOutcome[ExportResult]:
     """Convert FCPXML to DaVinci Resolve-compatible format (FCPXML v1.9).
 
     Args:
@@ -3611,7 +4018,9 @@ def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
         output_path: Output file path
     """
 
-    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    source = _resolve_input(path, suffixes={".fcpxml"})
+    source_reference = _artifact_reference_for_path(source)
+    mod = FCPXMLModifier(source)
     # Downgrade version for Resolve compatibility
     mod.root.set("version", "1.9")
 
@@ -3626,12 +4035,33 @@ def fcpxml_export_resolve(path: str, output_path: str = "") -> str:
         output_path = str(
             mod.path.parent / f"{mod.path.stem}_resolve.fcpxml"
         )
-    out = _save_modifier(mod, output_path)
-    return f"Resolve-compatible FCPXML saved: {out}"
+    receipt = _save_modifier_receipt(mod, output_path)
+    committed_root = _committed_root(receipt)
+    if committed_root.get("version") != "1.9":
+        raise RuntimeError("Committed Resolve export has the wrong version")
+    return ToolOutcome(
+        text=(
+            "Resolve-compatible FCPXML saved: "
+            f"{receipt.destination}"
+        ),
+        structured=ExportResult(
+            format="resolve",
+            source=source_reference,
+            artifact=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
-def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ExportResult,
+)
+def fcpxml_export_fcp7(
+    path: str,
+    output_path: str = "",
+) -> ToolOutcome[ExportResult]:
     """Convert FCPXML to FCP7 XML format (compatible with Premiere Pro and Avid).
 
     Args:
@@ -3641,6 +4071,7 @@ def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
     import xml.etree.ElementTree as ET
 
     source = _resolve_input(path, suffixes={".fcpxml"})
+    source_reference = _artifact_reference_for_path(source)
     doc = _parser.parse(source)
 
     # Build FCP7 XMEML
@@ -3713,16 +4144,36 @@ def fcpxml_export_fcp7(path: str, output_path: str = "") -> str:
         encoding="unicode",
         xml_declaration=True,
     )
-    atomic_replace_bytes(
+    write_receipt = atomic_replace_bytes(
         destination,
         f"{xml_text}\n".encode(),
         event_format=CONFIG.log_format,
     )
-    return f"FCP7 XML saved: {destination}"
+    if ET.parse(write_receipt.destination).getroot().tag != "xmeml":
+        raise RuntimeError("Committed FCP7 export is not XMEML")
+    return ToolOutcome(
+        text=f"FCP7 XML saved: {write_receipt.destination}",
+        structured=ExportResult(
+            format="fcp7",
+            source=source_reference,
+            artifact=_artifact_reference_for_path(
+                write_receipt.destination,
+                media_type="application/xml",
+            ),
+            receipt=None,
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
-def fcpxml_export_edl(path: str, output_path: str = "") -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=ExportResult,
+)
+def fcpxml_export_edl(
+    path: str,
+    output_path: str = "",
+) -> ToolOutcome[ExportResult]:
     """Export timeline as EDL (Edit Decision List).
 
     Args:
@@ -3730,6 +4181,7 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
         output_path: Output .edl file path
     """
     source = _resolve_input(path, suffixes={".fcpxml"})
+    source_reference = _artifact_reference_for_path(source)
     doc = _parser.parse(source)
     fmt = next(iter(doc.formats.values())) if doc.formats else None
     fps = fmt.fps if fmt else 29.97
@@ -3766,12 +4218,35 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
         input_path=source,
         suffixes={".edl"},
     )
-    atomic_replace_bytes(
+    write_receipt = atomic_replace_bytes(
         destination,
         edl_content.encode(),
         event_format=CONFIG.log_format,
     )
-    return f"EDL exported ({edit_num - 1} edits): {destination}"
+    committed_lines = write_receipt.destination.read_text(
+        encoding="utf-8"
+    ).splitlines()
+    committed_edit_count = sum(
+        len(line) >= 3 and line[:3].isdigit()
+        for line in committed_lines
+    )
+    if committed_edit_count != edit_num - 1:
+        raise RuntimeError("Committed EDL edit count is inconsistent")
+    return ToolOutcome(
+        text=(
+            f"EDL exported ({committed_edit_count} edits): "
+            f"{write_receipt.destination}"
+        ),
+        structured=ExportResult(
+            format="edl",
+            source=source_reference,
+            artifact=_artifact_reference_for_path(
+                write_receipt.destination,
+                media_type="text/x-cmx3600",
+            ),
+            receipt=None,
+        ),
+    )
 
 
 # ============================================================================
