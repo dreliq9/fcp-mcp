@@ -1,7 +1,8 @@
 # fcp-mcp LLM Guide
 
 MCP server giving you (Claude) professional-grade Final Cut Pro editing
-via FCPXML + AppleScript + ffprobe. 88 tools across 12 categories.
+via FCPXML + AppleScript + ffprobe. 89 tools across 12 categories and
+5 prompts.
 Modified FCPXMLs are written alongside their input with a `_modified`
 suffix unless `output_path` is specified.
 
@@ -29,6 +30,10 @@ duration. Never guess a clip name — the human may have renamed clips,
 used emoji, or left the FCP defaults ("Clip 1", "Clip 1 (duplicate)").
 Always list, then copy the name exactly.
 
+```tool-call
+{"name":"fcpxml_list_clips","arguments":{"path":"show.fcpxml"}}
+```
+
 ## Time values: be explicit
 
 FCPXML uses rational time (`"720/24s"` = 30 seconds at 24fps). Tools
@@ -38,40 +43,77 @@ Don't pass raw floats like `30.0` — they may silently quantize wrong.
 
 ## QC report anatomy
 
-`fcpxml_qc_report(path)` bundles six checks into one call. Returns a
-structured report with:
+`fcpxml_qc_report` returns Markdown in v0.2.1:
 
-- **flash_frames** — clips under 2 frames on any visible lane
-- **gaps** — silent/black gaps between timeline clips
-- **duplicates** — repeated clip names that may indicate accidental copy
-- **media_offline** — missing source files (path no longer resolves)
-- **frame_rate_conflicts** — clips at a rate different from the sequence
-- **audio_level_warnings** — clips peaking above -3 dBFS or below -40
-- **safe_zone_violations** — titles/graphics outside 90% action-safe
+```tool-call
+{"name":"fcpxml_qc_report","arguments":{"path":"show.fcpxml"}}
+```
 
-The tool returns JSON; parse it and decide which `fcpxml_fix_*` or
-`fcpxml_check_*` tool to call next.
+Its sections cover schema validation, timeline statistics, gaps, flash
+frames, duplicate sources, and pacing. Media links, frame rates, audio
+levels, safe zones, and target duration are separate tools; do not claim
+that the aggregate report ran them.
+
+```tool-call
+{"name":"fcpxml_check_media_links","arguments":{"path":"show.fcpxml"}}
+```
+
+```tool-call
+{"name":"fcpxml_check_frame_rates","arguments":{"path":"show.fcpxml"}}
+```
+
+```tool-call
+{"name":"fcpxml_check_audio_levels","arguments":{"path":"show.fcpxml"}}
+```
+
+```tool-call
+{"name":"fcpxml_check_safe_zones","arguments":{"path":"show.fcpxml"}}
+```
 
 ## Healing vs editing
 
-`heal` tools are **non-destructive reshuffles** of the timeline:
-- `fcpxml_fix_flash_frames` — merges <2-frame clips into their neighbor
-- `fcpxml_fill_gaps` — extends the preceding clip to close gaps
-- `fcpxml_remove_silence` — cuts audio-silent ranges from an interview
+The three cleanup tools mutate timeline structure and must be reviewed:
 
-`edit` tools **change media or metadata**. If the user says "clean up
-this edit," start with heal. If they say "tighten the pacing," use
-`edit` (trim, reorder, speed).
+- `fcpxml_fix_flash_frames` extends clips shorter than a configured
+  minimum; it does not merge them into a neighbor.
+
+```tool-call
+{"name":"fcpxml_fix_flash_frames","arguments":{"path":"show.fcpxml","output_path":"show_clean.fcpxml"}}
+```
+
+- `fcpxml_fill_gaps` replaces gap elements with clips referencing an
+  existing asset ID.
+
+```tool-call
+{"name":"fcpxml_fill_gaps","arguments":{"path":"show_clean.fcpxml","fill_asset_ref":"r2","output_path":"show_clean.fcpxml"}}
+```
+
+- `fcpxml_remove_silence` removes FCPXML gap elements at or above the
+  threshold. It does not consume FFmpeg silence ranges or splice silence
+  out of source clips.
+
+```tool-call
+{"name":"fcpxml_remove_silence","arguments":{"path":"show_clean.fcpxml","silence_threshold_seconds":2.0,"output_path":"show_clean.fcpxml"}}
+```
+
+After any cleanup, inspect the output and re-run the relevant checks.
 
 ## Cross-NLE export
 
-Three targets for the same timeline:
+Three conversion targets are available. Treat every conversion as lossy
+and inspect the output in the destination NLE:
 
-- `fcpxml_export_edl` — flat EDL (CMX3600), lossy but universal
-- `fcpxml_export_resolve` — DaVinci Resolve-flavored XML (v1.9). Preserves
-  effects, roles (as tracks), audio levels, color labels
-- `fcpxml_export_fcp7` — Premiere Pro-compatible XMEML (FCP7 format).
-  Roles become tracks; some effects become placeholders
+```tool-call
+{"name":"fcpxml_export_edl","arguments":{"path":"show.fcpxml","output_path":"show.edl"}}
+```
+
+```tool-call
+{"name":"fcpxml_export_resolve","arguments":{"path":"show.fcpxml","output_path":"show_resolve.xml"}}
+```
+
+```tool-call
+{"name":"fcpxml_export_fcp7","arguments":{"path":"show.fcpxml","output_path":"show_fcp7.xml"}}
+```
 
 When a user says "send this to color," pick EDL (grade-only) or
 `_resolve` (round-trip with VFX). When they say "send to Premiere,"
@@ -79,9 +121,13 @@ pick `_fcp7`.
 
 ## Live FCP: when to use it, when not
 
-`fcp_*` tools require Final Cut Pro to be **running**. Check first with
-`fcp_is_running()`. If false, either ask the user to launch FCP or stay
-in FCPXML mode.
+`fcp_*` tools require Final Cut Pro to be **running**. Check first:
+
+```tool-call
+{"name":"fcp_is_running","arguments":{}}
+```
+
+If false, either ask the user to launch FCP or stay in FCPXML mode.
 
 Use live tools for:
 - Current project/library state (`fcp_get_timeline_info`)
@@ -101,30 +147,38 @@ Don't use live tools for:
 directly in the timeline. No external Motion templates or third-party
 plugins — just standards-compliant FCPXML.
 
-```
-puppet_create_humanoid_rig(name="walker")
-puppet_preset_motion(name="walker", preset="walk", duration="5s")
-puppet_multi_scene(
-    rigs=[
-        {"name": "a", "preset": "walk", "offset": 0},
-        {"name": "b", "preset": "talk", "offset": 1},
-        {"name": "c", "preset": "wave", "offset": 2},
-    ],
-    duration="10s",
-)
-puppet_build_scene(name="walker", output_path="scene.fcpxml")
+Validate a conventional image directory:
+
+```tool-call
+{"name":"puppet_create_humanoid_rig","arguments":{"name":"walker","image_dir":"characters/walker"}}
 ```
 
-Presets: `walk`, `talk`, `wave`. Each takes a parameter dict
-(stride, cycles, arm_swing, etc.) — call `puppet_list_presets()` for the
-full parameter catalog. For custom bone/keyframe control bypass the
-presets and use `puppet_create_rig` + `puppet_animate` directly.
+Inspect supported presets:
+
+```tool-call
+{"name":"puppet_list_presets","arguments":{}}
+```
+
+Puppet calls do not retain a rig by name between invocations. Pass the
+complete rig JSON string to preset motion:
+
+```tool-call
+{"name":"puppet_preset_motion","arguments":{"rig_json":"{\"name\":\"walker\",\"parts\":[{\"name\":\"body\",\"image\":\"characters/walker/body.png\"}]}","preset":"walk","duration":"5s","output_path":"walker.fcpxml"}}
+```
+
+Multi-scene generation likewise takes serialized rig and scene arrays:
+
+```tool-call
+{"name":"puppet_multi_scene","arguments":{"rigs_json":"[{\"name\":\"walker\",\"parts\":[{\"name\":\"body\",\"image\":\"characters/walker/body.png\"}]}]","scenes_json":"[{\"name\":\"intro\",\"duration\":\"5s\",\"preset\":\"idle\"},{\"name\":\"walk\",\"duration\":\"5s\",\"preset\":\"walk\"}]","project_name":"Walker","output_path":"scenes"}}
+```
+
+For custom keyframe control, provide serialized rigs and animations to
+`puppet_animate`.
 
 ## Media analysis (ffprobe + ffmpeg)
 
-`media_*` tools require **FFmpeg on $PATH**. If FFmpeg is missing, every
-`media_*` call returns an error with install instructions — the tool
-doesn't crash, it degrades gracefully.
+`media_*` tools require **FFmpeg on $PATH**. If FFmpeg is missing, the
+tool returns a coded `dependency_missing` MCP error.
 
 - `media_info(path)` — streams, duration, codec, sample rate, channel layout
 - `media_list_streams(path)` — detailed per-stream metadata
@@ -138,13 +192,33 @@ doesn't crash, it degrades gracefully.
 - `media_audio_to_midi(path)` — transcribe audio to a MIDI sketch (useful
   for music-driven edits + beat placement)
 
+For example:
+
+```tool-call
+{"name":"media_detect_silence","arguments":{"path":"interview.mov","noise_threshold":"-40dB","min_duration":0.8}}
+```
+
+```tool-call
+{"name":"media_extract_thumbnail","arguments":{"path":"interview.mov","time":30.0,"output_path":"thumb.jpg"}}
+```
+
 ## Compressor
 
-`compressor_encode(input, setting)` dispatches an Apple Compressor job
-asynchronously. The tool returns immediately with a job ID; the encode
-runs in the background. Use `compressor_list_settings()` to see what's
-installed on the user's machine — Compressor setting names are
-user-specific and depend on what presets the user has saved.
+List the local settings first:
+
+```tool-call
+{"name":"compressor_list_settings","arguments":{}}
+```
+
+Then pass a concrete `.cmprstng` path:
+
+```tool-call
+{"name":"compressor_encode","arguments":{"input_path":"hero.mov","setting_path":"Presets/YouTube 4K.cmprstng","output_dir":"deliverables","batch_name":"YouTube 4K"}}
+```
+
+The tool invokes Compressor's CLI and returns its captured submission
+output. v0.2.1 does not expose a normalized job ID or completion
+tracking.
 
 ## Output directory
 
