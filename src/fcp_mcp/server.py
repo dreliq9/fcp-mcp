@@ -2073,14 +2073,32 @@ def fcpxml_check_frame_rates(path: str) -> ToolOutcome[FrameRateCheckResult]:
             "MIXED FRAME RATES DETECTED: "
             + ", ".join(f"{rate:.2f}fps" for rate in sorted(frame_rates))
         )
-        expected_fps = formats[0].fps
+        referenced_fps = next(
+            (
+                fmt.fps
+                for project in doc.all_projects
+                if project.sequence
+                and (
+                    fmt := doc.formats.get(project.sequence.format_ref)
+                ) is not None
+                and fmt.frame_duration.numerator > 0
+            ),
+            None,
+        )
+        expected_fps = (
+            referenced_fps
+            if referenced_fps is not None
+            else next(
+                item.fps for item in formats if item.fps in frame_rates
+            )
+        )
         mismatches = [
             FrameRateMismatchRecord(
                 format_id=item.format_id,
                 expected_fps=expected_fps,
                 actual_fps=item.fps,
             )
-            for item in formats[1:]
+            for item in formats
             if item.fps != expected_fps
         ]
 

@@ -388,3 +388,44 @@ async def test_metadata_checks_keep_empty_observations_honest(
     assert safe_zones.structuredContent["observations"] == []
     assert safe_zones.structuredContent["verified"] is False
     assert safe_zones.structuredContent["limitations"]
+
+
+@pytest.mark.asyncio
+async def test_frame_rate_mismatches_use_the_referenced_sequence_format(
+    tmp_path: Path,
+    qc_discovery_cases: dict[str, tuple[dict[str, object], str | None]],
+) -> None:
+    del qc_discovery_cases
+    path = tmp_path / "later-declared-timeline-format.fcpxml"
+    path.write_text(
+        """<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r24" name="Non Timeline" frameDuration="1/24s"
+            width="1920" height="1080"/>
+    <format id="r30" name="Timeline" frameDuration="1/30s"
+            width="1920" height="1080"/>
+  </resources>
+  <project name="Referenced Format">
+    <sequence format="r30" duration="1s"><spine/></sequence>
+  </project>
+</fcpxml>
+""",
+        encoding="utf-8",
+    )
+
+    result = await server.mcp.call_tool(
+        "fcpxml_check_frame_rates",
+        {"path": str(path)},
+    )
+
+    assert result.content[0].text == (
+        "MIXED FRAME RATES DETECTED: 24.00fps, 30.00fps"
+    )
+    assert result.structuredContent["mismatches"] == [
+        {
+            "format_id": "r24",
+            "expected_fps": 30.0,
+            "actual_fps": 24.0,
+        }
+    ]
