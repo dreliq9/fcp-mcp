@@ -32,6 +32,15 @@ class ErrorCode(str, Enum):
     TRANSACTION_FAILED = "transaction_failed"
     UNSUPPORTED_CONTRACT = "unsupported_contract"
     INTERNAL_ERROR = "internal_error"
+    APPROVAL_REQUIRED = "approval_required"
+    APPROVAL_EXPIRED = "approval_expired"
+    WORKFLOW_STATE_CONFLICT = "workflow_state_conflict"
+    WORKFLOW_STALE = "workflow_stale"
+    OPERATION_FAILED = "operation_failed"
+    ARTIFACT_CORRUPT = "artifact_corrupt"
+    LEDGER_UNAVAILABLE = "ledger_unavailable"
+    RECOVERY_REQUIRED = "recovery_required"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 
 
 class FCPMCPError(RuntimeError):
