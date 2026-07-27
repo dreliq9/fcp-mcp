@@ -12,12 +12,25 @@ from mcp.server.fastmcp.exceptions import ToolError
 import fcp_mcp.automation.osascript as automation
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
-from fcp_mcp.contracts import FCPMCPError
+from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.result_models.common import LegacyTextResult, ToolOutcome
 from fcp_mcp.security.paths import PathPolicy
 from fcp_mcp.version import distribution_version
 
 HOSTILE = 'x" & do shell script "touch /tmp/pwned" & "'
+
+
+def test_direct_server_main_rejects_non_macos_before_mcp_run(monkeypatch):
+    def forbidden():
+        raise AssertionError("unsupported startup crossed the server boundary")
+
+    monkeypatch.setattr("fcp_mcp.platform_support.sys.platform", "linux")
+    monkeypatch.setattr(server.mcp, "run", forbidden)
+
+    with pytest.raises(FCPMCPError) as caught:
+        server.main()
+
+    assert caught.value.code is ErrorCode.UNSUPPORTED_PLATFORM
 
 
 @pytest.fixture

@@ -57,6 +57,7 @@ from .fcpxml.transaction import (
 from .fcpxml.validator import FCPXMLValidator
 from .fcpxml.writer import FCPXMLModifier
 from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
+from .platform_support import require_macos
 from .profiles import Profile, ToolClass
 from .registry import PromptRegistry, ToolRegistry
 from .result_models.common import ArtifactReference, ToolOutcome
@@ -7738,6 +7739,7 @@ mcp = build_mcp_server(CONFIG, TOOLS, PROMPTS)
 
 def main():
     """Run the MCP server."""
+    require_macos()
     mcp.run()
 
 

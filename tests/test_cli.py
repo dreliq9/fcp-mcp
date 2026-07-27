@@ -16,6 +16,37 @@ def test_version_prints_package_version(capsys):
     assert capsys.readouterr().out.strip() == "fcp-mcp 0.2.1"
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [[], ["serve"], ["doctor"], ["doctor", "--json"]],
+)
+def test_non_macos_operations_fail_before_config_or_server(
+    arguments,
+    monkeypatch,
+    capsys,
+):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("unsupported startup crossed a side-effect boundary")
+
+    monkeypatch.setattr("fcp_mcp.platform_support.sys.platform", "linux")
+    monkeypatch.setattr("fcp_mcp.cli.serve", forbidden)
+    monkeypatch.setattr("fcp_mcp.cli.RuntimeConfig.from_env", forbidden)
+
+    assert main(arguments) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "unsupported_platform: fcp-mcp requires macOS\n"
+
+
+def test_non_macos_help_and_version_remain_available(monkeypatch, capsys):
+    monkeypatch.setattr("fcp_mcp.platform_support.sys.platform", "linux")
+
+    assert main(["--version"]) == 0
+    with pytest.raises(SystemExit) as help_exit:
+        main(["--help"])
+    assert help_exit.value.code == 0
+
+
 def test_doctor_json_is_machine_readable(capsys, tmp_path, monkeypatch):
     monkeypatch.setenv("FCP_MCP_OUTPUT_DIR", str(tmp_path))
     code = main(["doctor", "--json"])

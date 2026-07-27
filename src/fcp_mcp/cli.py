@@ -6,8 +6,9 @@ import sys
 from collections.abc import Sequence
 
 from fcp_mcp.config import RuntimeConfig
-from fcp_mcp.contracts import DoctorReport, FCPMCPError
+from fcp_mcp.contracts import DoctorReport, ErrorCode, FCPMCPError
 from fcp_mcp.diagnostics import collect_doctor, configuration_failure_report
+from fcp_mcp.platform_support import require_macos
 from fcp_mcp.version import package_version
 
 
@@ -18,6 +19,7 @@ def serve() -> None:
 
 
 async def _doctor() -> DoctorReport:
+    require_macos()
     try:
         config = RuntimeConfig.from_env()
     except FCPMCPError as error:
@@ -72,15 +74,20 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if not arguments:
-        serve()
-        return 0
-
     options = _parser().parse_args(arguments)
     if options.version:
         print(f"fcp-mcp {package_version()}")
         return 0
-    if options.command == "serve":
+
+    try:
+        require_macos()
+    except FCPMCPError as error:
+        if error.code is not ErrorCode.UNSUPPORTED_PLATFORM:
+            raise
+        print(str(error), file=sys.stderr)
+        return 2
+
+    if options.command in {None, "serve"}:
         serve()
         return 0
     if options.command == "doctor":

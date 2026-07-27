@@ -200,8 +200,11 @@ def test_enabled_live_control_reports_accessibility_state(
     assert checks[1].status == expected_status
 
 
-def test_accessibility_probe_is_skipped_off_macos(monkeypatch):
-    monkeypatch.setattr(diagnostics.platform, "system", lambda: "Linux")
+def test_accessibility_probe_reports_unavailable_framework(monkeypatch):
+    def unavailable(_framework):
+        raise OSError("framework unavailable")
+
+    monkeypatch.setattr(diagnostics.ctypes, "CDLL", unavailable)
     assert diagnostics._accessibility_trusted() is None
 
 

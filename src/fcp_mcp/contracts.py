@@ -41,6 +41,7 @@ class ErrorCode(str, Enum):
     LEDGER_UNAVAILABLE = "ledger_unavailable"
     RECOVERY_REQUIRED = "recovery_required"
     IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    UNSUPPORTED_PLATFORM = "unsupported_platform"
 
 
 class FCPMCPError(RuntimeError):

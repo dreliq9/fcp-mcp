@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import os
-import platform
 import subprocess
 import tempfile
 from collections.abc import Awaitable, Callable, Collection
@@ -128,8 +127,6 @@ def _fcp_check() -> tuple[DoctorCheck, bool, bool]:
 
 
 def _accessibility_trusted() -> bool | None:
-    if platform.system() != "Darwin":
-        return None
     framework = (
         "/System/Library/Frameworks/ApplicationServices.framework/"
         "ApplicationServices"
