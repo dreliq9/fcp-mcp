@@ -480,6 +480,213 @@ def _media_source_artifact_reference(path: Path) -> ArtifactReference:
     )
 
 
+def _read_midi_vlq(
+    data: bytes,
+    cursor: int,
+    end: int,
+) -> tuple[int, int]:
+    value = 0
+    for _ in range(4):
+        if cursor >= end:
+            _raise_validation_failure(
+                "MIDI artifact contains a truncated variable-length value"
+            )
+        byte = data[cursor]
+        cursor += 1
+        value = (value << 7) | (byte & 0x7F)
+        if byte < 0x80:
+            return value, cursor
+    _raise_validation_failure(
+        "MIDI artifact contains an oversized variable-length value"
+    )
+
+
+def _validate_midi_track(track: bytes) -> None:
+    cursor = 0
+    running_status: int | None = None
+    while cursor < len(track):
+        _, cursor = _read_midi_vlq(track, cursor, len(track))
+        if cursor >= len(track):
+            _raise_validation_failure(
+                "MIDI artifact contains a truncated event"
+            )
+
+        status_byte = track[cursor]
+        if status_byte < 0x80:
+            if running_status is None:
+                _raise_validation_failure(
+                    "MIDI artifact uses running status without a prior event"
+                )
+            status = running_status
+        else:
+            status = status_byte
+            cursor += 1
+
+        if 0x80 <= status <= 0xEF:
+            running_status = status
+            data_length = 1 if status >> 4 in {0xC, 0xD} else 2
+            if cursor + data_length > len(track):
+                _raise_validation_failure(
+                    "MIDI artifact contains truncated channel data"
+                )
+            if any(
+                byte >= 0x80
+                for byte in track[cursor : cursor + data_length]
+            ):
+                _raise_validation_failure(
+                    "MIDI artifact channel data is out of range"
+                )
+            cursor += data_length
+            continue
+
+        running_status = None
+        if status == 0xFF:
+            if cursor >= len(track):
+                _raise_validation_failure(
+                    "MIDI artifact contains a truncated meta event"
+                )
+            meta_type = track[cursor]
+            cursor += 1
+            length, cursor = _read_midi_vlq(
+                track,
+                cursor,
+                len(track),
+            )
+            if cursor + length > len(track):
+                _raise_validation_failure(
+                    "MIDI artifact contains truncated meta-event data"
+                )
+            cursor += length
+            if meta_type == 0x2F:
+                if length != 0 or cursor != len(track):
+                    _raise_validation_failure(
+                        "MIDI end-of-track evidence is malformed"
+                    )
+                return
+            continue
+
+        if status in {0xF0, 0xF7}:
+            length, cursor = _read_midi_vlq(
+                track,
+                cursor,
+                len(track),
+            )
+            if cursor + length > len(track):
+                _raise_validation_failure(
+                    "MIDI artifact contains truncated system-exclusive data"
+                )
+            cursor += length
+            continue
+
+        _raise_validation_failure(
+            "MIDI artifact contains an unsupported system event"
+        )
+
+    _raise_validation_failure(
+        "MIDI track is missing required end-of-track evidence"
+    )
+
+
+def _validate_midi_artifact(path: Path) -> None:
+    data = path.read_bytes()
+    if len(data) < 14 or data[:4] != b"MThd":
+        _raise_validation_failure(
+            "MIDI artifact is missing its complete SMF header"
+        )
+    header_length = int.from_bytes(data[4:8], "big")
+    header_end = 8 + header_length
+    if header_length < 6 or header_end > len(data):
+        _raise_validation_failure(
+            "MIDI artifact has a truncated SMF header"
+        )
+    format_number = int.from_bytes(data[8:10], "big")
+    track_count = int.from_bytes(data[10:12], "big")
+    division = int.from_bytes(data[12:14], "big")
+    if (
+        format_number not in {0, 1, 2}
+        or track_count == 0
+        or (format_number == 0 and track_count != 1)
+        or division == 0
+    ):
+        _raise_validation_failure(
+            "MIDI artifact has invalid SMF header fields"
+        )
+    if division & 0x8000:
+        smpte_format = ((division >> 8) & 0xFF) - 256
+        ticks_per_frame = division & 0xFF
+        if (
+            smpte_format not in {-24, -25, -29, -30}
+            or ticks_per_frame == 0
+        ):
+            _raise_validation_failure(
+                "MIDI artifact has an invalid SMPTE division"
+            )
+
+    cursor = header_end
+    for _ in range(track_count):
+        if cursor + 8 > len(data) or data[cursor : cursor + 4] != b"MTrk":
+            _raise_validation_failure(
+                "MIDI artifact is missing a declared track chunk"
+            )
+        track_length = int.from_bytes(
+            data[cursor + 4 : cursor + 8],
+            "big",
+        )
+        track_start = cursor + 8
+        track_end = track_start + track_length
+        if track_end > len(data):
+            _raise_validation_failure(
+                "MIDI artifact contains a truncated track chunk"
+            )
+        _validate_midi_track(data[track_start:track_end])
+        cursor = track_end
+    if cursor != len(data):
+        _raise_validation_failure(
+            "MIDI artifact contains undeclared trailing bytes"
+        )
+
+
+def _validate_decodable_media(path: Path, media_type: str) -> None:
+    from .media.ffprobe import _find_ffmpeg, _run_checked
+
+    stream_map = (
+        "0:v:0"
+        if media_type in {"image/jpeg", "image/png"}
+        else "0:a:0"
+    )
+    try:
+        _run_checked(
+            [
+                _find_ffmpeg(),
+                "-v",
+                "error",
+                "-xerror",
+                "-err_detect",
+                "explode",
+                "-i",
+                str(path),
+                "-map",
+                stream_map,
+                "-abort_on",
+                "empty_output",
+                "-f",
+                "null",
+                "-",
+            ],
+            timeout=300,
+        )
+    except FCPMCPError as error:
+        if error.code not in {
+            ErrorCode.COMMAND_FAILED,
+            ErrorCode.OUTPUT_MISSING,
+        }:
+            raise
+        raise FCPMCPError(
+            ErrorCode.VALIDATION_FAILED,
+            f"Media artifact failed strict decode validation: {path}",
+        ) from error
+
+
 def _media_artifact_reference(path: Path) -> ArtifactReference:
     resolved = path.resolve()
     if not resolved.is_file() or resolved.stat().st_size == 0:
@@ -497,6 +704,16 @@ def _media_artifact_reference(path: Path) -> ArtifactReference:
                 f"format: {resolved}"
             ),
         )
+    if detected_type == "audio/midi":
+        _validate_midi_artifact(resolved)
+    elif detected_type in {
+        "image/jpeg",
+        "image/png",
+        "audio/wav",
+        "audio/mpeg",
+        "audio/flac",
+    }:
+        _validate_decodable_media(resolved, detected_type)
     return _artifact_reference_for_path(
         resolved,
         media_type=detected_type,
@@ -937,12 +1154,45 @@ def _parse_positive_time(raw: str, label: str) -> RationalTime:
     return parsed
 
 
+def _parse_nonnegative_time(raw: str, label: str) -> RationalTime:
+    parsed = _parse_time(raw, label)
+    if parsed.numerator < 0:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must be nonnegative: {raw}",
+        )
+    return parsed
+
+
 def _require_puppet_project_name(project_name: str) -> None:
     if not project_name:
         raise FCPMCPError(
             ErrorCode.INVALID_ARGUMENTS,
             "project_name must not be empty",
         )
+
+
+def _preflight_scene_destination_aliases(
+    out_dir: Path,
+    destinations: list[Path],
+) -> None:
+    with tempfile.TemporaryDirectory(
+        prefix=".puppet-scene-probe-",
+        dir=out_dir,
+    ) as probe_directory:
+        probe_root = Path(probe_directory)
+        for destination in destinations:
+            try:
+                with (probe_root / destination.name).open("xb"):
+                    pass
+            except FileExistsError as error:
+                raise FCPMCPError(
+                    ErrorCode.INVALID_ARGUMENTS,
+                    (
+                        "Scene names resolve to duplicate output "
+                        "destinations on this filesystem"
+                    ),
+                ) from error
 
 
 def _resolve_clip_sources(
@@ -6013,7 +6263,11 @@ def puppet_build_scene(
         output_path: Where to save (default: ~/Movies/<project_name>.fcpxml)
     """
     _require_puppet_project_name(project_name)
-    _parse_positive_time(duration, "duration")
+    requested_duration = duration
+    duration = _parse_positive_time(
+        duration,
+        "duration",
+    ).to_fcpxml()
     rigs_data = _load_rigs(rigs_json)
 
     builder = PuppetSceneBuilder(duration=duration)
@@ -6038,7 +6292,7 @@ def puppet_build_scene(
         "file": str(receipt.destination),
         "rigs": len(rigs),
         "total_parts": total_parts,
-        "duration": duration,
+        "duration": requested_duration,
         "status": "scene_built",
     }, indent=2)
     return _TextToolOutcome(
@@ -6099,7 +6353,11 @@ def puppet_animate(
         output_path: Where to save
     """
     _require_puppet_project_name(project_name)
-    _parse_positive_time(duration, "duration")
+    requested_duration = duration
+    duration = _parse_positive_time(
+        duration,
+        "duration",
+    ).to_fcpxml()
     rigs_data = _load_rigs(rigs_json)
     anims_data = _load_json_list(animations_json, "animations_json")
     if not anims_data:
@@ -6155,13 +6413,13 @@ def puppet_animate(
                         f"[{keyframe_index}] must contain time and value"
                     ),
                 )
-            _parse_time(
+            canonical_keyframe_time = _parse_nonnegative_time(
                 str(kf["time"]),
                 (
                     f"animations_json[{index}].keyframes"
                     f"[{keyframe_index}].time"
                 ),
-            )
+            ).to_fcpxml()
             val = kf["value"]
             if ad["property"] == "rotation":
                 if not isinstance(val, (int, float)) or isinstance(val, bool):
@@ -6199,7 +6457,7 @@ def puppet_animate(
             if isinstance(val, list):
                 val = tuple(val)
             keyframes.append(Keyframe(
-                time=kf["time"],
+                time=canonical_keyframe_time,
                 value=val,
                 interp=kf.get("interp", "smooth2"),
             ))
@@ -6225,7 +6483,7 @@ def puppet_animate(
         "file": str(receipt.destination),
         "rigs": len(rigs),
         "animations": len(animations),
-        "duration": duration,
+        "duration": requested_duration,
         "status": "animated_scene_built",
     }, indent=2)
     return _TextToolOutcome(
@@ -6275,7 +6533,11 @@ def puppet_preset_motion(
         intensity: Scale factor for motion amplitude (0.5 = subtle, 2.0 = exaggerated)
     """
     _require_puppet_project_name(project_name)
-    _parse_positive_time(duration, "duration")
+    requested_duration = duration
+    duration = _parse_positive_time(
+        duration,
+        "duration",
+    ).to_fcpxml()
     if cycles <= 0 or intensity <= 0:
         raise FCPMCPError(
             ErrorCode.INVALID_ARGUMENTS,
@@ -6343,7 +6605,7 @@ def puppet_preset_motion(
         "preset": preset,
         "animations_applied": len(anims),
         "parts_animated": [a.part_name for a in anims],
-        "duration": duration,
+        "duration": requested_duration,
         "status": "preset_applied",
     }, indent=2)
     return _TextToolOutcome(
@@ -6396,6 +6658,7 @@ def puppet_multi_scene(
         )
     supported_presets = {"idle", "walk", "talk", "wave", "bounce"}
     normalized_scene_names: list[str] = []
+    canonical_scene_durations: list[str] = []
     for index, scene in enumerate(scenes_data):
         if not isinstance(scene, dict):
             raise FCPMCPError(
@@ -6434,9 +6697,11 @@ def puppet_multi_scene(
                 ErrorCode.INVALID_ARGUMENTS,
                 f"scenes_json[{index}].duration must be a string",
             )
-        _parse_positive_time(
-            scene_duration,
-            f"scenes_json[{index}].duration",
+        canonical_scene_durations.append(
+            _parse_positive_time(
+                scene_duration,
+                f"scenes_json[{index}].duration",
+            ).to_fcpxml()
         )
         preset = scene.get("preset", "idle")
         if not isinstance(preset, str) or preset not in supported_presets:
@@ -6492,6 +6757,10 @@ def puppet_multi_scene(
             ErrorCode.INVALID_ARGUMENTS,
             "Scene names resolve to duplicate output destinations",
         )
+    _preflight_scene_destination_aliases(
+        out_dir,
+        scene_destinations,
+    )
 
     prepared_scenes: list[
         tuple[
@@ -6506,7 +6775,7 @@ def puppet_multi_scene(
     for i, scene in enumerate(scenes_data):
         raw_scene_name = scene.get("name", f"scene_{i+1}")
         scene_name = normalized_scene_names[i]
-        scene_duration = scene.get("duration", "300300/30000s")
+        scene_duration = canonical_scene_durations[i]
         scene_preset = scene.get("preset", "idle")
         scene_cycles = scene.get("cycles", 3)
         scene_intensity = scene.get("intensity", 1.0)

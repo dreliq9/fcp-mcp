@@ -179,16 +179,12 @@ class MediaArtifactResult(BaseModel):
 
     @model_validator(mode="after")
     def artifact_type_matches_operation(self) -> Self:
-        expected_prefix = {
-            "extract_thumbnail": "image/",
-            "extract_audio": "audio/",
-            "audio_to_midi": "audio/midi",
+        expected_types = {
+            "extract_thumbnail": {"image/jpeg", "image/png"},
+            "extract_audio": {"audio/wav", "audio/mpeg", "audio/flac"},
+            "audio_to_midi": {"audio/midi"},
         }[self.operation]
-        if (
-            self.artifact.media_type != expected_prefix
-            if self.operation == "audio_to_midi"
-            else not self.artifact.media_type.startswith(expected_prefix)
-        ):
+        if self.artifact.media_type not in expected_types:
             raise ValueError(
                 "artifact media_type must match the requested operation"
             )
@@ -213,7 +209,7 @@ class MediaArtifactListResult(BaseModel):
         if self.requested_count <= 0:
             raise ValueError("requested_count must be positive")
         if any(
-            not artifact.media_type.startswith("image/")
+            artifact.media_type not in {"image/jpeg", "image/png"}
             for artifact in self.artifacts
         ):
             raise ValueError(

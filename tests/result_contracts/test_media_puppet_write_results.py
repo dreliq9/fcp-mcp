@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import importlib
 import json
@@ -16,6 +17,7 @@ from pydantic import ValidationError
 
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
+from fcp_mcp.contracts import FCPMCPError
 from fcp_mcp.security.paths import PathPolicy
 
 WRITE_CASES = (
@@ -32,22 +34,58 @@ WRITE_CASES = (
 )
 
 FCPXML_MEDIA_TYPE = "application/vnd.apple.fcpxml+xml"
-JPEG_BYTES = (
-    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00"
-    b"\x00\x01\x00\x01\x00\x00\xff\xd9"
+JPEG_BYTES = base64.b64decode(
+    "/9j/4AAQSkZJRgABAgAAAQABAAD//gAQTGF2YzYyLjI4LjEwMAD/2wBDAAgEBAQE"
+    "BAUFBQUFBQYGBgYGBgYGBgYGBgYHBwcICAgHBwcGBgcHCAgICAkJCQgICAgJCQoK"
+    "CgwMCwsODg4RERT/xABMAAEBAAAAAAAAAAAAAAAAAAAABgEBAQAAAAAAAAAAAAAA"
+    "AAAABgcQAQAAAAAAAAAAAAAAAAAAAAARAQAAAAAAAAAAAAAAAAAAAAD/wAARCAAC"
+    "AAIDASIAAhEAAxEA/9oADAMBAAIRAxEAPwCLAE1/f//Z"
 )
-FLAC_BYTES = b"fLaC\x80\x00\x00\x22" + (b"\x00" * 34)
+PNG_BYTES = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAACXBIWXMAAAABAAAA"
+    "AQBPJcTWAAAAEElEQVR4nGP8wwACLGCSAQANBAECv1AVswAAAABJRU5ErkJggg=="
+)
+FLAC_BYTES = base64.b64decode(
+    "ZkxhQwAAACICQAJAAAAAAASVAfQA8AAAAAAAAAAAAAAAAAAAAAAAAAAAhAAALg0A"
+    "AABMYXZmNjIuMTIuMTAwAQAAABUAAABlbmNvZGVyPUxhdmY2Mi4xMi4xMDD/+GQI"
+    "AE8JTgAABWsKMg3FD7YPzQ4FCpTlmJO/JGtbXhj3jqRBkn77gI6TffVzFBQs4ace"
+    "tz6Lr5N1u+UFHChZ57mLqrkyL7PZ4UIEDDxBDFUVyrJlNWNFmChQkQ8lnYAQIg=="
+)
+_WAV_SAMPLES = b"\x00\x00\x20\x03\xe0\xfc\x00\x00"
 WAV_BYTES = (
-    b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00"
-    b"\x01\x00\x01\x00\x44\xac\x00\x00\x88\x58\x01\x00"
-    b"\x02\x00\x10\x00data\x00\x00\x00\x00"
+    b"RIFF"
+    + (36 + len(_WAV_SAMPLES)).to_bytes(4, "little")
+    + b"WAVEfmt \x10\x00\x00\x00"
+    + b"\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00"
+    + b"\x02\x00\x10\x00data"
+    + len(_WAV_SAMPLES).to_bytes(4, "little")
+    + _WAV_SAMPLES
+)
+MP3_BYTES = base64.b64decode(
+    "/+MoxAAdMKqIX08AAAubclAAfv379+/f3vSA8ePHjylLv379+/34bJBL+F+A7gLYEMMM463o"
+    "8ePAQrB8/lDnygf6PfrBw5iAH31g4GMgD76wIc0A/yju/B8HAQBAEAQB8HwfB8CAgCAIBgHw"
+    "fB+UBAMb//B8HwICAIAg4Dg+D76gQcAB/f+eHNRqGpTYxzfy/+MoxA4g+Z6g8ZlIAFMZlupT"
+    "DMqf6MWM6m4ZiTlLmfU9hgcFLE6z5KREf5fIADBQIhDIpWRIm1GCdvQGDTUlkRCKRSsiIlUM"
+    "12yRjIQISXFUJCs0rUpXGNSlBufnPYZ7lJFEJAqEwVEQVBVRQMHy5+oeIjyhKd/KOl9FYiqJ"
+    "f//16tYB4ATEoSj72VtZrXDo/+MoxA0ZgP4gFcwYAMj5KCIAJsOIERFUphCBsDYxiaMj65JA"
+    "FABVDiDVSdCUqSiSqSmJit5o6PiDATVSDAQCBo8CobBUYeBUeCrhEe4NKDv4lnfxF/o/xF//"
+    "8Gr6j3EvWdK/z3+dTEFNRTMuMTAwqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq"
 )
 MIDI_BYTES = (
     b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
-    b"MTrk\x00\x00\x00\x04\x00\xff\x2f\x00"
+    b"MTrk\x00\x00\x00\x0c"
+    b"\x00\x90\x3c\x40\x60\x80\x3c\x40\x00\xff\x2f\x00"
 )
 QUICKTIME_BYTES = b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  "
 MP4_BYTES = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42"
+
+DECODABLE_MEDIA_BYTES = {
+    JPEG_BYTES,
+    PNG_BYTES,
+    FLAC_BYTES,
+    WAV_BYTES,
+    MP3_BYTES,
+}
 
 
 def _sha256(path: Path) -> str:
@@ -115,6 +153,35 @@ def _install_checked_media_runner(
         if len(argv) == 2 and argv[1] == "-version":
             return CompletedProcess(argv, 0, "ffmpeg version contract\n", "")
 
+        if "-abort_on" in argv:
+            source = Path(argv[argv.index("-i") + 1])
+            media_type = server._detected_media_type(source)
+            stream_map = (
+                "0:v:0"
+                if media_type in {"image/jpeg", "image/png"}
+                else "0:a:0"
+            )
+            assert argv == [
+                argv[0],
+                "-v",
+                "error",
+                "-xerror",
+                "-err_detect",
+                "explode",
+                "-i",
+                str(source),
+                "-map",
+                stream_map,
+                "-abort_on",
+                "empty_output",
+                "-f",
+                "null",
+                "-",
+            ]
+            if source.read_bytes() in DECODABLE_MEDIA_BYTES:
+                return CompletedProcess(argv, 0, "", "")
+            return CompletedProcess(argv, 1, "", "strict decode failed")
+
         destination = Path(argv[-1])
         if "-vframes" in argv:
             assert argv[1:2] == ["-y"]
@@ -163,6 +230,15 @@ def _install_checked_media_runner(
                     "pcm_s16le",
                     str(destination),
                 ]
+            elif destination.suffix == ".mp3":
+                assert argv[-6:] == [
+                    "-vn",
+                    "-c:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "2",
+                    str(destination),
+                ]
             else:
                 raise AssertionError(
                     f"unexpected audio command: {argv!r}"
@@ -178,7 +254,11 @@ def _install_checked_media_runner(
                 destination.write_bytes(
                     audio_bytes
                     if audio_bytes is not None
-                    else (FLAC_BYTES if destination.suffix == ".flac" else WAV_BYTES)
+                    else {
+                        ".flac": FLAC_BYTES,
+                        ".mp3": MP3_BYTES,
+                        ".wav": WAV_BYTES,
+                    }[destination.suffix]
                 )
             return CompletedProcess(argv, 0, "", "")
 
@@ -286,7 +366,7 @@ async def test_media_thumbnail_result_binds_real_bytes_and_exact_text(
         "source": _artifact(source, "video/quicktime"),
         "artifact": _artifact(destination, "image/jpeg"),
     }
-    assert len(commands) == 2
+    assert len(commands) == 4
 
 
 @pytest.mark.asyncio
@@ -507,6 +587,159 @@ async def test_empty_media_source_reaches_prior_command_failure(
         )
 
     assert any("-vframes" in command for command in commands)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "header_only"),
+    (
+        pytest.param(".jpg", b"\xff\xd8\xff\xd9", id="jpeg"),
+        pytest.param(".png", b"\x89PNG\r\n\x1a\n", id="png"),
+        pytest.param(".wav", b"RIFF\x04\x00\x00\x00WAVE", id="wav"),
+        pytest.param(".mp3", b"ID3", id="mp3"),
+        pytest.param(".flac", b"fLaC", id="flac"),
+        pytest.param(
+            ".mid",
+            b"MThd\x00\x00\x00\x06",
+            id="midi",
+        ),
+    ),
+)
+def test_media_boundary_rejects_header_only_artifacts(
+    suffix: str,
+    header_only: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_checked_media_runner(monkeypatch)
+    artifact = tmp_path / f"header-only{suffix}"
+    artifact.write_bytes(header_only)
+
+    with pytest.raises(FCPMCPError, match="validation_failed"):
+        server._media_artifact_reference(artifact)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "corrupt_bytes"),
+    (
+        pytest.param(
+            ".jpg",
+            (
+                b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00"
+                b"\x00\x01\x00\x01\x00\x00\xff\xd9"
+            ),
+            id="corrupt-jpeg-segments",
+        ),
+        pytest.param(
+            ".flac",
+            b"fLaC\x80\x00\x00\x22" + (b"\x00" * 34),
+            id="metadata-only-flac",
+        ),
+        pytest.param(
+            ".mid",
+            (
+                b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
+                b"MTrk\x00\x00\x00\x04\x00\xff"
+            ),
+            id="truncated-midi-track",
+        ),
+        pytest.param(
+            ".mid",
+            (
+                b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
+                b"MTrk\x00\x00\x00\x04\x00\x90\x3c\x40"
+            ),
+            id="midi-missing-end-of-track",
+        ),
+        pytest.param(
+            ".mid",
+            (
+                b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
+                b"MTrk\x00\x00\x00\x08"
+                b"\x81\x80\x80\x80\x00\x90\x3c\x40"
+            ),
+            id="midi-oversized-vlq",
+        ),
+        pytest.param(
+            ".mid",
+            (
+                b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
+                b"MTrk\x00\x00\x00\x05\x00\xff\x01\x05\xaa"
+            ),
+            id="midi-truncated-meta",
+        ),
+        pytest.param(
+            ".mid",
+            (
+                b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
+                b"MTrk\x00\x00\x00\x04\x00\xf0\x05\x01"
+            ),
+            id="midi-truncated-sysex",
+        ),
+        pytest.param(
+            ".mid",
+            (
+                b"MThd\x00\x00\x00\x07\x00\x00\x00\x01\x00\x60\x00"
+                b"MTrk\x00\x00\x00\x04\x00\xff\x2f\x00"
+            ),
+            id="midi-nonstandard-header-length",
+        ),
+    ),
+)
+def test_media_boundary_rejects_plausible_but_corrupt_artifacts(
+    suffix: str,
+    corrupt_bytes: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_checked_media_runner(monkeypatch)
+    artifact = tmp_path / f"corrupt{suffix}"
+    artifact.write_bytes(corrupt_bytes)
+
+    with pytest.raises(FCPMCPError, match="validation_failed"):
+        server._media_artifact_reference(artifact)
+
+
+@pytest.mark.parametrize(
+    ("suffix", "valid_bytes", "media_type"),
+    (
+        (".jpg", JPEG_BYTES, "image/jpeg"),
+        (".png", PNG_BYTES, "image/png"),
+        (".wav", WAV_BYTES, "audio/wav"),
+        (".mp3", MP3_BYTES, "audio/mpeg"),
+        (".flac", FLAC_BYTES, "audio/flac"),
+        (".mid", MIDI_BYTES, "audio/midi"),
+    ),
+)
+def test_media_boundary_accepts_complete_decodable_artifacts(
+    suffix: str,
+    valid_bytes: bytes,
+    media_type: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_checked_media_runner(monkeypatch)
+    artifact = tmp_path / f"valid{suffix}"
+    artifact.write_bytes(valid_bytes)
+
+    assert server._media_artifact_reference(artifact).model_dump() == (
+        _artifact(artifact, media_type)
+    )
+
+
+def test_media_boundary_accepts_valid_midi_running_status(
+    tmp_path: Path,
+) -> None:
+    artifact = tmp_path / "running-status.mid"
+    artifact.write_bytes(
+        b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
+        b"MTrk\x00\x00\x00\x0f"
+        b"\x00\x90\x3c\x40"
+        b"\x60\x3e\x40"
+        b"\x60\x80\x3c\x40"
+        b"\x00\xff\x2f\x00"
+    )
+
+    assert server._media_artifact_reference(artifact).media_type == "audio/midi"
 
 
 @pytest.mark.asyncio
@@ -800,6 +1033,122 @@ async def test_puppet_build_rejects_nonpositive_duration_before_commit(
     assert destination.read_bytes() == prior_bytes
 
 
+def _assert_expected_transaction_residue(
+    destination: Path,
+    *,
+    backup_path: str | None,
+) -> None:
+    assert list(destination.parent.glob(f".{destination.name}.*.tmp")) == []
+    backups = list(destination.parent.glob(f"{destination.name}.bak.*"))
+    if backup_path is None:
+        assert backups == []
+    else:
+        assert backups == [Path(backup_path)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_duration", "preexisting"),
+    (
+        pytest.param("+1s", False, id="plus-new"),
+        pytest.param(" 1s ", True, id="whitespace-overwrite"),
+    ),
+)
+async def test_puppet_build_canonicalizes_accepted_duration_without_text_drift(
+    raw_duration: str,
+    preexisting: bool,
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    destination = tmp_path / "canonical-duration.fcpxml"
+    if preexisting:
+        destination.write_bytes(b"prior destination")
+
+    result = await server.mcp.call_tool(
+        "puppet_build_scene",
+        {
+            "rigs_json": _rig_json(images),
+            "duration": raw_duration,
+            "project_name": "Canonical Duration",
+            "output_path": str(destination),
+        },
+    )
+
+    assert result.content[0].text == (
+        "{\n"
+        f'  "file": "{destination}",\n'
+        '  "rigs": 1,\n'
+        '  "total_parts": 3,\n'
+        f'  "duration": "{raw_duration}",\n'
+        '  "status": "scene_built"\n'
+        "}"
+    )
+    assert result.structuredContent["duration"] == "1s"
+    assert ET.parse(destination).find(".//sequence").get("duration") == "1s"
+    _assert_expected_transaction_residue(
+        destination,
+        backup_path=result.structuredContent["receipt"]["backup_path"],
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preexisting", (False, True), ids=("new", "overwrite"))
+async def test_puppet_animate_canonicalizes_duration_and_keyframe_times(
+    preexisting: bool,
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    destination = tmp_path / "canonical-keyframes.fcpxml"
+    if preexisting:
+        destination.write_bytes(b"prior destination")
+    animations = json.dumps(
+        [
+            {
+                "part": "head",
+                "property": "rotation",
+                "keyframes": [
+                    {"time": "+0s", "value": 0.0, "interp": "linear"},
+                    {"time": " 1s ", "value": 15.0, "interp": "smooth2"},
+                ],
+            }
+        ]
+    )
+
+    result = await server.mcp.call_tool(
+        "puppet_animate",
+        {
+            "rigs_json": _rig_json(images),
+            "animations_json": animations,
+            "duration": " +2s ",
+            "project_name": "Canonical Keyframes",
+            "output_path": str(destination),
+        },
+    )
+
+    assert result.content[0].text == (
+        "{\n"
+        f'  "file": "{destination}",\n'
+        '  "rigs": 1,\n'
+        '  "animations": 1,\n'
+        '  "duration": " +2s ",\n'
+        '  "status": "animated_scene_built"\n'
+        "}"
+    )
+    assert result.structuredContent["duration"] == "2s"
+    assert [
+        keyframe["time"]
+        for keyframe in result.structuredContent["animations"][0]["keyframes"]
+    ] == ["0s", "1s"]
+    assert [
+        keyframe.get("time")
+        for keyframe in ET.parse(destination).findall(".//param/keyframe")
+    ] == ["0s", "1s"]
+    _assert_expected_transaction_residue(
+        destination,
+        backup_path=result.structuredContent["receipt"]["backup_path"],
+    )
+
+
 @pytest.mark.asyncio
 async def test_puppet_preset_uses_generated_service_animations_and_receipt(
     tmp_path: Path,
@@ -836,6 +1185,40 @@ async def test_puppet_preset_uses_generated_service_animations_and_receipt(
     assert result.structuredContent["animations"][0]["part_name"] == "body"
     assert result.structuredContent["animations"][0]["property_name"] == "position"
     _assert_receipt(result.structuredContent, destination)
+
+
+@pytest.mark.asyncio
+async def test_puppet_preset_canonicalizes_duration_without_text_drift(
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    destination = tmp_path / "canonical-preset.fcpxml"
+
+    result = await server.mcp.call_tool(
+        "puppet_preset_motion",
+        {
+            "rig_json": _rig_json(images),
+            "preset": "bounce",
+            "duration": "+2s",
+            "project_name": "Canonical Preset",
+            "output_path": str(destination),
+        },
+    )
+
+    assert result.content[0].text == (
+        "{\n"
+        f'  "file": "{destination}",\n'
+        '  "preset": "bounce",\n'
+        '  "animations_applied": 1,\n'
+        '  "parts_animated": [\n'
+        '    "body"\n'
+        "  ],\n"
+        '  "duration": "+2s",\n'
+        '  "status": "preset_applied"\n'
+        "}"
+    )
+    assert result.structuredContent["duration"] == "2s"
+    assert ET.parse(destination).find(".//sequence").get("duration") == "2s"
 
 
 @pytest.mark.asyncio
@@ -893,6 +1276,48 @@ async def test_puppet_multi_scene_has_one_verified_artifact_per_scene(
 
 
 @pytest.mark.asyncio
+async def test_puppet_multi_scene_canonicalizes_accepted_duration(
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    destination = tmp_path / "Contract_intro.fcpxml"
+
+    result = await server.mcp.call_tool(
+        "puppet_multi_scene",
+        {
+            "rigs_json": _rig_json(images),
+            "scenes_json": json.dumps(
+                [
+                    {
+                        "name": "intro",
+                        "duration": " 2s ",
+                        "preset": "idle",
+                    }
+                ]
+            ),
+            "project_name": "Contract",
+            "output_path": str(tmp_path),
+        },
+    )
+
+    assert result.content[0].text == (
+        "{\n"
+        '  "scenes_created": 1,\n'
+        '  "files": [\n'
+        "    {\n"
+        '      "scene": "intro",\n'
+        f'      "file": "{destination}",\n'
+        '      "preset": "idle"\n'
+        "    }\n"
+        "  ],\n"
+        '  "status": "multi_scene_built"\n'
+        "}"
+    )
+    assert result.structuredContent["artifacts"][0]["duration"] == "2s"
+    assert ET.parse(destination).find(".//sequence").get("duration") == "2s"
+
+
+@pytest.mark.asyncio
 async def test_multi_scene_rejects_duplicate_normalized_destinations_prewrite(
     tmp_path: Path,
 ) -> None:
@@ -916,6 +1341,74 @@ async def test_multi_scene_rejects_duplicate_normalized_destinations_prewrite(
         )
 
     assert list(tmp_path.glob("Contract_*.fcpxml")) == []
+
+
+def _filesystem_aliases(
+    directory: Path,
+    first_name: str,
+    second_name: str,
+) -> bool:
+    probe = directory / ".test-filesystem-aliases"
+    probe.mkdir()
+    try:
+        with (probe / first_name).open("xb"):
+            pass
+        try:
+            with (probe / second_name).open("xb"):
+                pass
+        except FileExistsError:
+            return True
+        return False
+    finally:
+        for child in probe.iterdir():
+            child.unlink()
+        probe.rmdir()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scene_names",
+    (
+        pytest.param(("Same", "same"), id="case-alias"),
+        pytest.param(("caf\u00e9", "cafe\u0301"), id="unicode-alias"),
+    ),
+)
+async def test_multi_scene_uses_destination_filesystem_alias_semantics(
+    scene_names: tuple[str, str],
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    basenames = tuple(
+        f"Contract_{scene_name}.fcpxml"
+        for scene_name in scene_names
+    )
+    aliases = _filesystem_aliases(tmp_path, *basenames)
+    arguments = {
+        "rigs_json": _rig_json(images),
+        "scenes_json": json.dumps(
+            [
+                {"name": scene_name, "duration": "1s", "preset": "idle"}
+                for scene_name in scene_names
+            ]
+        ),
+        "project_name": "Contract",
+        "output_path": str(tmp_path),
+    }
+
+    if aliases:
+        with pytest.raises(ToolError, match="duplicate"):
+            await server.mcp.call_tool("puppet_multi_scene", arguments)
+        assert list(tmp_path.glob("Contract_*.fcpxml")) == []
+    else:
+        result = await server.mcp.call_tool(
+            "puppet_multi_scene",
+            arguments,
+        )
+        assert result.structuredContent["scene_count"] == 2
+        assert all((tmp_path / basename).is_file() for basename in basenames)
+
+    assert list(tmp_path.glob(".puppet-scene-probe-*")) == []
+    assert list(tmp_path.glob("*.bak.*")) == []
 
 
 @pytest.mark.asyncio
@@ -1205,6 +1698,38 @@ def test_media_artifact_models_bind_operation_to_artifact_type() -> None:
                 )
             ],
         )
+    for unsupported_image_type in ("image/gif", "image/tiff"):
+        with pytest.raises(ValidationError):
+            models.MediaArtifactResult(
+                operation="extract_thumbnail",
+                source=source,
+                artifact=_artifact_payload(
+                    "/tmp/unsupported-image",
+                    media_type=unsupported_image_type,
+                ),
+            )
+        with pytest.raises(ValidationError):
+            models.MediaArtifactListResult(
+                operation="extract_thumbnails",
+                source=source,
+                requested_count=1,
+                artifacts=[
+                    _artifact_payload(
+                        "/tmp/unsupported-image",
+                        media_type=unsupported_image_type,
+                    )
+                ],
+            )
+    for unsupported_audio_type in ("audio/midi", "audio/ogg"):
+        with pytest.raises(ValidationError):
+            models.MediaArtifactResult(
+                operation="extract_audio",
+                source=source,
+                artifact=_artifact_payload(
+                    "/tmp/unsupported-audio",
+                    media_type=unsupported_audio_type,
+                ),
+            )
 
 
 def test_puppet_build_model_accepts_operation_and_binds_invariants() -> None:
@@ -1313,6 +1838,74 @@ def test_puppet_multi_scene_model_binds_operation_and_artifacts() -> None:
 
     with pytest.raises(ValidationError):
         models.PuppetMultiSceneResult(scene_count=0, artifacts=[])
+
+
+@pytest.mark.parametrize(
+    ("rigs", "animation"),
+    (
+        pytest.param(
+            [_rig_payload()],
+            {**_rotation_animation_payload(), "rig_name": "ghost"},
+            id="missing-rig",
+        ),
+        pytest.param(
+            [_rig_payload()],
+            {**_rotation_animation_payload(), "part_name": "body"},
+            id="missing-part",
+        ),
+        pytest.param(
+            [_rig_payload(), _rig_payload()],
+            _rotation_animation_payload(),
+            id="duplicate-rig-identity",
+        ),
+        pytest.param(
+            [
+                {
+                    **_rig_payload(),
+                    "parts": [
+                        _rig_payload()["parts"][0],
+                        _rig_payload()["parts"][0],
+                    ],
+                }
+            ],
+            _rotation_animation_payload(),
+            id="duplicate-part-identity",
+        ),
+    ),
+)
+def test_puppet_write_models_bind_animations_to_unambiguous_rig_parts(
+    rigs: list[dict[str, object]],
+    animation: dict[str, object],
+) -> None:
+    models = importlib.import_module("fcp_mcp.result_models.puppet")
+    build_payload = {
+        "operation": "animate",
+        "project": "Contract",
+        "rigs": rigs,
+        "animations": [animation],
+        "duration": "2s",
+        "destination": _artifact_payload(),
+        "receipt": _receipt_payload(),
+    }
+    with pytest.raises(ValidationError):
+        models.PuppetBuildResult(**build_payload)
+
+    scene_payload = {
+        "operation": "multi_scene",
+        "scene": "intro",
+        "preset": "idle",
+        "project": "Contract_intro",
+        "rigs": rigs,
+        "animations": [animation],
+        "duration": "2s",
+        "destination": _artifact_payload(),
+        "receipt": _receipt_payload(),
+    }
+    with pytest.raises(ValidationError):
+        models.PuppetMultiSceneResult(
+            scene_count=1,
+            artifacts=[scene_payload],
+        )
 
 
 def test_task9_models_are_frozen_strict_forbid_extra_and_use_no_any() -> None:

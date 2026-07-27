@@ -53,6 +53,31 @@ def _write_evidence_is_consistent(
         raise ValueError("receipt elapsed_ms must be nonnegative")
 
 
+def _animation_targets_are_unambiguous(
+    rigs: list[PuppetRigRecord],
+    animations: list[PuppetAnimationRecord],
+) -> None:
+    rig_parts: dict[str, set[str]] = {}
+    for rig in rigs:
+        if rig.name in rig_parts:
+            raise ValueError("rig identities must be unique")
+        part_names = [part.name for part in rig.parts]
+        if len(set(part_names)) != len(part_names):
+            raise ValueError(
+                f"part identities in rig '{rig.name}' must be unique"
+            )
+        rig_parts[rig.name] = set(part_names)
+    for animation in animations:
+        if animation.rig_name not in rig_parts:
+            raise ValueError(
+                "animation rig_name must identify a declared rig"
+            )
+        if animation.part_name not in rig_parts[animation.rig_name]:
+            raise ValueError(
+                "animation part_name must identify a part in its rig"
+            )
+
+
 class PuppetPresetParameterRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -165,6 +190,7 @@ class PuppetBuildResult(BaseModel):
             raise ValueError(
                 "animation operations must report animation evidence"
             )
+        _animation_targets_are_unambiguous(self.rigs, self.animations)
         _write_evidence_is_consistent(self.destination, self.receipt)
         return self
 
@@ -192,6 +218,7 @@ class PuppetSceneArtifactRecord(BaseModel):
 
     @model_validator(mode="after")
     def write_evidence_is_consistent(self) -> Self:
+        _animation_targets_are_unambiguous(self.rigs, self.animations)
         _write_evidence_is_consistent(self.destination, self.receipt)
         return self
 
