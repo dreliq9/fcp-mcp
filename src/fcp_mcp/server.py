@@ -6,7 +6,6 @@ The most capable FCP MCP server: FCPXML engine + live FCP control + media analys
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
@@ -14,6 +13,9 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from .automation import osascript as automation
+from .config import RuntimeConfig
+from .contracts import ErrorCode, FCPMCPError
 from .fcpxml.analysis import (
     analyze_pacing,
     analyze_timeline_stats,
@@ -46,8 +48,8 @@ mcp = FastMCP(
     instructions="Final Cut Pro MCP Server — FCPXML engine + live FCP control + media analysis + puppet animation. 89 tools across 11 categories.",
 )
 
-# Default project directory (can be overridden via env var)
-PROJECTS_DIR = Path(os.environ.get("FCP_PROJECTS_DIR", str(Path.home() / "Movies")))
+CONFIG = RuntimeConfig.from_env()
+PROJECTS_DIR = CONFIG.output_dir
 
 _parser = FCPXMLParser()
 _validator = FCPXMLValidator()
@@ -1487,20 +1489,10 @@ def fcp_is_running() -> str:
 @mcp.tool()
 def fcp_get_libraries() -> str:
     """Get all open libraries in Final Cut Pro (requires FCP to be running)."""
-    script = """
-    var fcp = Application("Final Cut Pro");
-    var libs = fcp.libraries();
-    var result = [];
-    for (var i = 0; i < libs.length; i++) {
-        result.push({
-            name: libs[i].name(),
-            id: libs[i].id(),
-            file: libs[i].file().toString()
-        });
-    }
-    JSON.stringify(result);
-    """
-    return _run_jxa(script)
+    return automation.run_osascript(
+        automation.FCP_LIBRARIES,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1510,25 +1502,11 @@ def fcp_get_events(library_name: str = "") -> str:
     Args:
         library_name: Library name to filter (optional)
     """
-    filter_line = f'if ("{library_name}" && libs[i].name() !== "{library_name}") continue;' if library_name else ""
-    script = f"""
-    var fcp = Application("Final Cut Pro");
-    var libs = fcp.libraries();
-    var result = [];
-    for (var i = 0; i < libs.length; i++) {{
-        {filter_line}
-        var events = libs[i].events();
-        for (var j = 0; j < events.length; j++) {{
-            result.push({{
-                library: libs[i].name(),
-                name: events[j].name(),
-                id: events[j].id()
-            }});
-        }}
-    }}
-    JSON.stringify(result);
-    """
-    return _run_jxa(script)
+    return automation.run_osascript(
+        automation.FCP_EVENTS,
+        [library_name],
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1538,83 +1516,29 @@ def fcp_get_projects(event_name: str = "") -> str:
     Args:
         event_name: Event name to filter (optional)
     """
-    filter_line = f'if ("{event_name}" && events[j].name() !== "{event_name}") continue;' if event_name else ""
-    script = f"""
-    var fcp = Application("Final Cut Pro");
-    var libs = fcp.libraries();
-    var result = [];
-    for (var i = 0; i < libs.length; i++) {{
-        var events = libs[i].events();
-        for (var j = 0; j < events.length; j++) {{
-            {filter_line}
-            var projects = events[j].projects();
-            for (var k = 0; k < projects.length; k++) {{
-                var seq = projects[k].sequence();
-                result.push({{
-                    library: libs[i].name(),
-                    event: events[j].name(),
-                    name: projects[k].name(),
-                    id: projects[k].id(),
-                    duration: seq ? seq.duration().toString() : "unknown"
-                }});
-            }}
-        }}
-    }}
-    JSON.stringify(result);
-    """
-    return _run_jxa(script)
+    return automation.run_osascript(
+        automation.FCP_PROJECTS,
+        [event_name],
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
 def fcp_get_timeline_info() -> str:
     """Get info about the current/first timeline in FCP."""
-    script = """
-    var fcp = Application("Final Cut Pro");
-    var libs = fcp.libraries();
-    if (libs.length === 0) { JSON.stringify({error: "No libraries open"}); }
-    else {
-        var events = libs[0].events();
-        if (events.length === 0) { JSON.stringify({error: "No events"}); }
-        else {
-            var projects = events[0].projects();
-            if (projects.length === 0) { JSON.stringify({error: "No projects"}); }
-            else {
-                var p = projects[0];
-                var seq = p.sequence();
-                JSON.stringify({
-                    library: libs[0].name(),
-                    event: events[0].name(),
-                    project: p.name(),
-                    duration: seq ? {
-                        value: seq.duration().value,
-                        timescale: seq.duration().timescale
-                    } : null,
-                    frameDuration: seq ? {
-                        value: seq.frameDuration().value,
-                        timescale: seq.frameDuration().timescale
-                    } : null,
-                    tcFormat: seq ? seq.timecodeFormat() : null
-                });
-            }
-        }
-    }
-    """
-    return _run_jxa(script)
+    return automation.run_osascript(
+        automation.FCP_TIMELINE_INFO,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
 def fcp_get_app_state() -> str:
     """Get FCP application state — version, frontmost status."""
-    script = """
-    var fcp = Application("Final Cut Pro");
-    JSON.stringify({
-        name: fcp.name(),
-        version: fcp.version(),
-        frontmost: fcp.frontmost(),
-        libraryCount: fcp.libraries().length
-    });
-    """
-    return _run_jxa(script)
+    return automation.run_osascript(
+        automation.FCP_APP_STATE,
+        config=CONFIG,
+    )
 
 
 # ============================================================================
@@ -1628,14 +1552,23 @@ def fcp_open_library(library_path: str) -> str:
     Args:
         library_path: Path to .fcpbundle file
     """
-    path = Path(library_path).resolve()
+    automation.require_live_control(CONFIG)
+    path = Path(library_path).expanduser().resolve()
     if not path.exists():
-        return f"Library not found: {path}"
+        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"Library not found: {path}")
     try:
         subprocess.run(["open", str(path)], check=True, timeout=10)
         return f"Opening library: {path}"
-    except Exception as e:
-        return f"Error: {e}"
+    except subprocess.TimeoutExpired as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "Timed out while opening the FCP library",
+        ) from error
+    except (subprocess.CalledProcessError, OSError) as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"Could not open the FCP library: {error}",
+        ) from error
 
 
 @mcp.tool()
@@ -1645,29 +1578,33 @@ def fcp_import_xml(fcpxml_path: str) -> str:
     Args:
         fcpxml_path: Path to .fcpxml file
     """
-    path = Path(fcpxml_path).resolve()
+    automation.require_live_control(CONFIG)
+    path = Path(fcpxml_path).expanduser().resolve()
     if not path.exists():
-        return f"FCPXML file not found: {path}"
+        raise FCPMCPError(ErrorCode.SOURCE_NOT_FOUND, f"FCPXML file not found: {path}")
     try:
         subprocess.run(["open", "-a", "Final Cut Pro", str(path)], check=True, timeout=10)
         return f"Importing FCPXML: {path}"
-    except Exception as e:
-        return f"Error: {e}"
+    except subprocess.TimeoutExpired as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            "Timed out while importing FCPXML",
+        ) from error
+    except (subprocess.CalledProcessError, OSError) as error:
+        raise FCPMCPError(
+            ErrorCode.COMMAND_FAILED,
+            f"Could not import FCPXML: {error}",
+        ) from error
 
 
 @mcp.tool()
 def fcp_export_xml() -> str:
     """Trigger XML export in FCP via menu automation (requires Accessibility permissions)."""
-    return _run_applescript("""
-        tell application "Final Cut Pro" to activate
-        delay 0.5
-        tell application "System Events"
-            tell process "Final Cut Pro"
-                click menu item "Export XML..." of menu "File" of menu bar 1
-            end tell
-        end tell
-        return "Export XML dialog opened"
-    """)
+    return automation.run_osascript(
+        automation.FCP_EXPORT_XML,
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1683,15 +1620,17 @@ def fcp_playback(action: str = "toggle") -> str:
         "stop": "k",
         "pause": "k",
     }
-    key = key_map.get(action, "space")
-    return _run_applescript(f"""
-        tell application "Final Cut Pro" to activate
-        delay 0.3
-        tell application "System Events"
-            keystroke "{key}"
-        end tell
-        return "Playback: {action}"
-    """)
+    if action not in key_map:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Unsupported playback action: {action}",
+        )
+    return automation.run_osascript(
+        automation.FCP_PLAYBACK,
+        [action, key_map[action]],
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1702,24 +1641,16 @@ def fcp_navigate(timecode: str = "") -> str:
         timecode: Timecode to navigate to (e.g., "00:01:30:00"). Opens timecode entry if provided.
     """
     if not timecode:
-        return "No timecode provided"
+        raise FCPMCPError(ErrorCode.INVALID_ARGUMENTS, "No timecode provided")
 
     # Control+P opens the timecode entry field in FCP
     clean_tc = timecode.replace(":", "").replace(";", "")
-    return _run_applescript(f"""
-        tell application "Final Cut Pro" to activate
-        delay 0.3
-        tell application "System Events"
-            tell process "Final Cut Pro"
-                key code 35 using control down
-                delay 0.3
-                keystroke "{clean_tc}"
-                delay 0.1
-                keystroke return
-            end tell
-        end tell
-        return "Navigated to {timecode}"
-    """)
+    return automation.run_osascript(
+        automation.FCP_NAVIGATE,
+        [timecode, clean_tc],
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1733,41 +1664,37 @@ def fcp_select_tool(tool: str = "select") -> str:
         "select": "a", "trim": "t", "position": "p",
         "range": "r", "blade": "b", "zoom": "z", "hand": "h",
     }
-    key = tool_keys.get(tool, "a")
-    return _run_applescript(f"""
-        tell application "Final Cut Pro" to activate
-        delay 0.2
-        tell application "System Events"
-            keystroke "{key}"
-        end tell
-        return "Tool: {tool}"
-    """)
+    if tool not in tool_keys:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Unsupported FCP tool: {tool}",
+        )
+    return automation.run_osascript(
+        automation.FCP_SELECT_TOOL,
+        [tool, tool_keys[tool]],
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
 def fcp_undo() -> str:
     """Undo the last action in FCP."""
-    return _run_applescript("""
-        tell application "Final Cut Pro" to activate
-        delay 0.2
-        tell application "System Events"
-            keystroke "z" using command down
-        end tell
-        return "Undo performed"
-    """)
+    return automation.run_osascript(
+        automation.FCP_UNDO,
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
 def fcp_redo() -> str:
     """Redo the last undone action in FCP."""
-    return _run_applescript("""
-        tell application "Final Cut Pro" to activate
-        delay 0.2
-        tell application "System Events"
-            keystroke "z" using {command down, shift down}
-        end tell
-        return "Redo performed"
-    """)
+    return automation.run_osascript(
+        automation.FCP_REDO,
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1778,28 +1705,18 @@ def fcp_menu_command(menu_path: str) -> str:
         menu_path: Menu path like "File > Export XML..." or "Edit > Select All"
     """
     parts = [p.strip() for p in menu_path.split(">")]
-    if len(parts) < 2:
-        return "Menu path must have at least 2 parts (e.g., 'File > Export XML...')"
-
-    menu_name = parts[0]
-    # Build nested menu item click
-    if len(parts) == 2:
-        click_cmd = f'click menu item "{parts[1]}" of menu "{menu_name}" of menu bar 1'
-    elif len(parts) == 3:
-        click_cmd = f'click menu item "{parts[2]}" of menu 1 of menu item "{parts[1]}" of menu "{menu_name}" of menu bar 1'
-    else:
-        return "Menu paths deeper than 3 levels not supported"
-
-    return _run_applescript(f"""
-        tell application "Final Cut Pro" to activate
-        delay 0.5
-        tell application "System Events"
-            tell process "Final Cut Pro"
-                {click_cmd}
-            end tell
-        end tell
-        return "Executed: {menu_path}"
-    """)
+    if len(parts) not in {2, 3} or any(not part for part in parts):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "Menu path must contain two or three nonempty components",
+        )
+    validated_json = json.dumps(parts, separators=(",", ":"))
+    return automation.run_osascript(
+        automation.FCP_MENU_COMMAND,
+        [validated_json, menu_path, *parts],
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1809,33 +1726,13 @@ def fcp_keyboard_shortcut(keys: str) -> str:
     Args:
         keys: Shortcut description like "cmd+c", "cmd+shift+e", "option+w"
     """
-    parts = keys.lower().split("+")
-    key = parts[-1]
-    modifiers = parts[:-1]
-
-    modifier_map = {
-        "cmd": "command down",
-        "command": "command down",
-        "shift": "shift down",
-        "opt": "option down",
-        "option": "option down",
-        "alt": "option down",
-        "ctrl": "control down",
-        "control": "control down",
-    }
-
-    mod_list = [modifier_map[m] for m in modifiers if m in modifier_map]
-    mod_str = "{" + ", ".join(mod_list) + "}" if mod_list else ""
-    using = f" using {mod_str}" if mod_str else ""
-
-    return _run_applescript(f"""
-        tell application "Final Cut Pro" to activate
-        delay 0.2
-        tell application "System Events"
-            keystroke "{key}"{using}
-        end tell
-        return "Shortcut sent: {keys}"
-    """)
+    key, modifiers = automation.parse_shortcut(keys)
+    return automation.run_osascript(
+        automation.FCP_KEYBOARD_SHORTCUT,
+        [keys, key, *modifiers],
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 # ============================================================================
@@ -1849,28 +1746,12 @@ def fcp_share(destination: str = "") -> str:
     Args:
         destination: Share destination name (opens default if empty)
     """
-    if destination:
-        return _run_applescript(f"""
-            tell application "Final Cut Pro" to activate
-            delay 0.5
-            tell application "System Events"
-                tell process "Final Cut Pro"
-                    click menu item "{destination}" of menu 1 of menu item "Share" of menu "File" of menu bar 1
-                end tell
-            end tell
-            return "Share triggered: {destination}"
-        """)
-    else:
-        return _run_applescript("""
-            tell application "Final Cut Pro" to activate
-            delay 0.5
-            tell application "System Events"
-                tell process "Final Cut Pro"
-                    click menu item "Share" of menu "File" of menu bar 1
-                end tell
-            end tell
-            return "Share menu opened"
-        """)
+    return automation.run_osascript(
+        automation.FCP_SHARE,
+        [destination],
+        timeout=30,
+        config=CONFIG,
+    )
 
 
 @mcp.tool()
@@ -1890,6 +1771,7 @@ def compressor_encode(
     """
     from .utils.paths import compressor_binary
 
+    automation.require_live_control(CONFIG)
     comp = compressor_binary()
     if not comp.exists():
         return f"Compressor not found at {comp}"
@@ -2085,48 +1967,6 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
 
     Path(output_path).write_text(edl_content)
     return f"EDL exported ({edit_num - 1} edits): {output_path}"
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
-
-def _run_jxa(script: str) -> str:
-    """Run a JXA script via osascript."""
-    try:
-        result = subprocess.run(
-            ["osascript", "-l", "JavaScript", "-e", script],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return json.dumps({"error": result.stderr.strip()})
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": "JXA script timed out"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
-
-
-def _run_applescript(script: str) -> str:
-    """Run an AppleScript via osascript."""
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=30,
-        )
-        if result.returncode != 0:
-            error = result.stderr.strip()
-            if "assistive" in error.lower():
-                return json.dumps({
-                    "error": "Accessibility permissions required",
-                    "fix": "System Settings > Privacy & Security > Accessibility > Enable for Terminal/Claude Code",
-                })
-            return json.dumps({"error": error})
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": "AppleScript timed out"})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
 
 
 # ============================================================================
