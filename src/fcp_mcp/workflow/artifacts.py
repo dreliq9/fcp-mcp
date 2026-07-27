@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 import threading
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
@@ -148,7 +149,10 @@ def _windows_attributes_mark_reparse(path: Path) -> bool:
     try:
         import ctypes
 
-        get_attributes = ctypes.windll.kernel32.GetFileAttributesW
+        get_attributes = ctypes.WinDLL(
+            "kernel32",
+            use_last_error=True,
+        ).GetFileAttributesW
         get_attributes.argtypes = [ctypes.c_wchar_p]
         get_attributes.restype = ctypes.c_uint32
         attributes = int(get_attributes(str(path)))
@@ -157,6 +161,82 @@ def _windows_attributes_mark_reparse(path: Path) -> bool:
     invalid_attributes = 0xFFFFFFFF
     return attributes != invalid_attributes and bool(
         attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _attach_cleanup_errors(
+    primary_error: BaseException | None,
+    failures: list[str],
+) -> None:
+    if not failures:
+        return
+    if isinstance(primary_error, FCPMCPError):
+        existing = primary_error.details.setdefault("cleanup_errors", [])
+        if isinstance(existing, list):
+            existing.extend(failures)
+        return
+    if primary_error is not None:
+        primary_error._fcp_cleanup_errors = tuple(failures)
+        return
+    raise _coded(
+        ErrorCode.TRANSACTION_FAILED,
+        "resource cleanup failed",
+        OSError("; ".join(failures)),
+    )
+
+
+def _close_windows_handle_values(
+    handles: list[int],
+    close_handle,
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    failures: list[str] = []
+    for handle in reversed(handles):
+        try:
+            closed = bool(close_handle(handle))
+        except OSError as error:
+            failures.append(f"CloseHandle({handle}) raised: {error}")
+        else:
+            if not closed:
+                failures.append(f"CloseHandle({handle}) returned false")
+    _attach_cleanup_errors(primary_error, failures)
+
+
+def _release_windows_mutex_handle(
+    handle: int,
+    release_mutex,
+    close_handle,
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
+    failures: list[str] = []
+    try:
+        released = bool(release_mutex(handle))
+    except OSError as error:
+        failures.append(f"ReleaseMutex raised: {error}")
+    else:
+        if not released:
+            failures.append("ReleaseMutex returned false")
+    try:
+        closed = bool(close_handle(handle))
+    except OSError as error:
+        failures.append(f"CloseHandle raised: {error}")
+    else:
+        if not closed:
+            failures.append("CloseHandle returned false")
+    _attach_cleanup_errors(primary_error, failures)
+
+
+def _close_windows_handle_after_failure(
+    handle: int,
+    close_handle,
+    primary_error: BaseException,
+) -> None:
+    _close_windows_handle_values(
+        [handle],
+        close_handle,
+        primary_error=primary_error,
     )
 
 
@@ -182,7 +262,7 @@ def _acquire_windows_directory_handles(path: Path) -> list[int]:
                 ("nFileIndexLow", wintypes.DWORD),
             ]
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_file = kernel32.CreateFileW
         create_file.argtypes = [
             wintypes.LPCWSTR,
@@ -240,20 +320,20 @@ def _acquire_windows_directory_handles(path: Path) -> list[int]:
             handle_value = int(handle) if handle is not None else 0
             if handle_value in {0, invalid_handle}:
                 raise OSError(ctypes.get_last_error(), "CreateFileW failed")
+            handles.append(handle_value)
             information = _ByHandleFileInformation()
             if not get_information(handle, ctypes.byref(information)):
-                close_handle(handle)
                 raise OSError(ctypes.get_last_error(), "GetFileInformationByHandle failed")
             if not information.dwFileAttributes & directory_attribute:
-                close_handle(handle)
                 raise OSError(errno.ENOTDIR, "Windows path component is not a directory")
             if information.dwFileAttributes & reparse_attribute:
-                close_handle(handle)
                 raise OSError(errno.ELOOP, "Windows path component is a reparse point")
-            handles.append(handle_value)
     except OSError as error:
-        for handle_value in reversed(handles):
-            close_handle(handle_value)
+        _close_windows_handle_values(
+            handles,
+            close_handle,
+            primary_error=error,
+        )
         raise _coded(
             ErrorCode.ARTIFACT_CORRUPT,
             "cannot hold a safe Windows artifact directory chain",
@@ -262,23 +342,37 @@ def _acquire_windows_directory_handles(path: Path) -> list[int]:
     return handles
 
 
-def _release_windows_handles(handles: list[int]) -> None:
+def _release_windows_handles(
+    handles: list[int],
+    *,
+    primary_error: BaseException | None = None,
+) -> None:
     if os.name != "nt":
         return
     try:
         import ctypes
         from ctypes import wintypes
 
-        close_handle = ctypes.windll.kernel32.CloseHandle
+        close_handle = ctypes.WinDLL(
+            "kernel32",
+            use_last_error=True,
+        ).CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
-        for handle in reversed(handles):
-            close_handle(handle)
+        def checked_close(handle: int) -> bool:
+            if not close_handle(handle):
+                raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+            return True
+
+        _close_windows_handle_values(
+            handles,
+            checked_close,
+            primary_error=primary_error,
+        )
     except (AttributeError, OSError) as error:
-        raise _coded(
-            ErrorCode.ARTIFACT_CORRUPT,
-            "cannot release Windows artifact directory handles",
-            error,
+        _attach_cleanup_errors(
+            primary_error,
+            [f"cannot release Windows artifact directory handles: {error}"],
         )
 
 
@@ -286,10 +380,14 @@ def _release_windows_handles(handles: list[int]) -> None:
 def _windows_directory_guard(path: Path):
     """Prevent rename/reparse swaps while fallback pathname I/O is active."""
     handles = _acquire_windows_directory_handles(path)
+    primary_error: BaseException | None = None
     try:
         yield
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        _release_windows_handles(handles)
+        _release_windows_handles(handles, primary_error=primary_error)
 
 
 @contextmanager
@@ -302,7 +400,7 @@ def _windows_run_mutex(root: Path, run_id: str):
         import ctypes
         from ctypes import wintypes
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_mutex = kernel32.CreateMutexW
         create_mutex.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
         create_mutex.restype = wintypes.HANDLE
@@ -315,6 +413,16 @@ def _windows_run_mutex(root: Path, run_id: str):
         close_handle = kernel32.CloseHandle
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
+        def checked_release(handle: int) -> bool:
+            if not release_mutex(handle):
+                raise OSError(ctypes.get_last_error(), "ReleaseMutex failed")
+            return True
+
+        def checked_close(handle: int) -> bool:
+            if not close_handle(handle):
+                raise OSError(ctypes.get_last_error(), "CloseHandle failed")
+            return True
+
         mutex_name = "Local\\fcp-mcp-artifact-" + hashlib.sha256(
             f"{root}\0{run_id}".encode()
         ).hexdigest()
@@ -323,19 +431,35 @@ def _windows_run_mutex(root: Path, run_id: str):
             raise OSError(ctypes.get_last_error(), "CreateMutexW failed")
         wait_result = wait_for_single_object(handle, 0xFFFFFFFF)
         if wait_result not in {0x00000000, 0x00000080}:
-            close_handle(handle)
-            raise OSError(ctypes.get_last_error(), "WaitForSingleObject failed")
+            wait_error = OSError(
+                ctypes.get_last_error(),
+                "WaitForSingleObject failed",
+            )
+            _close_windows_handle_after_failure(
+                int(handle),
+                checked_close,
+                wait_error,
+            )
+            raise wait_error
     except (AttributeError, OSError) as error:
         raise _coded(
             ErrorCode.TRANSACTION_FAILED,
             "safe Windows artifact serialization is unavailable",
             error,
         )
+    primary_error: BaseException | None = None
     try:
         yield
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        release_mutex(handle)
-        close_handle(handle)
+        _release_windows_mutex_handle(
+            handle,
+            checked_release,
+            checked_close,
+            primary_error=primary_error,
+        )
 
 
 def _fallback_open_file(
@@ -347,7 +471,12 @@ def _fallback_open_file(
 ) -> int:
     """Open a final fallback component itself, never its reparse target."""
     if os.name != "nt":
-        flags = _file_open_flags(write=write) | getattr(os, "O_BINARY", 0)
+        flags = (
+            os.O_RDWR
+            if write
+            else os.O_RDONLY
+        ) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_BINARY", 0)
         if exclusive:
             flags |= os.O_CREAT | os.O_EXCL
         try:
@@ -373,7 +502,7 @@ def _fallback_open_file(
                 ("nFileIndexLow", wintypes.DWORD),
             ]
 
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_file = kernel32.CreateFileW
         create_file.argtypes = [
             wintypes.LPCWSTR,
@@ -395,8 +524,8 @@ def _fallback_open_file(
         close_handle.argtypes = [wintypes.HANDLE]
         close_handle.restype = wintypes.BOOL
 
-        desired_access = 0x40000000 if write else 0x80000000
-        share_mode = 0 if write else 0x00000001
+        desired_access = (0x80000000 | 0x40000000 | 0x00010000) if write else 0x80000000
+        share_mode = (0x00000001 | 0x00000002) if write else 0x00000001
         creation = 1 if exclusive else 3
         attributes = 0x00000080 | 0x00200000
         handle = create_file(
@@ -422,7 +551,7 @@ def _fallback_open_file(
                 ErrorCode.ARTIFACT_CORRUPT,
                 "artifact file is a directory or reparse point",
             )
-        flags = (os.O_WRONLY if write else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
+        flags = (os.O_RDWR if write else os.O_RDONLY) | getattr(os, "O_BINARY", 0)
         try:
             return msvcrt.open_osfhandle(handle_value, flags)
         except OSError:
@@ -436,6 +565,72 @@ def _fallback_open_file(
             "safe Windows artifact file open is unavailable",
             error,
         )
+
+
+def _replace_owned_fallback_file(fd: int, source: Path, target: Path) -> None:
+    """Replace the target with the opened file identity, not a mutable child name."""
+    if os.name != "nt":
+        os.replace(source, target)
+        return
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        file_name = str(target)
+
+        class _FileRenameInformation(ctypes.Structure):
+            _fields_ = [
+                ("ReplaceIfExists", wintypes.BOOLEAN),
+                ("RootDirectory", wintypes.HANDLE),
+                ("FileNameLength", wintypes.DWORD),
+                ("FileName", wintypes.WCHAR * len(file_name)),
+            ]
+
+        information = _FileRenameInformation()
+        information.ReplaceIfExists = True
+        information.RootDirectory = None
+        information.FileNameLength = len(file_name.encode("utf-16-le"))
+        information.FileName = file_name
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        rename = kernel32.SetFileInformationByHandle
+        rename.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+        ]
+        rename.restype = wintypes.BOOL
+        handle = msvcrt.get_osfhandle(fd)
+        if not rename(
+            handle,
+            3,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise OSError(ctypes.get_last_error(), "SetFileInformationByHandle failed")
+    except (AttributeError, OSError) as error:
+        raise _coded(
+            ErrorCode.TRANSACTION_FAILED,
+            "failed to replace target with owned Windows artifact",
+            error,
+        )
+
+
+def _read_opened_payload(fd: int, expected_size: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    total = 0
+    while total <= expected_size:
+        remaining = expected_size + 1 - total
+        if remaining <= 0:
+            break
+        chunk = os.read(fd, min(_READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
 
 
 def _is_link_or_reparse(path: Path, result: os.stat_result) -> bool:
@@ -767,6 +962,11 @@ class StatePaths(BaseModel):
         root = config.state_dir
         if not root.is_absolute():
             raise _coded(ErrorCode.INVALID_CONFIGURATION, "workflow state root must be absolute")
+        if root != Path(os.path.abspath(os.fspath(root))):
+            raise _coded(
+                ErrorCode.INVALID_CONFIGURATION,
+                "workflow state root must be lexically normalized",
+            )
         if os.name == "posix":
             _initialize_posix_state(root)
         else:
@@ -952,9 +1152,17 @@ class ArtifactStore:
 
     @staticmethod
     def _close_posix_run(root_fd: int, artifacts_fd: int, run_fd: int) -> None:
-        os.close(run_fd)
-        os.close(artifacts_fd)
-        os.close(root_fd)
+        failures: list[str] = []
+        for description, fd in (
+            ("run", run_fd),
+            ("artifacts", artifacts_fd),
+            ("root", root_fd),
+        ):
+            try:
+                os.close(fd)
+            except OSError as error:
+                failures.append(f"close {description} fd {fd}: {error}")
+        _attach_cleanup_errors(None, failures)
 
     def _existing_artifact_sizes_posix(self, run_fd: int) -> dict[ArtifactKind, int]:
         sizes: dict[ArtifactKind, int] = {}
@@ -1018,6 +1226,7 @@ class ArtifactStore:
         target_name = _ARTIFACT_NAMES[kind]
         temporary_name: str | None = None
         temporary_fd: int | None = None
+        temporary_owned = False
         replaced = False
         process_locked = False
         try:
@@ -1030,14 +1239,31 @@ class ArtifactStore:
                 kind,
                 len(payload),
             )
-            temporary_name = f".{target_name}.{secrets.token_hex(16)}.tmp"
             flags = (
-                _file_open_flags(write=True)
+                os.O_RDWR
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
                 | os.O_CREAT
                 | os.O_EXCL
                 | getattr(os, "O_BINARY", 0)
             )
-            temporary_fd = os.open(temporary_name, flags, _FILE_MODE, dir_fd=run_fd)
+            collision: OSError | None = None
+            for _ in range(3):
+                temporary_name = f".{target_name}.{secrets.token_hex(16)}.tmp"
+                try:
+                    temporary_fd = os.open(
+                        temporary_name,
+                        flags,
+                        _FILE_MODE,
+                        dir_fd=run_fd,
+                    )
+                except FileExistsError as error:
+                    collision = error
+                    continue
+                temporary_owned = True
+                break
+            if temporary_fd is None:
+                raise collision or OSError(errno.EEXIST, "cannot allocate artifact temp")
             os.fchmod(temporary_fd, _FILE_MODE)
             view = memoryview(payload)
             written = 0
@@ -1055,8 +1281,6 @@ class ArtifactStore:
                 or stat.S_IMODE(result.st_mode) != _FILE_MODE
             ):
                 raise OSError(errno.EIO, "temporary artifact validation failed")
-            os.close(temporary_fd)
-            temporary_fd = None
             os.replace(
                 temporary_name,
                 target_name,
@@ -1064,6 +1288,23 @@ class ArtifactStore:
                 dst_dir_fd=run_fd,
             )
             replaced = True
+            temporary_owned = False
+            opened_result = os.fstat(temporary_fd)
+            current_result = os.stat(
+                target_name,
+                dir_fd=run_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(current_result.st_mode)
+                or _is_reparse_stat(current_result)
+                or not os.path.samestat(opened_result, current_result)
+                or _read_opened_payload(temporary_fd, len(payload)) != payload
+            ):
+                raise _coded(
+                    ErrorCode.ARTIFACT_CORRUPT,
+                    "committed artifact identity or bytes changed during replacement",
+                )
             os.fsync(run_fd)
         except FCPMCPError:
             raise
@@ -1075,36 +1316,60 @@ class ArtifactStore:
                 error,
             )
         finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_failures: list[str] = []
+            cleanup_error: OSError | None = None
+            if (
+                temporary_owned
+                and temporary_name is not None
+                and temporary_fd is not None
+            ):
+                try:
+                    current_result = os.stat(
+                        temporary_name,
+                        dir_fd=run_fd,
+                        follow_symlinks=False,
+                    )
+                    opened_result = os.fstat(temporary_fd)
+                except FileNotFoundError:
+                    cleanup_error = None
+                except OSError as error:
+                    cleanup_error = error
+                else:
+                    if (
+                        not stat.S_ISLNK(current_result.st_mode)
+                        and os.path.samestat(opened_result, current_result)
+                    ):
+                        for _ in range(2):
+                            try:
+                                os.unlink(temporary_name, dir_fd=run_fd)
+                            except FileNotFoundError:
+                                cleanup_error = None
+                                break
+                            except OSError as error:
+                                cleanup_error = error
+                            else:
+                                cleanup_error = None
+                                break
             if temporary_fd is not None:
                 try:
                     os.close(temporary_fd)
-                except OSError:
-                    pass
-            if temporary_name is not None:
-                cleanup_error: OSError | None = None
-                for _ in range(2):
-                    try:
-                        os.unlink(temporary_name, dir_fd=run_fd)
-                    except FileNotFoundError:
-                        cleanup_error = None
-                        break
-                    except OSError as error:
-                        cleanup_error = error
-                    else:
-                        cleanup_error = None
-                        break
-                if cleanup_error is not None:
-                    if process_locked:
-                        fcntl.flock(run_fd, fcntl.LOCK_UN)
-                    self._close_posix_run(root_fd, artifacts_fd, run_fd)
-                    raise _coded(
-                        ErrorCode.TRANSACTION_FAILED,
-                        "failed to clean up private artifact temporary file",
-                        cleanup_error,
-                    )
+                except OSError as error:
+                    cleanup_failures.append(f"close temporary artifact: {error}")
             if process_locked:
-                fcntl.flock(run_fd, fcntl.LOCK_UN)
-            self._close_posix_run(root_fd, artifacts_fd, run_fd)
+                try:
+                    fcntl.flock(run_fd, fcntl.LOCK_UN)
+                except OSError as error:
+                    cleanup_failures.append(f"unlock artifact run: {error}")
+            try:
+                self._close_posix_run(root_fd, artifacts_fd, run_fd)
+            except FCPMCPError as error:
+                cleanup_failures.append(error.message)
+            if cleanup_error is not None:
+                cleanup_failures.append(
+                    f"remove private artifact temporary file: {cleanup_error}"
+                )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
         return self._metadata(run_id, kind, payload)
 
     def _fallback_existing_sizes(
@@ -1183,21 +1448,41 @@ class ArtifactStore:
         )
         self._enforce_aggregate(self._fallback_existing_sizes(run_directory), kind, len(payload))
         target = run_directory / _ARTIFACT_NAMES[kind]
-        temporary = run_directory / f".{target.name}.{secrets.token_hex(16)}.tmp"
+        temporary: Path | None = None
         fd: int | None = None
+        temporary_owned = False
         replaced = False
         try:
-            _validate_fallback_chain(
-                temporary,
-                code=ErrorCode.ARTIFACT_CORRUPT,
-                description="temporary artifact",
-            )
-            fd = _fallback_open_file(
-                temporary,
-                write=True,
-                exclusive=True,
-                failure_code=ErrorCode.TRANSACTION_FAILED,
-            )
+            collision: FCPMCPError | None = None
+            for _ in range(3):
+                temporary = (
+                    run_directory
+                    / f".{target.name}.{secrets.token_hex(16)}.tmp"
+                )
+                _validate_fallback_chain(
+                    temporary,
+                    code=ErrorCode.ARTIFACT_CORRUPT,
+                    description="temporary artifact",
+                )
+                try:
+                    fd = _fallback_open_file(
+                        temporary,
+                        write=True,
+                        exclusive=True,
+                        failure_code=ErrorCode.TRANSACTION_FAILED,
+                    )
+                except FCPMCPError as error:
+                    if isinstance(error.__cause__, FileExistsError):
+                        collision = error
+                        continue
+                    raise
+                temporary_owned = True
+                break
+            if fd is None or temporary is None:
+                raise collision or _coded(
+                    ErrorCode.TRANSACTION_FAILED,
+                    "cannot allocate artifact temporary file",
+                )
             view = memoryview(payload)
             written = 0
             while written < len(view):
@@ -1211,8 +1496,6 @@ class ArtifactStore:
                 raise OSError(errno.EIO, "temporary artifact validation failed")
             if result.st_size != len(payload):
                 raise OSError(errno.EIO, "temporary artifact size mismatch")
-            os.close(fd)
-            fd = None
             _validate_fallback_chain(
                 run_directory,
                 code=ErrorCode.ARTIFACT_CORRUPT,
@@ -1237,8 +1520,9 @@ class ArtifactStore:
                 description="temporary artifact",
                 require_private_mode=False,
             )
-            os.replace(temporary, target)
+            _replace_owned_fallback_file(fd, temporary, target)
             replaced = True
+            temporary_owned = False
             _validate_fallback_chain(
                 target,
                 code=ErrorCode.ARTIFACT_CORRUPT,
@@ -1251,32 +1535,56 @@ class ArtifactStore:
                 description=f"{kind.value} artifact target",
                 require_private_mode=False,
             )
+            opened_result = os.fstat(fd)
+            current_result = target.lstat()
+            if (
+                _is_link_or_reparse(target, current_result)
+                or not os.path.samestat(opened_result, current_result)
+                or _read_opened_payload(fd, len(payload)) != payload
+            ):
+                raise _coded(
+                    ErrorCode.ARTIFACT_CORRUPT,
+                    "committed artifact identity or bytes changed during replacement",
+                )
         except OSError as error:
             action = "commit" if replaced else "write"
             raise _coded(ErrorCode.TRANSACTION_FAILED, f"failed to {action} private artifact", error)
         finally:
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+            primary_error = sys.exc_info()[1]
             cleanup_error: OSError | None = None
-            for _ in range(2):
+            if temporary_owned and temporary is not None and fd is not None:
                 try:
-                    temporary.unlink()
+                    current_result = temporary.lstat()
+                    opened_result = os.fstat(fd)
                 except FileNotFoundError:
                     cleanup_error = None
-                    break
                 except OSError as error:
                     cleanup_error = error
                 else:
-                    cleanup_error = None
-                    break
+                    if (
+                        not _is_link_or_reparse(temporary, current_result)
+                        and os.path.samestat(opened_result, current_result)
+                    ):
+                        for _ in range(2):
+                            try:
+                                temporary.unlink()
+                            except FileNotFoundError:
+                                cleanup_error = None
+                                break
+                            except OSError as error:
+                                cleanup_error = error
+                            else:
+                                cleanup_error = None
+                                break
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError as error:
+                    cleanup_error = cleanup_error or error
             if cleanup_error is not None:
-                raise _coded(
-                    ErrorCode.TRANSACTION_FAILED,
-                    "failed to clean up private artifact temporary file",
-                    cleanup_error,
+                _attach_cleanup_errors(
+                    primary_error,
+                    [f"cleanup private artifact temporary file: {cleanup_error}"],
                 )
         return self._metadata(run_id, kind, payload)
 
@@ -1323,9 +1631,13 @@ class ArtifactStore:
 
     def read(self, metadata: ArtifactMetadataV1) -> bytes:
         run_id, kind = self._validated_metadata(metadata)
-        if os.name == "posix":
-            return self._read_posix(metadata, run_id, kind)
-        return self._read_fallback(metadata, run_id, kind)
+        with (
+            _run_thread_guard(self.paths.root, run_id),
+            _windows_run_mutex(self.paths.root, run_id),
+        ):
+            if os.name == "posix":
+                return self._read_posix(metadata, run_id, kind)
+            return self._read_fallback(metadata, run_id, kind)
 
     def _read_fd(self, fd: int, metadata: ArtifactMetadataV1) -> bytes:
         result = os.fstat(fd)
@@ -1366,14 +1678,35 @@ class ArtifactStore:
         artifacts_fd: int | None = None
         run_fd: int | None = None
         artifact_fd: int | None = None
+        process_locked = False
         try:
+            import fcntl
+
             root_fd, artifacts_fd, run_fd = self._open_posix_run(run_id, create=False)
+            fcntl.flock(run_fd, fcntl.LOCK_SH)
+            process_locked = True
             artifact_fd = os.open(
                 _ARTIFACT_NAMES[kind],
                 _file_open_flags() | getattr(os, "O_BINARY", 0),
                 dir_fd=run_fd,
             )
-            return self._read_fd(artifact_fd, metadata)
+            payload = self._read_fd(artifact_fd, metadata)
+            opened_result = os.fstat(artifact_fd)
+            current_result = os.stat(
+                _ARTIFACT_NAMES[kind],
+                dir_fd=run_fd,
+                follow_symlinks=False,
+            )
+            if (
+                stat.S_ISLNK(current_result.st_mode)
+                or _is_reparse_stat(current_result)
+                or not os.path.samestat(opened_result, current_result)
+            ):
+                raise _coded(
+                    ErrorCode.ARTIFACT_CORRUPT,
+                    "recorded artifact path changed during read",
+                )
+            return payload
         except FCPMCPError as error:
             if error.code is ErrorCode.ARTIFACT_CORRUPT:
                 raise
@@ -1381,10 +1714,24 @@ class ArtifactStore:
         except OSError as error:
             raise _coded(ErrorCode.ARTIFACT_CORRUPT, "recorded artifact cannot be read", error)
         finally:
+            primary_error = sys.exc_info()[1]
+            cleanup_failures: list[str] = []
             if artifact_fd is not None:
-                os.close(artifact_fd)
+                try:
+                    os.close(artifact_fd)
+                except OSError as error:
+                    cleanup_failures.append(f"close recorded artifact: {error}")
+            if process_locked and run_fd is not None:
+                try:
+                    fcntl.flock(run_fd, fcntl.LOCK_UN)
+                except OSError as error:
+                    cleanup_failures.append(f"unlock artifact run: {error}")
             if root_fd is not None and artifacts_fd is not None and run_fd is not None:
-                self._close_posix_run(root_fd, artifacts_fd, run_fd)
+                try:
+                    self._close_posix_run(root_fd, artifacts_fd, run_fd)
+                except FCPMCPError as error:
+                    cleanup_failures.append(error.message)
+            _attach_cleanup_errors(primary_error, cleanup_failures)
 
     def _read_fallback(
         self,

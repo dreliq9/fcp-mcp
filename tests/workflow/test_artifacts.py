@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -90,6 +91,19 @@ def test_state_paths_reject_lexically_noncanonical_root(tmp_path: Path):
             artifacts=root / "artifacts",
             locks=root / "locks",
         )
+
+
+def test_from_config_rejects_noncanonical_root_before_any_mutation(tmp_path: Path):
+    canonical = tmp_path / "outside"
+    lexical = tmp_path / "safe" / ".." / "outside"
+    config = replace(_config(tmp_path), state_dir=lexical)
+
+    with pytest.raises(FCPMCPError) as error:
+        StatePaths.from_config(config)
+
+    _assert_code(error, ErrorCode.INVALID_CONFIGURATION)
+    assert not canonical.exists()
+    assert not (tmp_path / "safe").exists()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX modes are not portable")
@@ -474,6 +488,74 @@ def test_existing_target_is_atomically_replaced(tmp_path: Path):
     _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
 
 
+def test_fallback_temp_child_swap_cannot_return_metadata_for_attack_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path)
+    run_directory = store.paths.run_dir(RUN_ID)
+    run_directory.mkdir(mode=0o700)
+    real_replace = os.replace
+
+    def swapping_replace(source: Path, target: Path, *args, **kwargs) -> None:
+        source.unlink()
+        source.write_bytes(b"ATTACK!!!")
+        real_replace(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(artifact_module.os, "replace", swapping_replace)
+
+    with pytest.raises(FCPMCPError) as error:
+        store._write_guarded_fallback(
+            RUN_ID,
+            ArtifactKind.CANDIDATE,
+            b"candidate",
+            run_directory,
+        )
+
+    assert error.value.code in {ErrorCode.ARTIFACT_CORRUPT, ErrorCode.TRANSACTION_FAILED}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cleanup ownership regression")
+def test_posix_exclusive_open_failure_does_not_unlink_preexisting_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path)
+    run_directory = store.paths.run_dir(RUN_ID)
+    run_directory.mkdir(mode=0o700)
+    temp = run_directory / ".candidate.fcpxml.fixed.tmp"
+    temp.write_bytes(b"preexisting")
+    os.chmod(temp, 0o600)
+    monkeypatch.setattr(artifact_module.secrets, "token_hex", lambda size: "fixed")
+
+    with pytest.raises(FCPMCPError):
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+
+    assert temp.read_bytes() == b"preexisting"
+
+
+def test_fallback_exclusive_open_failure_does_not_unlink_preexisting_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path)
+    run_directory = store.paths.run_dir(RUN_ID)
+    run_directory.mkdir(mode=0o700)
+    temp = run_directory / ".candidate.fcpxml.fixed.tmp"
+    temp.write_bytes(b"preexisting")
+    monkeypatch.setattr(artifact_module.secrets, "token_hex", lambda size: "fixed")
+
+    with pytest.raises(FCPMCPError):
+        store._write_guarded_fallback(
+            RUN_ID,
+            ArtifactKind.CANDIDATE,
+            b"candidate",
+            run_directory,
+        )
+
+    assert temp.read_bytes() == b"preexisting"
+
+
 def test_aggregate_artifact_limit_rejects_without_partial_write(tmp_path: Path):
     store = _store(tmp_path, limit=5)
     candidate = store.write(RUN_ID, ArtifactKind.CANDIDATE, b"123")
@@ -659,6 +741,126 @@ def test_run_lock_is_released_after_write_exception(
     assert outcome[0].byte_size == 9
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX cleanup failure regression")
+def test_posix_unlock_failure_is_coded_and_still_closes_directory_fds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import fcntl
+
+    store = _store(tmp_path)
+    real_flock = fcntl.flock
+    real_close_run = store._close_posix_run
+    close_run_called = False
+
+    def failing_unlock(fd: int, operation: int) -> None:
+        if operation == fcntl.LOCK_UN:
+            raise OSError("injected unlock failure")
+        real_flock(fd, operation)
+
+    def recording_close(root_fd: int, artifacts_fd: int, run_fd: int) -> None:
+        nonlocal close_run_called
+        close_run_called = True
+        real_close_run(root_fd, artifacts_fd, run_fd)
+
+    monkeypatch.setattr(fcntl, "flock", failing_unlock)
+    monkeypatch.setattr(store, "_close_posix_run", recording_close)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+
+    _assert_code(error, ErrorCode.TRANSACTION_FAILED)
+    assert close_run_called is True
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX close-all regression")
+def test_close_posix_run_attempts_every_descriptor_after_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    descriptors: list[int] = []
+    writers: list[int] = []
+    for _ in range(3):
+        reader, writer = os.pipe()
+        descriptors.append(reader)
+        writers.append(writer)
+    real_close = os.close
+    failed_fd = descriptors[2]
+    attempted: list[int] = []
+
+    def one_failing_close(fd: int) -> None:
+        attempted.append(fd)
+        if fd == failed_fd:
+            raise OSError("injected close failure")
+        real_close(fd)
+
+    monkeypatch.setattr(artifact_module.os, "close", one_failing_close)
+    with pytest.raises(FCPMCPError) as error:
+        ArtifactStore._close_posix_run(
+            descriptors[0],
+            descriptors[1],
+            descriptors[2],
+        )
+    monkeypatch.setattr(artifact_module.os, "close", real_close)
+
+    _assert_code(error, ErrorCode.TRANSACTION_FAILED)
+    assert set(attempted) == set(descriptors)
+    real_close(failed_fd)
+    for writer in writers:
+        real_close(writer)
+
+
+def test_windows_handle_cleanup_attempts_all_and_reports_failures():
+    attempted: list[int] = []
+
+    def failing_close(handle: int) -> bool:
+        attempted.append(handle)
+        return handle != 2
+
+    with pytest.raises(FCPMCPError) as error:
+        artifact_module._close_windows_handle_values([1, 2, 3], failing_close)
+
+    _assert_code(error, ErrorCode.TRANSACTION_FAILED)
+    assert attempted == [3, 2, 1]
+
+
+def test_windows_mutex_cleanup_preserves_primary_error_details():
+    primary = FCPMCPError(ErrorCode.ARTIFACT_CORRUPT, "primary")
+
+    def failing_release(handle: int) -> bool:
+        return False
+
+    def successful_close(handle: int) -> bool:
+        return True
+
+    artifact_module._release_windows_mutex_handle(
+        1,
+        failing_release,
+        successful_close,
+        primary_error=primary,
+    )
+
+    assert primary.code is ErrorCode.ARTIFACT_CORRUPT
+    assert primary.details["cleanup_errors"]
+
+
+def test_single_windows_handle_failure_preserves_primary_and_checks_close():
+    primary = FCPMCPError(ErrorCode.ARTIFACT_CORRUPT, "primary")
+    attempted: list[int] = []
+
+    def failing_close(handle: int) -> bool:
+        attempted.append(handle)
+        return False
+
+    artifact_module._close_windows_handle_after_failure(
+        7,
+        failing_close,
+        primary,
+    )
+
+    assert attempted == [7]
+    assert primary.details["cleanup_errors"]
+
+
 def test_complete_diff_artifact_is_not_limited_by_rendered_summary_limit(tmp_path: Path):
     store = _store(tmp_path, limit=100)
     complete = "αβγ complete canonical diff".encode()
@@ -782,6 +984,36 @@ def test_read_rejects_artifact_symlink_substitution(tmp_path: Path):
     outside.write_bytes(b"candidate")
     target.unlink()
     target.symlink_to(outside)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.read(metadata)
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX fd identity regression")
+def test_posix_read_rejects_target_replaced_after_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path)
+    metadata = store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+    target = store.paths.root / metadata.relative_path
+    replacement = target.with_name("replacement")
+    replacement.write_bytes(b"replacement")
+    os.chmod(replacement, 0o600)
+    real_read = os.read
+    replaced = False
+
+    def replacing_read(fd: int, byte_count: int) -> bytes:
+        nonlocal replaced
+        chunk = real_read(fd, byte_count)
+        if chunk and not replaced:
+            replaced = True
+            os.replace(replacement, target)
+        return chunk
+
+    monkeypatch.setattr(artifact_module.os, "read", replacing_read)
 
     with pytest.raises(FCPMCPError) as error:
         store.read(metadata)
