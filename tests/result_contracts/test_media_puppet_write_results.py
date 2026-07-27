@@ -32,6 +32,22 @@ WRITE_CASES = (
 )
 
 FCPXML_MEDIA_TYPE = "application/vnd.apple.fcpxml+xml"
+JPEG_BYTES = (
+    b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x00"
+    b"\x00\x01\x00\x01\x00\x00\xff\xd9"
+)
+FLAC_BYTES = b"fLaC\x80\x00\x00\x22" + (b"\x00" * 34)
+WAV_BYTES = (
+    b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00"
+    b"\x01\x00\x01\x00\x44\xac\x00\x00\x88\x58\x01\x00"
+    b"\x02\x00\x10\x00data\x00\x00\x00\x00"
+)
+MIDI_BYTES = (
+    b"MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60"
+    b"MTrk\x00\x00\x00\x04\x00\xff\x2f\x00"
+)
+QUICKTIME_BYTES = b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00qt  "
+MP4_BYTES = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42"
 
 
 def _sha256(path: Path) -> str:
@@ -85,6 +101,9 @@ def _install_checked_media_runner(
     *,
     thumbnail_count: int = 2,
     omit_outputs: bool = False,
+    thumbnail_bytes: bytes = JPEG_BYTES,
+    audio_bytes: bytes | None = None,
+    media_returncode: int = 0,
 ) -> list[list[str]]:
     ffprobe = importlib.import_module("fcp_mcp.media.ffprobe")
     original_run_checked = ffprobe._run_checked
@@ -104,18 +123,32 @@ def _install_checked_media_runner(
             assert argv[4] == "-i"
             assert argv[-3] == "-vf"
             assert argv[-2] in {"scale=320:-1", "scale=640:-1"}
+            if media_returncode:
+                return CompletedProcess(
+                    argv,
+                    media_returncode,
+                    "",
+                    "contract media failure",
+                )
             if not omit_outputs:
-                destination.write_bytes(b"\xff\xd8thumbnail-contract\xff\xd9")
+                destination.write_bytes(thumbnail_bytes)
             return CompletedProcess(argv, 0, "", "")
 
         if any(item.startswith("fps=1/") for item in argv):
             assert argv[1:3] == ["-y", "-i"]
             assert argv[-2] == "fps=1/3.0,scale=480:-1"
+            if media_returncode:
+                return CompletedProcess(
+                    argv,
+                    media_returncode,
+                    "",
+                    "contract media failure",
+                )
             if not omit_outputs:
                 for index in range(1, thumbnail_count + 1):
-                    Path(str(destination).replace("%04d", f"{index:04d}")).write_bytes(
-                        f"thumbnail-{index}".encode()
-                    )
+                    Path(
+                        str(destination).replace("%04d", f"{index:04d}")
+                    ).write_bytes(thumbnail_bytes)
             return CompletedProcess(argv, 0, "", "")
 
         if "-vn" in argv:
@@ -134,8 +167,19 @@ def _install_checked_media_runner(
                 raise AssertionError(
                     f"unexpected audio command: {argv!r}"
                 )
+            if media_returncode:
+                return CompletedProcess(
+                    argv,
+                    media_returncode,
+                    "",
+                    "contract media failure",
+                )
             if not omit_outputs:
-                destination.write_bytes(b"RIFFaudio-contract")
+                destination.write_bytes(
+                    audio_bytes
+                    if audio_bytes is not None
+                    else (FLAC_BYTES if destination.suffix == ".flac" else WAV_BYTES)
+                )
             return CompletedProcess(argv, 0, "", "")
 
         raise AssertionError(f"unexpected external command: {argv!r}")
@@ -222,7 +266,7 @@ async def test_media_thumbnail_result_binds_real_bytes_and_exact_text(
 ) -> None:
     commands = _install_checked_media_runner(monkeypatch)
     source = tmp_path / "source.mov"
-    source.write_bytes(b"source-video")
+    source.write_bytes(QUICKTIME_BYTES)
     destination = tmp_path / "thumb.jpg"
 
     result = await server.mcp.call_tool(
@@ -252,7 +296,7 @@ async def test_media_thumbnail_missing_promised_file_is_coded_failure(
 ) -> None:
     _install_checked_media_runner(monkeypatch, omit_outputs=True)
     source = tmp_path / "source.mov"
-    source.write_bytes(b"source-video")
+    source.write_bytes(QUICKTIME_BYTES)
 
     with pytest.raises(ToolError, match="output_missing"):
         await server.mcp.call_tool(
@@ -271,7 +315,7 @@ async def test_media_thumbnail_list_binds_count_to_verified_artifacts(
 ) -> None:
     _install_checked_media_runner(monkeypatch, thumbnail_count=2)
     source = tmp_path / "source.mp4"
-    source.write_bytes(b"source-video")
+    source.write_bytes(MP4_BYTES)
     destination = tmp_path / "thumbs"
 
     result = await server.mcp.call_tool(
@@ -314,7 +358,7 @@ async def test_media_audio_result_uses_honest_mime_and_exact_text(
 ) -> None:
     _install_checked_media_runner(monkeypatch)
     source = tmp_path / "source.mov"
-    source.write_bytes(b"source-video")
+    source.write_bytes(QUICKTIME_BYTES)
     destination = tmp_path / "audio.flac"
 
     result = await server.mcp.call_tool(
@@ -348,7 +392,7 @@ async def test_media_audio_to_midi_binds_written_midi_bytes(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.wav"
-    source.write_bytes(b"RIFFsource-audio")
+    source.write_bytes(WAV_BYTES)
     destination = tmp_path / "notes.mid"
 
     basic_pitch = types.ModuleType("basic_pitch")
@@ -357,7 +401,7 @@ async def test_media_audio_to_midi_binds_written_midi_bytes(
 
     class MidiData:
         def write(self, path: str) -> None:
-            Path(path).write_bytes(b"MThd-midi-contract")
+            Path(path).write_bytes(MIDI_BYTES)
 
     def predict(
         path: str,
@@ -392,6 +436,77 @@ async def test_media_audio_to_midi_binds_written_midi_bytes(
         "source": _artifact(source, "audio/wav"),
         "artifact": _artifact(destination, "audio/midi"),
     }
+
+
+@pytest.mark.asyncio
+async def test_media_thumbnail_rejects_text_with_jpeg_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_checked_media_runner(
+        monkeypatch,
+        thumbnail_bytes=b"not a jpeg",
+    )
+    source = tmp_path / "source.mov"
+    source.write_bytes(QUICKTIME_BYTES)
+    destination = tmp_path / "fake.jpg"
+
+    with pytest.raises(ToolError, match="validation_failed"):
+        await server.mcp.call_tool(
+            "media_extract_thumbnail",
+            {
+                "path": str(source),
+                "output_path": str(destination),
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_media_audio_rejects_riff_bytes_with_flac_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_checked_media_runner(
+        monkeypatch,
+        audio_bytes=WAV_BYTES,
+    )
+    source = tmp_path / "source.mov"
+    source.write_bytes(QUICKTIME_BYTES)
+    destination = tmp_path / "fake.flac"
+
+    with pytest.raises(ToolError, match="validation_failed"):
+        await server.mcp.call_tool(
+            "media_extract_audio",
+            {
+                "path": str(source),
+                "output_path": str(destination),
+                "format": "flac",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_empty_media_source_reaches_prior_command_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands = _install_checked_media_runner(
+        monkeypatch,
+        media_returncode=9,
+    )
+    source = tmp_path / "empty.mov"
+    source.touch()
+
+    with pytest.raises(ToolError, match="command_failed"):
+        await server.mcp.call_tool(
+            "media_extract_thumbnail",
+            {
+                "path": str(source),
+                "output_path": str(tmp_path / "unused.jpg"),
+            },
+        )
+
+    assert any("-vframes" in command for command in commands)
 
 
 @pytest.mark.asyncio
@@ -583,6 +698,7 @@ async def test_puppet_animate_returns_typed_service_animations_and_receipt(
     )
     assert result.structuredContent["animations"] == [
         {
+            "rig_name": "Ada",
             "part_name": "head",
             "property_name": "rotation",
             "keyframes": [
@@ -592,6 +708,96 @@ async def test_puppet_animate_returns_typed_service_animations_and_receipt(
         }
     ]
     _assert_receipt(result.structuredContent, destination)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ("property", "keyframe_count", "time", "value", "interpolation"),
+)
+async def test_puppet_animation_evidence_rejects_candidate_mutation(
+    mutation: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    destination = tmp_path / f"mutated-{mutation}.fcpxml"
+    prior_bytes = b"<?xml version='1.0'?><fcpxml version='1.11'/>"
+    destination.write_bytes(prior_bytes)
+    original_build = server.PuppetSceneBuilder.build
+
+    def mutated_build(
+        builder: server.PuppetSceneBuilder,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        generator = original_build(builder, *args, **kwargs)
+        parameter = generator.root.find(".//param")
+        assert parameter is not None
+        keyframes = parameter.findall("keyframe")
+        assert len(keyframes) == 2
+        if mutation == "property":
+            parameter.set("name", "scale")
+        elif mutation == "keyframe_count":
+            parameter.remove(keyframes[-1])
+        elif mutation == "time":
+            keyframes[0].set("time", "1s")
+        elif mutation == "value":
+            keyframes[0].set("value", "99.0")
+        else:
+            keyframes[0].set("interp", "hold")
+        return generator
+
+    monkeypatch.setattr(server.PuppetSceneBuilder, "build", mutated_build)
+    animations = json.dumps(
+        [
+            {
+                "part": "head",
+                "property": "rotation",
+                "keyframes": [
+                    {"time": "0s", "value": 0.0, "interp": "linear"},
+                    {"time": "2s", "value": 15.0, "interp": "smooth2"},
+                ],
+            }
+        ]
+    )
+
+    with pytest.raises(ToolError, match="validation_failed"):
+        await server.mcp.call_tool(
+            "puppet_animate",
+            {
+                "rigs_json": _rig_json(images),
+                "animations_json": animations,
+                "duration": "2s",
+                "output_path": str(destination),
+            },
+        )
+
+    assert destination.read_bytes() == prior_bytes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duration", ("0s", "-1s"))
+async def test_puppet_build_rejects_nonpositive_duration_before_commit(
+    duration: str,
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    destination = tmp_path / "nonpositive.fcpxml"
+    prior_bytes = b"prior destination"
+    destination.write_bytes(prior_bytes)
+
+    with pytest.raises(ToolError, match="invalid_arguments"):
+        await server.mcp.call_tool(
+            "puppet_build_scene",
+            {
+                "rigs_json": _rig_json(images),
+                "duration": duration,
+                "output_path": str(destination),
+            },
+        )
+
+    assert destination.read_bytes() == prior_bytes
 
 
 @pytest.mark.asyncio
@@ -687,6 +893,110 @@ async def test_puppet_multi_scene_has_one_verified_artifact_per_scene(
 
 
 @pytest.mark.asyncio
+async def test_multi_scene_rejects_duplicate_normalized_destinations_prewrite(
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    scenes = json.dumps(
+        [
+            {"name": 42, "duration": "2s", "preset": "idle"},
+            {"name": "42", "duration": "2s", "preset": "idle"},
+        ]
+    )
+
+    with pytest.raises(ToolError, match="duplicate"):
+        await server.mcp.call_tool(
+            "puppet_multi_scene",
+            {
+                "rigs_json": _rig_json(images),
+                "scenes_json": scenes,
+                "project_name": "Contract",
+                "output_path": str(tmp_path),
+            },
+        )
+
+    assert list(tmp_path.glob("Contract_*.fcpxml")) == []
+
+
+@pytest.mark.asyncio
+async def test_multi_scene_preflights_every_candidate_before_first_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    original_build = server.PuppetSceneBuilder.build
+    build_count = 0
+
+    class MalformedGenerator:
+        def to_string(self) -> str:
+            return "<not-fcpxml>"
+
+    def second_candidate_is_malformed(
+        builder: server.PuppetSceneBuilder,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal build_count
+        build_count += 1
+        if build_count == 2:
+            return MalformedGenerator()
+        return original_build(builder, *args, **kwargs)
+
+    monkeypatch.setattr(
+        server.PuppetSceneBuilder,
+        "build",
+        second_candidate_is_malformed,
+    )
+
+    with pytest.raises(ToolError, match="validation_failed"):
+        await server.mcp.call_tool(
+            "puppet_multi_scene",
+            {
+                "rigs_json": _rig_json(images),
+                "scenes_json": json.dumps(
+                    [
+                        {"name": "first", "duration": "2s", "preset": "idle"},
+                        {"name": "second", "duration": "2s", "preset": "idle"},
+                    ]
+                ),
+                "project_name": "Contract",
+                "output_path": str(tmp_path),
+            },
+        )
+
+    assert list(tmp_path.glob("Contract_*.fcpxml")) == []
+
+
+@pytest.mark.asyncio
+async def test_multi_scene_rejects_preset_without_compatible_part_prewrite(
+    tmp_path: Path,
+) -> None:
+    body = tmp_path / "body.png"
+    body.write_bytes(b"body")
+    rig = json.dumps(
+        {
+            "name": "BodyOnly",
+            "parts": [{"name": "body", "image": str(body)}],
+        }
+    )
+
+    with pytest.raises(ToolError, match="target_not_found"):
+        await server.mcp.call_tool(
+            "puppet_multi_scene",
+            {
+                "rigs_json": rig,
+                "scenes_json": json.dumps(
+                    [{"name": "wave", "duration": "2s", "preset": "wave"}]
+                ),
+                "project_name": "Contract",
+                "output_path": str(tmp_path),
+            },
+        )
+
+    assert list(tmp_path.glob("Contract_*.fcpxml")) == []
+
+
+@pytest.mark.asyncio
 async def test_malformed_puppet_candidate_preserves_existing_destination(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -718,7 +1028,45 @@ async def test_malformed_puppet_candidate_preserves_existing_destination(
 
 
 @pytest.mark.asyncio
-async def test_invalid_multi_scene_name_creates_no_artifact(
+async def test_numeric_multi_scene_name_preserves_legacy_compatibility(
+    tmp_path: Path,
+) -> None:
+    images = _write_rig_images(tmp_path)
+    destination = tmp_path / "Contract_42.fcpxml"
+
+    result = await server.mcp.call_tool(
+        "puppet_multi_scene",
+        {
+            "rigs_json": _rig_json(images),
+            "scenes_json": json.dumps(
+                [{"name": 42, "duration": "2s", "preset": "idle"}]
+            ),
+            "project_name": "Contract",
+            "output_path": str(tmp_path),
+        },
+    )
+
+    assert result.content[0].text == (
+        "{\n"
+        '  "scenes_created": 1,\n'
+        '  "files": [\n'
+        "    {\n"
+        '      "scene": 42,\n'
+        f'      "file": "{destination}",\n'
+        '      "preset": "idle"\n'
+        "    }\n"
+        "  ],\n"
+        '  "status": "multi_scene_built"\n'
+        "}"
+    )
+    assert result.structuredContent["artifacts"][0]["scene"] == "42"
+    _assert_receipt(result.structuredContent["artifacts"][0], destination)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe_name", (["nested"], {"nested": "name"}))
+async def test_structured_multi_scene_name_remains_invalid(
+    unsafe_name: object,
     tmp_path: Path,
 ) -> None:
     images = _write_rig_images(tmp_path)
@@ -729,7 +1077,13 @@ async def test_invalid_multi_scene_name_creates_no_artifact(
             {
                 "rigs_json": _rig_json(images),
                 "scenes_json": json.dumps(
-                    [{"name": 42, "duration": "2s", "preset": "idle"}]
+                    [
+                        {
+                            "name": unsafe_name,
+                            "duration": "2s",
+                            "preset": "idle",
+                        }
+                    ]
                 ),
                 "project_name": "Contract",
                 "output_path": str(tmp_path),
@@ -754,6 +1108,211 @@ def test_media_list_model_rejects_wrong_requested_artifact_count() -> None:
             requested_count=2,
             artifacts=[reference],
         )
+
+
+def _artifact_payload(
+    path: str = "/tmp/destination.fcpxml",
+    *,
+    media_type: str = "application/vnd.apple.fcpxml+xml",
+    sha256: str = "2" * 64,
+) -> dict[str, object]:
+    return {
+        "path": path,
+        "media_type": media_type,
+        "sha256": sha256,
+        "size_bytes": 1,
+    }
+
+
+def _receipt_payload(
+    destination: str = "/tmp/destination.fcpxml",
+    *,
+    output_sha256: str = "2" * 64,
+    elapsed_ms: int = 1,
+) -> dict[str, object]:
+    return {
+        "transaction_id": "task-9-contract",
+        "source": None,
+        "destination": destination,
+        "backup_path": None,
+        "input_sha256": None,
+        "prior_sha256": None,
+        "output_sha256": output_sha256,
+        "validation_warnings": [],
+        "elapsed_ms": elapsed_ms,
+        "disposition": "committed",
+    }
+
+
+def _rig_payload() -> dict[str, object]:
+    return {
+        "name": "hero",
+        "position": [0.0, 0.0],
+        "parts": [
+            {
+                "name": "head",
+                "image": "/tmp/head.png",
+                "position": [0.0, 0.0],
+                "scale": 1.0,
+                "rotation": 0.0,
+                "anchor": [0.0, 0.0],
+                "z_order": 1,
+                "width": 1,
+                "height": 1,
+            }
+        ],
+    }
+
+
+def _rotation_animation_payload() -> dict[str, object]:
+    return {
+        "rig_name": "hero",
+        "part_name": "head",
+        "property_name": "rotation",
+        "keyframes": [
+            {"time": "0s", "value": 0.0, "interp": "linear"},
+            {"time": "1s", "value": 10.0, "interp": "smooth2"},
+        ],
+    }
+
+
+def test_media_artifact_models_bind_operation_to_artifact_type() -> None:
+    models = importlib.import_module("fcp_mcp.result_models.media")
+    source = _artifact_payload(
+        "/tmp/source.mov",
+        media_type="video/quicktime",
+        sha256="1" * 64,
+    )
+
+    with pytest.raises(ValidationError):
+        models.MediaArtifactResult(
+            operation="extract_thumbnail",
+            source=source,
+            artifact=_artifact_payload(
+                "/tmp/not-an-image.flac",
+                media_type="audio/flac",
+            ),
+        )
+    with pytest.raises(ValidationError):
+        models.MediaArtifactListResult(
+            operation="extract_thumbnails",
+            source=source,
+            requested_count=1,
+            artifacts=[
+                _artifact_payload(
+                    "/tmp/not-an-image.wav",
+                    media_type="audio/wav",
+                )
+            ],
+        )
+
+
+def test_puppet_build_model_accepts_operation_and_binds_invariants() -> None:
+    models = importlib.import_module("fcp_mcp.result_models.puppet")
+    payload = {
+        "operation": "animate",
+        "project": "Contract",
+        "rigs": [_rig_payload()],
+        "animations": [_rotation_animation_payload()],
+        "duration": "2s",
+        "destination": _artifact_payload(),
+        "receipt": _receipt_payload(),
+    }
+
+    result = models.PuppetBuildResult(**payload)
+    assert result.operation == "animate"
+
+    contradictions = (
+        {**payload, "operation": "build_scene"},
+        {**payload, "animations": []},
+        {**payload, "duration": "not-a-time"},
+        {
+            **payload,
+            "animations": [
+                {
+                    **_rotation_animation_payload(),
+                    "keyframes": [
+                        {"time": "0s", "value": [0.0, 1.0], "interp": "linear"}
+                    ],
+                }
+            ],
+        },
+        {
+            **payload,
+            "animations": [
+                {
+                    **_rotation_animation_payload(),
+                    "property_name": "scale",
+                    "keyframes": [
+                        {"time": "0s", "value": 1.0, "interp": "linear"}
+                    ],
+                }
+            ],
+        },
+        {
+            **payload,
+            "animations": [
+                {
+                    **_rotation_animation_payload(),
+                    "keyframes": [
+                        {"time": "-1s", "value": 0.0, "interp": "linear"}
+                    ],
+                }
+            ],
+        },
+        {
+            **payload,
+            "receipt": _receipt_payload("/tmp/other.fcpxml"),
+        },
+        {
+            **payload,
+            "receipt": _receipt_payload(output_sha256="3" * 64),
+        },
+        {
+            **payload,
+            "receipt": _receipt_payload(elapsed_ms=-1),
+        },
+    )
+    for contradiction in contradictions:
+        with pytest.raises(ValidationError):
+            models.PuppetBuildResult(**contradiction)
+
+
+def test_puppet_multi_scene_model_binds_operation_and_artifacts() -> None:
+    models = importlib.import_module("fcp_mcp.result_models.puppet")
+    artifact = {
+        "operation": "multi_scene",
+        "scene": "intro",
+        "preset": "idle",
+        "project": "Contract_intro",
+        "rigs": [_rig_payload()],
+        "animations": [_rotation_animation_payload()],
+        "duration": "2s",
+        "destination": _artifact_payload(),
+        "receipt": _receipt_payload(),
+    }
+    result = models.PuppetMultiSceneResult(
+        scene_count=1,
+        artifacts=[artifact],
+    )
+    assert result.artifacts[0].operation == "multi_scene"
+
+    for contradiction in (
+        {**artifact, "operation": "animate"},
+        {**artifact, "animations": []},
+        {
+            **artifact,
+            "destination": _artifact_payload("/tmp/other.fcpxml"),
+        },
+    ):
+        with pytest.raises(ValidationError):
+            models.PuppetMultiSceneResult(
+                scene_count=1,
+                artifacts=[contradiction],
+            )
+
+    with pytest.raises(ValidationError):
+        models.PuppetMultiSceneResult(scene_count=0, artifacts=[])
 
 
 def test_task9_models_are_frozen_strict_forbid_extra_and_use_no_any() -> None:

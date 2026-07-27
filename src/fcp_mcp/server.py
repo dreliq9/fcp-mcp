@@ -9,9 +9,10 @@ import hashlib
 import json
 import logging
 import subprocess
+import tempfile
 import xml.etree.ElementTree as ET
 from collections.abc import Callable, Collection
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
@@ -424,6 +425,61 @@ _MEDIA_TYPES_BY_SUFFIX = {
 }
 
 
+def _detected_media_type(path: Path) -> str | None:
+    with path.open("rb") as media_file:
+        header = media_file.read(64)
+        if header.startswith(b"\xff\xd8\xff"):
+            media_file.seek(-2, 2)
+            return (
+                "image/jpeg"
+                if media_file.read(2) == b"\xff\xd9"
+                else None
+            )
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header[:4] in {b"II*\x00", b"MM\x00*"}:
+        return "image/tiff"
+    if header.startswith(b"fLaC"):
+        return "audio/flac"
+    if header.startswith(b"RIFF") and header[8:12] == b"WAVE":
+        return "audio/wav"
+    if header.startswith(b"RIFF") and header[8:12] == b"AVI ":
+        return "video/x-msvideo"
+    if header.startswith(b"MThd") and header[4:8] == b"\x00\x00\x00\x06":
+        return "audio/midi"
+    if header.startswith(b"ID3") or (
+        len(header) >= 2
+        and header[0] == 0xFF
+        and header[1] & 0xE0 == 0xE0
+    ):
+        return "audio/mpeg"
+    if len(header) >= 12 and header[4:8] == b"ftyp":
+        brand = header[8:12]
+        if brand in {b"qt  ", b"moov"}:
+            return "video/quicktime"
+        return "video/mp4"
+    if header.startswith(b"\x1aE\xdf\xa3"):
+        return (
+            "video/webm"
+            if b"webm" in header.lower()
+            else "video/x-matroska"
+        )
+    return None
+
+
+def _media_source_artifact_reference(path: Path) -> ArtifactReference:
+    resolved = path.resolve()
+    return _artifact_reference_for_path(
+        resolved,
+        media_type=(
+            _detected_media_type(resolved)
+            if resolved.stat().st_size
+            else None
+        )
+        or "application/octet-stream",
+    )
+
+
 def _media_artifact_reference(path: Path) -> ArtifactReference:
     resolved = path.resolve()
     if not resolved.is_file() or resolved.stat().st_size == 0:
@@ -431,12 +487,19 @@ def _media_artifact_reference(path: Path) -> ArtifactReference:
             ErrorCode.OUTPUT_MISSING,
             f"Media artifact is missing or empty: {resolved}",
         )
+    expected_type = _MEDIA_TYPES_BY_SUFFIX.get(resolved.suffix.lower())
+    detected_type = _detected_media_type(resolved)
+    if expected_type is None or detected_type != expected_type:
+        raise FCPMCPError(
+            ErrorCode.VALIDATION_FAILED,
+            (
+                "Media artifact content does not match its destination "
+                f"format: {resolved}"
+            ),
+        )
     return _artifact_reference_for_path(
         resolved,
-        media_type=_MEDIA_TYPES_BY_SUFFIX.get(
-            resolved.suffix.lower(),
-            "application/octet-stream",
-        ),
+        media_type=detected_type,
     )
 
 
@@ -580,40 +643,248 @@ def _save_puppet_generation(
     expected_project: str,
     rigs: list[PuppetRig],
     animations: list[PartAnimation],
-) -> tuple[FCPXMLTransactionReceipt, str]:
-    committed_project = ""
-    expected_part_count = sum(len(rig.parts) for rig in rigs)
-
-    def validate_puppet_generation(candidate: Path) -> None:
-        nonlocal committed_project
-        root = ET.parse(candidate).getroot()
-        project = next(root.iter("project"), None)
-        if project is None:
-            _raise_validation_failure(
-                "Puppet candidate is missing its project"
-            )
-        committed_project = project.get("name", "")
-        if committed_project != expected_project:
-            _raise_validation_failure(
-                "Puppet candidate project does not match the request"
-            )
-        parts = root.findall(".//gap/asset-clip")
-        if len(parts) != expected_part_count:
-            _raise_validation_failure(
-                "Puppet candidate part count does not match its rigs"
-            )
-        if len(list(root.iter("param"))) < len(animations):
-            _raise_validation_failure(
-                "Puppet candidate is missing requested animations"
-            )
-
-    receipt = _save_generator_receipt(
+) -> tuple[
+    FCPXMLTransactionReceipt,
+    str,
+    list[PuppetAnimationRecord],
+]:
+    prepared = _prepare_puppet_generation(
         generator,
         output_path,
         default_name=default_name,
-        validate_candidate=validate_puppet_generation,
+        expected_project=expected_project,
+        rigs=rigs,
+        animations=animations,
     )
-    return receipt, committed_project
+    return _commit_puppet_generation(prepared)
+
+
+@dataclass(frozen=True)
+class _PreparedPuppetGeneration:
+    destination: Path
+    xml_bytes: bytes
+    expected_project: str
+    rigs: list[PuppetRig]
+    animations: list[PartAnimation]
+
+
+def _expected_puppet_value(
+    keyframe: Keyframe,
+    *,
+    property_name: str,
+    rig: PuppetRig,
+) -> str:
+    value = keyframe.value
+    if property_name == "position" and isinstance(value, tuple):
+        value = (
+            value[0] + rig.position[0],
+            value[1] + rig.position[1],
+        )
+    if isinstance(value, tuple):
+        return f"{value[0]:.1f} {value[1]:.1f}"
+    return f"{value:.1f}"
+
+
+def _puppet_candidate_evidence(
+    candidate: Path,
+    *,
+    expected_project: str,
+    rigs: list[PuppetRig],
+    animations: list[PartAnimation],
+) -> tuple[str, list[PuppetAnimationRecord]]:
+    try:
+        root = ET.parse(candidate).getroot()
+    except (ET.ParseError, OSError) as error:
+        raise FCPMCPError(
+            ErrorCode.VALIDATION_FAILED,
+            "Puppet candidate is not valid XML",
+        ) from error
+
+    project = next(root.iter("project"), None)
+    if project is None:
+        _raise_validation_failure("Puppet candidate is missing its project")
+    committed_project = project.get("name", "")
+    if committed_project != expected_project:
+        _raise_validation_failure(
+            "Puppet candidate project does not match the request"
+        )
+
+    expected_part_count = sum(len(rig.parts) for rig in rigs)
+    clips = root.findall(".//gap/asset-clip")
+    if len(clips) != expected_part_count:
+        _raise_validation_failure(
+            "Puppet candidate part count does not match its rigs"
+        )
+    clips_by_name: dict[str, ET.Element] = {}
+    for clip in clips:
+        name = clip.get("name", "")
+        if not name or name in clips_by_name:
+            _raise_validation_failure(
+                "Puppet candidate part identity is ambiguous"
+            )
+        clips_by_name[name] = clip
+
+    evidence: list[PuppetAnimationRecord] = []
+    expected_clip_names: set[str] = set()
+    for rig in rigs:
+        for part in sorted(rig.parts, key=lambda item: item.z_order):
+            clip_name = f"{rig.name}_{part.name}"
+            expected_clip_names.add(clip_name)
+            clip = clips_by_name.get(clip_name)
+            if clip is None:
+                _raise_validation_failure(
+                    "Puppet candidate is missing a requested rig part"
+                )
+            expected_animations = [
+                animation
+                for animation in animations
+                if animation.part_name == part.name
+            ]
+            parameters = clip.findall("./adjust-transform/param")
+            if len(parameters) != len(expected_animations):
+                _raise_validation_failure(
+                    "Puppet candidate animation count does not match "
+                    "the requested part"
+                )
+            for parameter, animation in zip(
+                parameters,
+                expected_animations,
+                strict=True,
+            ):
+                if parameter.get("name") != animation.property_name:
+                    _raise_validation_failure(
+                        "Puppet candidate animation property does not "
+                        "match the request"
+                    )
+                actual_keyframes = parameter.findall("keyframe")
+                if len(actual_keyframes) != len(animation.keyframes):
+                    _raise_validation_failure(
+                        "Puppet candidate keyframe count does not match "
+                        "the request"
+                    )
+                keyframe_records: list[PuppetKeyframeRecord] = []
+                for actual, expected in zip(
+                    actual_keyframes,
+                    animation.keyframes,
+                    strict=True,
+                ):
+                    expected_value = _expected_puppet_value(
+                        expected,
+                        property_name=animation.property_name,
+                        rig=rig,
+                    )
+                    actual_value = actual.get("value", "")
+                    if (
+                        actual.get("time") != expected.time
+                        or actual_value != expected_value
+                        or actual.get("interp") != expected.interp
+                    ):
+                        _raise_validation_failure(
+                            "Puppet candidate keyframe does not match "
+                            "the request"
+                        )
+                    values = [
+                        float(item)
+                        for item in actual_value.split()
+                    ]
+                    keyframe_records.append(
+                        PuppetKeyframeRecord(
+                            time=actual.get("time", ""),
+                            value=(
+                                values
+                                if len(values) == 2
+                                else values[0]
+                            ),
+                            interp=actual.get("interp", ""),
+                        )
+                    )
+                evidence.append(
+                    PuppetAnimationRecord(
+                        rig_name=rig.name,
+                        part_name=part.name,
+                        property_name=animation.property_name,
+                        keyframes=keyframe_records,
+                    )
+                )
+    if set(clips_by_name) != expected_clip_names:
+        _raise_validation_failure(
+            "Puppet candidate contains unexpected rig parts"
+        )
+    return committed_project, evidence
+
+
+def _validate_prepared_puppet_generation(
+    candidate: Path,
+    prepared: _PreparedPuppetGeneration,
+) -> tuple[str, list[PuppetAnimationRecord]]:
+    validation = _validator.validate_file(candidate)
+    if not validation.valid:
+        _raise_validation_failure(
+            "Puppet candidate failed FCPXML validation"
+        )
+    return _puppet_candidate_evidence(
+        candidate,
+        expected_project=prepared.expected_project,
+        rigs=prepared.rigs,
+        animations=prepared.animations,
+    )
+
+
+def _prepare_puppet_generation(
+    generator: FCPXMLGenerator,
+    output_path: str,
+    *,
+    default_name: str,
+    expected_project: str,
+    rigs: list[PuppetRig],
+    animations: list[PartAnimation],
+) -> _PreparedPuppetGeneration:
+    prepared = _PreparedPuppetGeneration(
+        destination=_resolve_output(
+            output_path,
+            default_name=default_name,
+            suffixes={".fcpxml"},
+        ),
+        xml_bytes=f"{generator.to_string()}\n".encode(),
+        expected_project=expected_project,
+        rigs=rigs,
+        animations=animations,
+    )
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        candidate = Path(temporary_directory) / "candidate.fcpxml"
+        candidate.write_bytes(prepared.xml_bytes)
+        _validate_prepared_puppet_generation(candidate, prepared)
+    return prepared
+
+
+def _commit_puppet_generation(
+    prepared: _PreparedPuppetGeneration,
+) -> tuple[
+    FCPXMLTransactionReceipt,
+    str,
+    list[PuppetAnimationRecord],
+]:
+    evidence: tuple[str, list[PuppetAnimationRecord]] = ("", [])
+
+    def validate_puppet_generation(candidate: Path) -> None:
+        nonlocal evidence
+        evidence = _puppet_candidate_evidence(
+            candidate,
+            expected_project=prepared.expected_project,
+            rigs=prepared.rigs,
+            animations=prepared.animations,
+        )
+
+    receipt = commit_fcpxml_bytes(
+        source=None,
+        destination=prepared.destination,
+        xml_bytes=prepared.xml_bytes,
+        validate_candidate=validate_puppet_generation,
+        event_format=CONFIG.log_format,
+        operation="puppet_generator_save",
+    )
+    committed_project, animations = evidence
+    return receipt, committed_project, animations
 
 
 def _load_json(raw: str, label: str) -> Any:
@@ -654,6 +925,24 @@ def _parse_time(raw: str, label: str) -> RationalTime:
             ErrorCode.INVALID_ARGUMENTS,
             f"{label} must be a valid FCPXML time: {raw}",
         ) from error
+
+
+def _parse_positive_time(raw: str, label: str) -> RationalTime:
+    parsed = _parse_time(raw, label)
+    if parsed.numerator <= 0:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"{label} must be positive: {raw}",
+        )
+    return parsed
+
+
+def _require_puppet_project_name(project_name: str) -> None:
+    if not project_name:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "project_name must not be empty",
+        )
 
 
 def _resolve_clip_sources(
@@ -766,30 +1055,6 @@ def _puppet_rig_record(rig: PuppetRig) -> PuppetRigRecord:
         name=rig.name,
         position=[float(rig.position[0]), float(rig.position[1])],
         parts=[_puppet_part_record(part) for part in rig.parts],
-    )
-
-
-def _puppet_animation_record(
-    animation: PartAnimation,
-) -> PuppetAnimationRecord:
-    return PuppetAnimationRecord(
-        part_name=animation.part_name,
-        property_name=animation.property_name,
-        keyframes=[
-            PuppetKeyframeRecord(
-                time=keyframe.time,
-                value=(
-                    [
-                        float(keyframe.value[0]),
-                        float(keyframe.value[1]),
-                    ]
-                    if isinstance(keyframe.value, tuple)
-                    else float(keyframe.value)
-                ),
-                interp=keyframe.interp,
-            )
-            for keyframe in animation.keyframes
-        ],
     )
 
 
@@ -5180,7 +5445,6 @@ def media_extract_thumbnail(
     from .media.ffprobe import extract_thumbnail
 
     source = _resolve_input(path)
-    source_reference = _media_artifact_reference(source)
     destination = _resolve_output(
         output_path
         or str(source.parent / f"{source.stem}_thumb_{time:.0f}s.jpg"),
@@ -5194,6 +5458,7 @@ def media_extract_thumbnail(
         width,
     )
     artifact = _media_artifact_reference(Path(out))
+    source_reference = _media_source_artifact_reference(source)
     text = f"Thumbnail saved: {out}"
     return _TextToolOutcome(
         text=text,
@@ -5227,7 +5492,6 @@ def media_extract_thumbnails(
     from .media.ffprobe import extract_thumbnails
 
     source = _resolve_input(path)
-    source_reference = _media_artifact_reference(source)
     destination = _resolve_output(
         output_dir or str(source.parent / f"{source.stem}_thumbs"),
         input_path=source,
@@ -5242,6 +5506,7 @@ def media_extract_thumbnails(
         _media_artifact_reference(Path(thumbnail))
         for thumbnail in thumbs
     ]
+    source_reference = _media_source_artifact_reference(source)
     text = json.dumps(
         {"count": len(thumbs), "thumbnails": thumbs},
         indent=2,
@@ -5442,7 +5707,6 @@ def media_extract_audio(
     from .media.ffprobe import _find_ffmpeg, _run_checked
 
     source = _resolve_input(path)
-    source_reference = _media_artifact_reference(source)
     if format not in {"wav", "mp3", "flac"}:
         raise FCPMCPError(
             ErrorCode.INVALID_ARGUMENTS,
@@ -5469,6 +5733,8 @@ def media_extract_audio(
         timeout=300,
         expected_outputs=[output],
     )
+    artifact = _media_artifact_reference(output)
+    source_reference = _media_source_artifact_reference(source)
 
     size_mb = output.stat().st_size / (1024 * 1024)
     text = json.dumps({
@@ -5482,7 +5748,7 @@ def media_extract_audio(
         structured=MediaArtifactResult(
             operation="extract_audio",
             source=source_reference,
-            artifact=_media_artifact_reference(output),
+            artifact=artifact,
         ),
     )
 
@@ -5510,7 +5776,6 @@ def media_audio_to_midi(
     from .media.ffprobe import _find_ffmpeg, _run_checked
 
     source = _resolve_input(path)
-    source_reference = _media_artifact_reference(source)
     inference_source = source
 
     # If video, extract audio first
@@ -5557,6 +5822,8 @@ def media_audio_to_midi(
                 ErrorCode.OUTPUT_MISSING,
                 f"basic-pitch did not create a nonempty MIDI file: {output}",
             )
+        artifact = _media_artifact_reference(output)
+        source_reference = _media_source_artifact_reference(source)
 
         # Summarize what was detected
         note_count = len(note_events)
@@ -5580,7 +5847,7 @@ def media_audio_to_midi(
             structured=MediaArtifactResult(
                 operation="audio_to_midi",
                 source=source_reference,
-                artifact=_media_artifact_reference(output),
+                artifact=artifact,
             ),
         )
 
@@ -5745,7 +6012,8 @@ def puppet_build_scene(
         project_name: Project name
         output_path: Where to save (default: ~/Movies/<project_name>.fcpxml)
     """
-    _parse_time(duration, "duration")
+    _require_puppet_project_name(project_name)
+    _parse_positive_time(duration, "duration")
     rigs_data = _load_rigs(rigs_json)
 
     builder = PuppetSceneBuilder(duration=duration)
@@ -5756,7 +6024,7 @@ def puppet_build_scene(
 
     gen = builder.build(project_name=project_name)
 
-    receipt, committed_project = _save_puppet_generation(
+    receipt, committed_project, animation_records = _save_puppet_generation(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
@@ -5776,9 +6044,10 @@ def puppet_build_scene(
     return _TextToolOutcome(
         text=text,
         structured=PuppetBuildResult(
+            operation="build_scene",
             project=committed_project,
             rigs=rig_records,
-            animations=[],
+            animations=animation_records,
             duration=duration,
             destination=_artifact_reference(receipt),
             receipt=_receipt_result(receipt),
@@ -5829,7 +6098,8 @@ def puppet_animate(
         project_name: Project name
         output_path: Where to save
     """
-    _parse_time(duration, "duration")
+    _require_puppet_project_name(project_name)
+    _parse_positive_time(duration, "duration")
     rigs_data = _load_rigs(rigs_json)
     anims_data = _load_json_list(animations_json, "animations_json")
     if not anims_data:
@@ -5942,11 +6212,7 @@ def puppet_animate(
         animations.append(animation)
 
     gen = builder.build(project_name=project_name)
-    animation_records = [
-        _puppet_animation_record(animation)
-        for animation in animations
-    ]
-    receipt, committed_project = _save_puppet_generation(
+    receipt, committed_project, animation_records = _save_puppet_generation(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
@@ -5965,6 +6231,7 @@ def puppet_animate(
     return _TextToolOutcome(
         text=text,
         structured=PuppetBuildResult(
+            operation="animate",
             project=committed_project,
             rigs=rig_records,
             animations=animation_records,
@@ -6007,7 +6274,8 @@ def puppet_preset_motion(
         cycles: Number of motion cycles (more = faster movement)
         intensity: Scale factor for motion amplitude (0.5 = subtle, 2.0 = exaggerated)
     """
-    _parse_time(duration, "duration")
+    _require_puppet_project_name(project_name)
+    _parse_positive_time(duration, "duration")
     if cycles <= 0 or intensity <= 0:
         raise FCPMCPError(
             ErrorCode.INVALID_ARGUMENTS,
@@ -6061,11 +6329,7 @@ def puppet_preset_motion(
 
     gen = builder.build(project_name=project_name)
     rig_record = _puppet_rig_record(rig)
-    animation_records = [
-        _puppet_animation_record(animation)
-        for animation in anims
-    ]
-    receipt, committed_project = _save_puppet_generation(
+    receipt, committed_project, animation_records = _save_puppet_generation(
         gen,
         output_path,
         default_name=f"{project_name}.fcpxml",
@@ -6085,6 +6349,7 @@ def puppet_preset_motion(
     return _TextToolOutcome(
         text=text,
         structured=PuppetBuildResult(
+            operation="preset_motion",
             project=committed_project,
             rigs=[rig_record],
             animations=animation_records,
@@ -6121,6 +6386,7 @@ def puppet_multi_scene(
         project_name: Base project name (scenes get suffixed)
         output_path: Output directory (default: ~/Movies/)
     """
+    _require_puppet_project_name(project_name)
     rigs_data = _load_rigs(rigs_json)
     scenes_data = _load_json_list(scenes_json, "scenes_json")
     if not scenes_data:
@@ -6129,25 +6395,49 @@ def puppet_multi_scene(
             "scenes_json must contain at least one scene",
         )
     supported_presets = {"idle", "walk", "talk", "wave", "bounce"}
+    normalized_scene_names: list[str] = []
     for index, scene in enumerate(scenes_data):
         if not isinstance(scene, dict):
             raise FCPMCPError(
                 ErrorCode.INVALID_ARGUMENTS,
                 f"scenes_json[{index}] must be an object",
             )
-        scene_name = scene.get("name", f"scene_{index + 1}")
-        if not isinstance(scene_name, str) or not scene_name:
+        raw_scene_name = scene.get("name", f"scene_{index + 1}")
+        if isinstance(raw_scene_name, str):
+            scene_name = raw_scene_name
+        elif (
+            isinstance(raw_scene_name, (int, float))
+            and not isinstance(raw_scene_name, bool)
+            and (
+                not isinstance(raw_scene_name, float)
+                or isfinite(raw_scene_name)
+            )
+        ):
+            scene_name = str(raw_scene_name)
+        else:
             raise FCPMCPError(
                 ErrorCode.INVALID_ARGUMENTS,
-                f"scenes_json[{index}].name must be a nonempty string",
+                (
+                    f"scenes_json[{index}].name must be a nonempty "
+                    "string or finite number"
+                ),
             )
+        if not scene_name:
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"scenes_json[{index}].name must not be empty",
+            )
+        normalized_scene_names.append(scene_name)
         scene_duration = scene.get("duration", "300300/30000s")
         if not isinstance(scene_duration, str):
             raise FCPMCPError(
                 ErrorCode.INVALID_ARGUMENTS,
                 f"scenes_json[{index}].duration must be a string",
             )
-        _parse_time(scene_duration, f"scenes_json[{index}].duration")
+        _parse_positive_time(
+            scene_duration,
+            f"scenes_json[{index}].duration",
+        )
         preset = scene.get("preset", "idle")
         if not isinstance(preset, str) or preset not in supported_presets:
             raise FCPMCPError(
@@ -6182,11 +6472,40 @@ def puppet_multi_scene(
             ErrorCode.INVALID_PATH,
             f"Expected an existing output directory: {out_dir}",
         )
-    results = []
-    scene_artifacts: list[PuppetSceneArtifactRecord] = []
+    out_dir = out_dir.resolve()
+    scene_destinations: list[Path] = []
+    for index, scene_name in enumerate(normalized_scene_names):
+        full_name = f"{project_name}_{scene_name}"
+        destination = _resolve_output(
+            str(out_dir / f"{full_name}.fcpxml"),
+            default_name=f"{full_name}.fcpxml",
+            suffixes={".fcpxml"},
+        )
+        if destination.parent != out_dir:
+            raise FCPMCPError(
+                ErrorCode.INVALID_ARGUMENTS,
+                f"scenes_json[{index}].name escapes the output directory",
+            )
+        scene_destinations.append(destination)
+    if len(set(scene_destinations)) != len(scene_destinations):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "Scene names resolve to duplicate output destinations",
+        )
 
+    prepared_scenes: list[
+        tuple[
+            object,
+            str,
+            str,
+            str,
+            list[PuppetRigRecord],
+            _PreparedPuppetGeneration,
+        ]
+    ] = []
     for i, scene in enumerate(scenes_data):
-        scene_name = scene.get("name", f"scene_{i+1}")
+        raw_scene_name = scene.get("name", f"scene_{i+1}")
+        scene_name = normalized_scene_names[i]
         scene_duration = scene.get("duration", "300300/30000s")
         scene_preset = scene.get("preset", "idle")
         scene_cycles = scene.get("cycles", 3)
@@ -6221,38 +6540,129 @@ def puppet_multi_scene(
                 builder.add_animation(anim)
                 scene_animations.append(anim)
 
+        if not scene_animations:
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                (
+                    f"Preset '{scene_preset}' has no compatible parts "
+                    f"in scene '{scene_name}'"
+                ),
+            )
         full_name = f"{project_name}_{scene_name}"
         gen = builder.build(project_name=full_name)
         rig_records = [
             _puppet_rig_record(rig)
             for rig in scene_rigs
         ]
-        animation_records = [
-            _puppet_animation_record(animation)
-            for animation in scene_animations
-        ]
-        receipt, committed_project = _save_puppet_generation(
+        prepared = _prepare_puppet_generation(
             gen,
-            str(out_dir / f"{full_name}.fcpxml"),
+            str(scene_destinations[i]),
             default_name=f"{full_name}.fcpxml",
             expected_project=full_name,
             rigs=scene_rigs,
             animations=scene_animations,
         )
+        prepared_scenes.append(
+            (
+                raw_scene_name,
+                scene_name,
+                scene_preset,
+                scene_duration,
+                rig_records,
+                prepared,
+            )
+        )
+
+    committed_scenes: list[
+        tuple[
+            object,
+            str,
+            str,
+            str,
+            list[PuppetRigRecord],
+            _PreparedPuppetGeneration,
+            FCPXMLTransactionReceipt,
+            str,
+            list[PuppetAnimationRecord],
+        ]
+    ] = []
+    for (
+        raw_scene_name,
+        scene_name,
+        scene_preset,
+        scene_duration,
+        rig_records,
+        prepared,
+    ) in prepared_scenes:
+        receipt, committed_project, animation_records = (
+            _commit_puppet_generation(prepared)
+        )
+        committed_scenes.append(
+            (
+                raw_scene_name,
+                scene_name,
+                scene_preset,
+                scene_duration,
+                rig_records,
+                prepared,
+                receipt,
+                committed_project,
+                animation_records,
+            )
+        )
+
+    results = []
+    scene_artifacts: list[PuppetSceneArtifactRecord] = []
+    for (
+        raw_scene_name,
+        scene_name,
+        scene_preset,
+        scene_duration,
+        rig_records,
+        prepared,
+        receipt,
+        committed_project,
+        animation_records,
+    ) in committed_scenes:
+        final_artifact = _artifact_reference_for_path(
+            receipt.destination,
+            media_type="application/vnd.apple.fcpxml+xml",
+        )
+        if (
+            final_artifact.path != str(receipt.destination)
+            or final_artifact.sha256 != receipt.output_sha256
+        ):
+            _raise_validation_failure(
+                "Committed puppet artifact no longer matches its receipt"
+            )
+        final_project, final_animations = _puppet_candidate_evidence(
+            receipt.destination,
+            expected_project=prepared.expected_project,
+            rigs=prepared.rigs,
+            animations=prepared.animations,
+        )
+        if (
+            final_project != committed_project
+            or final_animations != animation_records
+        ):
+            _raise_validation_failure(
+                "Committed puppet artifact evidence changed after commit"
+            )
         results.append({
-            "scene": scene_name,
+            "scene": raw_scene_name,
             "file": str(receipt.destination),
             "preset": scene_preset,
         })
         scene_artifacts.append(
             PuppetSceneArtifactRecord(
+                operation="multi_scene",
                 scene=scene_name,
                 preset=scene_preset,
                 project=committed_project,
                 rigs=rig_records,
                 animations=animation_records,
                 duration=scene_duration,
-                destination=_artifact_reference(receipt),
+                destination=final_artifact,
                 receipt=_receipt_result(receipt),
             )
         )

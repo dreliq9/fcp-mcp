@@ -177,6 +177,23 @@ class MediaArtifactResult(BaseModel):
     source: ArtifactReference
     artifact: ArtifactReference
 
+    @model_validator(mode="after")
+    def artifact_type_matches_operation(self) -> Self:
+        expected_prefix = {
+            "extract_thumbnail": "image/",
+            "extract_audio": "audio/",
+            "audio_to_midi": "audio/midi",
+        }[self.operation]
+        if (
+            self.artifact.media_type != expected_prefix
+            if self.operation == "audio_to_midi"
+            else not self.artifact.media_type.startswith(expected_prefix)
+        ):
+            raise ValueError(
+                "artifact media_type must match the requested operation"
+            )
+        return self
+
 
 class MediaArtifactListResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
@@ -193,4 +210,17 @@ class MediaArtifactListResult(BaseModel):
             raise ValueError(
                 "requested_count must match the verified artifact count"
             )
+        if self.requested_count <= 0:
+            raise ValueError("requested_count must be positive")
+        if any(
+            not artifact.media_type.startswith("image/")
+            for artifact in self.artifacts
+        ):
+            raise ValueError(
+                "extract_thumbnails artifacts must be images"
+            )
+        if len({artifact.path for artifact in self.artifacts}) != len(
+            self.artifacts
+        ):
+            raise ValueError("thumbnail artifact paths must be unique")
         return self
