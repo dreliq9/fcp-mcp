@@ -11,10 +11,26 @@ from .platform_support import require_macos
 
 _RUNTIME_MODULE = "fcp_mcp._server_runtime"
 _runtime: ModuleType | None = None
+_FACADE_OWNED_NAMES = frozenset(
+    {
+        "_FACADE_OWNED_NAMES",
+        "_RUNTIME_MODULE",
+        "_ServerFacade",
+        "_load_runtime",
+        "_runtime",
+        "Any",
+        "ModuleType",
+        "importlib",
+        "main",
+        "require_macos",
+        "sys",
+    }
+)
 
 
 def _load_runtime() -> ModuleType:
     global _runtime
+    require_macos()
     if _runtime is None:
         _runtime = importlib.import_module(_RUNTIME_MODULE)
     return _runtime
@@ -33,14 +49,19 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | set(dir(_load_runtime())))
+    names = set(globals())
+    if _runtime is not None:
+        names.update(dir(_runtime))
+    return sorted(names)
 
 
 class _ServerFacade(ModuleType):
     """Forward public test/runtime overrides to the lazy runtime module."""
 
     def __setattr__(self, name: str, value: Any) -> None:
-        if name.startswith("_") or name in self.__dict__:
+        if name in _FACADE_OWNED_NAMES or (
+            name.startswith("__") and name.endswith("__")
+        ):
             super().__setattr__(name, value)
             return
         runtime = _load_runtime()
@@ -50,7 +71,9 @@ class _ServerFacade(ModuleType):
         super().__setattr__(name, value)
 
     def __delattr__(self, name: str) -> None:
-        if name.startswith("_") or name in self.__dict__:
+        if name in _FACADE_OWNED_NAMES or (
+            name.startswith("__") and name.endswith("__")
+        ):
             super().__delattr__(name)
             return
         runtime = _load_runtime()

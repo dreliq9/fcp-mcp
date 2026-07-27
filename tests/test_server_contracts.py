@@ -72,6 +72,85 @@ else:
     assert completed.stderr == ""
 
 
+def test_lazy_server_access_rejects_before_runtime_construction():
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+import sysconfig
+
+sysconfig.get_config_vars()
+
+from fcp_mcp.config import RuntimeConfig
+from fcp_mcp.contracts import ErrorCode, FCPMCPError
+from fcp_mcp.mcp_boundary import FCPFastMCP
+from fcp_mcp.registry import PromptRegistry, ToolRegistry
+from fcp_mcp.security.paths import PathPolicy
+import fcp_mcp.mcp_boundary as mcp_boundary
+
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("unsupported access crossed a runtime boundary")
+
+
+RuntimeConfig.from_env = classmethod(forbidden)
+PathPolicy.__init__ = forbidden
+ToolRegistry.__init__ = forbidden
+PromptRegistry.__init__ = forbidden
+mcp_boundary.build_mcp_server = forbidden
+FCPFastMCP.run = forbidden
+
+sys.platform = "linux"
+import fcp_mcp.server as server
+
+dir(server)
+
+try:
+    from fcp_mcp.server import mcp
+except FCPMCPError as error:
+    assert error.code is ErrorCode.UNSUPPORTED_PLATFORM
+    assert str(error) == "unsupported_platform: fcp-mcp requires macOS"
+else:
+    raise AssertionError("lazy access exposed mcp off macOS")
+
+try:
+    from fcp_mcp.server import fcpxml_validate
+except FCPMCPError as error:
+    assert error.code is ErrorCode.UNSUPPORTED_PLATFORM
+    assert str(error) == "unsupported_platform: fcp-mcp requires macOS"
+else:
+    raise AssertionError("lazy access exposed fcpxml_validate off macOS")
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == ""
+    assert completed.stderr == ""
+
+
+def test_private_helper_override_reaches_runtime_handler(
+    monkeypatch,
+    sample_fcpxml_path: Path,
+):
+    def redirected_input(*_args, **_kwargs):
+        return sample_fcpxml_path
+
+    monkeypatch.setattr(server, "_resolve_input", redirected_input)
+
+    result = server.fcpxml_parse("redirected.fcpxml")
+
+    assert result.structured.version == "1.11"
+    assert [project.name for project in result.structured.projects] == [
+        "Travel Vlog v1"
+    ]
+
+
 @pytest.fixture
 def scoped_server_paths(
     monkeypatch,
