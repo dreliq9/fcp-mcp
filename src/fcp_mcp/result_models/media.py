@@ -4,21 +4,22 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
 RawSummary = Annotated[str, Field(max_length=2000)]
+BoundedText = Annotated[str, Field(max_length=2000)]
 
 
 class MediaStreamRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    index: int
+    index: int | None
     codec_type: str
     codec: str | None
     codec_long_name: str | None
     language: str
-    duration_seconds: float | None
-    bitrate_kbps: float | None
+    duration_seconds: FiniteFloat | None
+    bitrate_kbps: FiniteFloat | None
     raw_summary: RawSummary | None = None
 
 
@@ -26,7 +27,7 @@ class VideoStreamRecord(MediaStreamRecord):
     codec_type: Literal["video"]
     width: int | None
     height: int | None
-    frame_rate: float | None
+    frame_rate: FiniteFloat | None
     pixel_format: str | None
 
 
@@ -42,8 +43,23 @@ class SubtitleStreamRecord(MediaStreamRecord):
     title: str | None
 
 
+class UnsupportedStreamRecord(MediaStreamRecord):
+    codec_type: Literal["data", "attachment", "unknown"]
+    reason: Literal[
+        "unsupported_codec_type",
+        "unrecognized_codec_type",
+        "missing_codec_type",
+        "malformed_codec_type",
+    ]
+
+
 StreamRecord = Annotated[
-    VideoStreamRecord | AudioStreamRecord | SubtitleStreamRecord,
+    (
+        VideoStreamRecord
+        | AudioStreamRecord
+        | SubtitleStreamRecord
+        | UnsupportedStreamRecord
+    ),
     Field(discriminator="codec_type"),
 ]
 
@@ -54,9 +70,9 @@ class MediaInfoResult(BaseModel):
     schema_version: Literal["1"] = "1"
     filename: str | None
     format: str | None
-    duration_seconds: float | None
-    size_mb: float | None
-    bitrate_kbps: float | None
+    duration_seconds: FiniteFloat | None
+    size_mb: FiniteFloat | None
+    bitrate_kbps: FiniteFloat | None
     streams: list[StreamRecord]
     raw_summary: RawSummary | None = None
 
@@ -64,9 +80,9 @@ class MediaInfoResult(BaseModel):
 class SilenceRangeRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    start_seconds: float
-    end_seconds: float
-    duration_seconds: float
+    start_seconds: FiniteFloat
+    end_seconds: FiniteFloat
+    duration_seconds: FiniteFloat
 
 
 class SilenceDetectionResult(BaseModel):
@@ -74,23 +90,23 @@ class SilenceDetectionResult(BaseModel):
 
     schema_version: Literal["1"] = "1"
     noise_threshold: str
-    minimum_duration_seconds: float
+    minimum_duration_seconds: FiniteFloat
     ranges: list[SilenceRangeRecord]
 
 
 class BeatRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    seconds: float
+    seconds: FiniteFloat
     timecode: str
 
 
 class BeatCadenceRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    intervals_seconds: list[float]
-    average_interval_seconds: float | None
-    estimated_bpm: float | None
+    intervals_seconds: list[FiniteFloat]
+    average_interval_seconds: FiniteFloat | None
+    estimated_bpm: FiniteFloat | None
 
 
 class BeatDetectionResult(BaseModel):
@@ -107,16 +123,16 @@ class ParserWarningRecord(BaseModel):
 
     kind: Literal["malformed_value", "command_warning"]
     field: str | None
-    message: str
+    message: BoundedText
 
 
 class LoudnessResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal["1"] = "1"
-    integrated_lufs: float | None
-    loudness_range_lu: float | None
-    true_peak_dbfs: float | None
+    integrated_lufs: FiniteFloat | None
+    loudness_range_lu: FiniteFloat | None
+    true_peak_dbfs: FiniteFloat | None
     warnings: list[ParserWarningRecord]
     raw_summary: RawSummary | None = None
 
@@ -131,18 +147,17 @@ class StreamListResult(BaseModel):
 class SceneChangeRecord(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    time_seconds: float
-    timecode: str
-    score: float | None
+    time_seconds: FiniteFloat | None
+    timecode: str | None
+    score: FiniteFloat | None
 
 
 class SceneDetectionResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: Literal["1"] = "1"
-    threshold: float
+    threshold: FiniteFloat
     scene_count: int
     scene_changes: list[SceneChangeRecord]
     warnings: list[ParserWarningRecord]
     raw_summary: RawSummary | None = None
-

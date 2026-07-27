@@ -6,7 +6,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
@@ -24,7 +24,7 @@ FFPROBE_STDOUT = """{
   },
   "streams": [
     {
-      "index": 0,
+      "index": 3,
       "codec_name": "h264",
       "codec_long_name": "H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
       "codec_type": "video",
@@ -38,7 +38,7 @@ FFPROBE_STDOUT = """{
       "tags": {"language": "eng", "handler_name": "VideoHandler"}
     },
     {
-      "index": 1,
+      "index": 7,
       "codec_name": "aac",
       "codec_long_name": "AAC (Advanced Audio Coding)",
       "codec_type": "audio",
@@ -50,7 +50,7 @@ FFPROBE_STDOUT = """{
       "tags": {"language": "eng", "handler_name": "SoundHandler"}
     },
     {
-      "index": 2,
+      "index": 11,
       "codec_name": "mov_text",
       "codec_long_name": "MOV text",
       "codec_type": "subtitle",
@@ -254,10 +254,13 @@ def _assert_media_info(model: BaseModel) -> None:
     assert model.duration_seconds == 12.5
     assert model.bitrate_kbps == 1536.0
     assert model.streams[0].codec_type == "video"
+    assert model.streams[0].index == 3
     assert model.streams[0].frame_rate == 30000 / 1001
     assert model.streams[1].codec_type == "audio"
+    assert model.streams[1].index == 7
     assert model.streams[1].sample_rate_hz == 48000
     assert model.streams[2].codec_type == "subtitle"
+    assert model.streams[2].index == 11
     assert model.streams[2].title == "Spanish"
 
 
@@ -293,6 +296,7 @@ def _assert_streams(model: BaseModel) -> None:
         "subtitle",
     ]
     assert model.streams[0].width == 1920
+    assert [stream.index for stream in model.streams] == [3, 7, 11]
     assert model.streams[1].channel_layout == "stereo"
     assert model.streams[2].language == "spa"
     assert model.streams[2].title == "Spanish"
@@ -510,7 +514,7 @@ async def test_media_info_and_stream_list_publish_real_discriminated_unions(
         schema = tools[tool_name].outputSchema
         stream_items = schema["properties"]["streams"]["items"]
         assert stream_items["discriminator"]["propertyName"] == "codec_type"
-        assert len(stream_items["oneOf"]) == 3
+        assert len(stream_items["oneOf"]) == 4
         result = await server.mcp.call_tool(tool_name, {"path": str(source)})
         assert [
             stream["codec_type"] for stream in result.structuredContent["streams"]
@@ -556,6 +560,7 @@ async def test_media_info_bounds_raw_values_when_numbers_do_not_normalize(
   },
   "streams": [
     {
+      "index": 0,
       "codec_type": "video",
       "codec_name": "h264",
       "duration": "N/A",
@@ -603,6 +608,69 @@ async def test_media_info_bounds_raw_values_when_numbers_do_not_normalize(
 
 
 @pytest.mark.asyncio
+async def test_nonfinite_media_numbers_never_reach_structured_content(
+    multimedia_boundary: tuple[Path, dict[str, str]],
+) -> None:
+    source, command_output = multimedia_boundary
+    command_output["ffprobe_stdout"] = """{
+  "format": {
+    "filename": "/fixtures/nonfinite.mov",
+    "duration": "NaN",
+    "size": "+inf",
+    "bit_rate": "-inf"
+  },
+  "streams": [
+    {
+      "index": 27,
+      "codec_type": "audio",
+      "codec_name": "aac",
+      "duration": "NaN",
+      "bit_rate": "+inf",
+      "sample_rate": "-inf",
+      "channels": 2,
+      "channel_layout": "stereo"
+    }
+  ]
+}
+"""
+
+    result = await server.mcp.call_tool("media_info", {"path": str(source)})
+
+    assert result.content[0].text == """{
+  "filename": "/fixtures/nonfinite.mov",
+  "duration": "nans",
+  "size_mb": "inf",
+  "bitrate_kbps": "-inf",
+  "format": null,
+  "streams": [
+    {
+      "type": "audio",
+      "codec": "aac",
+      "sample_rate": "-inf",
+      "channels": 2,
+      "channel_layout": "stereo"
+    }
+  ]
+}"""
+    assert result.structuredContent["duration_seconds"] is None
+    assert result.structuredContent["size_mb"] is None
+    assert result.structuredContent["bitrate_kbps"] is None
+    assert result.structuredContent["raw_summary"] == (
+        "duration: NaN\nsize: +inf\nbit_rate: -inf"
+    )
+    stream = result.structuredContent["streams"][0]
+    assert stream["index"] == 27
+    assert stream["duration_seconds"] is None
+    assert stream["bitrate_kbps"] is None
+    assert stream["sample_rate_hz"] is None
+    assert stream["raw_summary"] == (
+        "duration: NaN\nbit_rate: +inf\nsample_rate: -inf"
+    )
+    assert len(result.structuredContent["raw_summary"]) <= 2000
+    assert len(stream["raw_summary"]) <= 2000
+
+
+@pytest.mark.asyncio
 async def test_loudness_retains_parsed_values_and_all_parser_warnings(
     multimedia_boundary: tuple[Path, dict[str, str]],
 ) -> None:
@@ -628,9 +696,45 @@ async def test_loudness_retains_parsed_values_and_all_parser_warnings(
         "malformed_value",
         "command_warning",
     ]
-    assert result.structuredContent["raw_summary"] == (
-        "LRA:        wide LU\n"
+    assert result.structuredContent["warnings"][1]["message"] == (
         "[Parsed_ebur128_0 @ 0x1] warning: gated measurement unavailable"
+    )
+    assert result.structuredContent["raw_summary"] == "LRA:        wide LU"
+    assert len(result.structuredContent["raw_summary"]) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_loudness_rejects_all_nonfinite_ffmpeg_forms(
+    multimedia_boundary: tuple[Path, dict[str, str]],
+) -> None:
+    source, command_output = multimedia_boundary
+    command_output["loudness_stderr"] = """ffmpeg version fixture
+[Parsed_ebur128_0 @ 0x1] Summary:
+  I:         -18.2 LUFS
+  I:           NaN LUFS
+  LRA:        +inf LU
+  Peak:       -inf dBFS
+"""
+
+    result = await server.mcp.call_tool("media_loudness", {"path": str(source)})
+
+    assert result.content[0].text == """{
+  "integrated_lufs": NaN,
+  "loudness_range_lu": Infinity,
+  "true_peak_dbfs": -Infinity
+}"""
+    assert result.structuredContent["integrated_lufs"] == -18.2
+    assert result.structuredContent["loudness_range_lu"] is None
+    assert result.structuredContent["true_peak_dbfs"] is None
+    assert [warning["field"] for warning in result.structuredContent["warnings"]] == [
+        "integrated_lufs",
+        "loudness_range_lu",
+        "true_peak_dbfs",
+    ]
+    assert result.structuredContent["raw_summary"] == (
+        "I:           NaN LUFS\n"
+        "LRA:        +inf LU\n"
+        "Peak:       -inf dBFS"
     )
     assert len(result.structuredContent["raw_summary"]) <= 2000
 
@@ -665,18 +769,270 @@ async def test_scene_detection_retains_scores_and_all_parser_warnings(
             "time_seconds": 1.25,
             "timecode": "00:00:01.250",
             "score": 0.52,
-        }
+        },
+        {
+            "time_seconds": None,
+            "timecode": None,
+            "score": 0.61,
+        },
     ]
     assert [warning["kind"] for warning in result.structuredContent["warnings"]] == [
         "malformed_value",
         "command_warning",
     ]
-    assert result.structuredContent["raw_summary"] == (
-        "[Parsed_showinfo_1 @ 0x1] n:1 pts:bad pts_time:not-a-number "
-        "lavfi.scene_score:0.61\n"
+    assert result.structuredContent["warnings"][1]["message"] == (
         "[Parsed_showinfo_1 @ 0x1] warning: corrupt timestamp metadata"
     )
+    assert result.structuredContent["raw_summary"] == (
+        "[Parsed_showinfo_1 @ 0x1] n:1 pts:bad pts_time:not-a-number "
+        "lavfi.scene_score:0.61"
+    )
     assert len(result.structuredContent["raw_summary"]) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_scene_detection_rejects_nonfinite_values_without_losing_finite_scores(
+    multimedia_boundary: tuple[Path, dict[str, str]],
+) -> None:
+    source, command_output = multimedia_boundary
+    command_output["scene_stderr"] = """ffmpeg version fixture
+[Parsed_showinfo_1 @ 0x1] n:0 pts:1 pts_time:1.5 lavfi.scene_score:NaN
+[Parsed_showinfo_1 @ 0x1] n:1 pts:2 pts_time:+inf lavfi.scene_score:0.62
+[Parsed_showinfo_1 @ 0x1] n:2 pts:3 pts_time:-inf lavfi.scene_score:-inf
+"""
+
+    result = await server.mcp.call_tool(
+        "media_scene_detect",
+        {"path": str(source), "threshold": 0.5},
+    )
+
+    assert result.content[0].text == """{
+  "scene_count": 3,
+  "scenes": [
+    {
+      "time": 1.5
+    },
+    {
+      "time": Infinity
+    },
+    {
+      "time": -Infinity
+    }
+  ]
+}"""
+    assert result.structuredContent["scene_changes"] == [
+        {
+            "time_seconds": 1.5,
+            "timecode": "00:00:01.500",
+            "score": None,
+        },
+        {
+            "time_seconds": None,
+            "timecode": None,
+            "score": 0.62,
+        },
+        {
+            "time_seconds": None,
+            "timecode": None,
+            "score": None,
+        },
+    ]
+    assert [warning["field"] for warning in result.structuredContent["warnings"]] == [
+        "score",
+        "time_seconds",
+        "time_seconds",
+        "score",
+    ]
+    assert result.structuredContent["raw_summary"] == (
+        "[Parsed_showinfo_1 @ 0x1] n:0 pts:1 pts_time:1.5 "
+        "lavfi.scene_score:NaN\n"
+        "[Parsed_showinfo_1 @ 0x1] n:1 pts:2 pts_time:+inf "
+        "lavfi.scene_score:0.62\n"
+        "[Parsed_showinfo_1 @ 0x1] n:2 pts:3 pts_time:-inf "
+        "lavfi.scene_score:-inf"
+    )
+    assert len(result.structuredContent["raw_summary"]) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_streams_preserve_real_indices_and_never_relabel_unsupported_types(
+    multimedia_boundary: tuple[Path, dict[str, str]],
+) -> None:
+    source, command_output = multimedia_boundary
+    command_output["ffprobe_stdout"] = """{
+  "format": {},
+  "streams": [
+    {"index": 4, "codec_type": "video", "codec_name": "h264"},
+    {"index": 9, "codec_type": "subtitle", "codec_name": "mov_text"},
+    {"index": 20, "codec_type": "data", "codec_name": "bin_data"},
+    {"index": 21, "codec_type": "attachment", "codec_name": "ttf"},
+    {"index": 22, "codec_type": "mystery", "codec_name": "private"},
+    {"index": 23, "codec_name": "missing_type"}
+  ]
+}
+"""
+
+    result = await server.mcp.call_tool(
+        "media_list_streams",
+        {"path": str(source)},
+    )
+
+    assert result.content[0].text == """[
+  {
+    "index": 0,
+    "type": "video",
+    "codec": "h264",
+    "language": "",
+    "duration": null
+  },
+  {
+    "index": 1,
+    "type": "subtitle",
+    "codec": "mov_text",
+    "language": "",
+    "duration": null
+  },
+  {
+    "index": 2,
+    "type": "data",
+    "codec": "bin_data",
+    "language": "",
+    "duration": null
+  },
+  {
+    "index": 3,
+    "type": "attachment",
+    "codec": "ttf",
+    "language": "",
+    "duration": null
+  },
+  {
+    "index": 4,
+    "type": "mystery",
+    "codec": "private",
+    "language": "",
+    "duration": null
+  },
+  {
+    "index": 5,
+    "type": null,
+    "codec": "missing_type",
+    "language": "",
+    "duration": null
+  }
+]"""
+    streams = result.structuredContent["streams"]
+    assert [stream["index"] for stream in streams] == [4, 9, 20, 21, 22, 23]
+    assert [stream["codec_type"] for stream in streams] == [
+        "video",
+        "subtitle",
+        "data",
+        "attachment",
+        "unknown",
+        "unknown",
+    ]
+    assert [stream.get("reason") for stream in streams[2:]] == [
+        "unsupported_codec_type",
+        "unsupported_codec_type",
+        "unrecognized_codec_type",
+        "missing_codec_type",
+    ]
+    assert streams[2]["raw_summary"] is None
+    assert streams[3]["raw_summary"] is None
+    assert streams[4]["raw_summary"] == "codec_type: mystery"
+    assert streams[5]["raw_summary"] == "codec_type: <missing>"
+
+
+@pytest.mark.asyncio
+async def test_scene_timecodes_round_before_second_minute_and_hour_decomposition(
+    multimedia_boundary: tuple[Path, dict[str, str]],
+) -> None:
+    source, command_output = multimedia_boundary
+    command_output["scene_stderr"] = """ffmpeg version fixture
+[Parsed_showinfo_1 @ 0x1] n:0 pts_time:0.9994
+[Parsed_showinfo_1 @ 0x1] n:1 pts_time:0.9996
+[Parsed_showinfo_1 @ 0x1] n:2 pts_time:1.0004
+[Parsed_showinfo_1 @ 0x1] n:3 pts_time:59.9994
+[Parsed_showinfo_1 @ 0x1] n:4 pts_time:59.9996
+[Parsed_showinfo_1 @ 0x1] n:5 pts_time:60.0004
+[Parsed_showinfo_1 @ 0x1] n:6 pts_time:3599.9996
+[Parsed_showinfo_1 @ 0x1] n:7 pts_time:3600.0004
+"""
+
+    result = await server.mcp.call_tool(
+        "media_scene_detect",
+        {"path": str(source), "threshold": 0.3},
+    )
+
+    assert result.content[0].text == """{
+  "scene_count": 8,
+  "scenes": [
+    {
+      "time": 0.9994
+    },
+    {
+      "time": 0.9996
+    },
+    {
+      "time": 1.0004
+    },
+    {
+      "time": 59.9994
+    },
+    {
+      "time": 59.9996
+    },
+    {
+      "time": 60.0004
+    },
+    {
+      "time": 3599.9996
+    },
+    {
+      "time": 3600.0004
+    }
+  ]
+}"""
+    assert [
+        change["timecode"]
+        for change in result.structuredContent["scene_changes"]
+    ] == [
+        "00:00:00.999",
+        "00:00:01.000",
+        "00:00:01.000",
+        "00:00:59.999",
+        "00:01:00.000",
+        "00:01:00.000",
+        "01:00:00.000",
+        "01:00:00.000",
+    ]
+
+
+def test_media_models_reject_nonfinite_values_at_validation_boundary() -> None:
+    result_models = importlib.import_module("fcp_mcp.result_models.media")
+
+    with pytest.raises(ValidationError):
+        result_models.MediaInfoResult(
+            filename=None,
+            format=None,
+            duration_seconds=float("nan"),
+            size_mb=None,
+            bitrate_kbps=None,
+            streams=[],
+        )
+    with pytest.raises(ValidationError):
+        result_models.SceneChangeRecord(
+            time_seconds=1.0,
+            timecode="00:00:01.000",
+            score=float("inf"),
+        )
+    with pytest.raises(ValidationError):
+        result_models.LoudnessResult(
+            integrated_lufs=-18.0,
+            loudness_range_lu=float("-inf"),
+            true_peak_dbfs=-1.0,
+            warnings=[],
+        )
 
 
 def test_media_and_puppet_models_are_frozen_strict_and_opaque_free() -> None:
@@ -687,6 +1043,7 @@ def test_media_and_puppet_models_are_frozen_strict_and_opaque_free() -> None:
         "VideoStreamRecord",
         "AudioStreamRecord",
         "SubtitleStreamRecord",
+        "UnsupportedStreamRecord",
         "MediaInfoResult",
         "SilenceRangeRecord",
         "SilenceDetectionResult",

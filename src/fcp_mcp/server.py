@@ -11,6 +11,7 @@ import subprocess
 from collections.abc import Collection
 from dataclasses import asdict
 from itertools import pairwise
+from math import isfinite
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote as url_unquote
@@ -103,6 +104,7 @@ from .result_models.media import (
     StreamListResult,
     StreamRecord,
     SubtitleStreamRecord,
+    UnsupportedStreamRecord,
     VideoStreamRecord,
 )
 from .result_models.puppet import (
@@ -3127,15 +3129,24 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
 
 
 def _seconds_timecode(seconds: float) -> str:
-    hours, remainder = divmod(seconds, 3600)
-    minutes, remainder = divmod(remainder, 60)
-    return f"{int(hours):02d}:{int(minutes):02d}:{remainder:06.3f}"
+    milliseconds = round(seconds * 1000)
+    hours, remainder = divmod(milliseconds, 3_600_000)
+    minutes, remainder = divmod(remainder, 60_000)
+    whole_seconds, milliseconds = divmod(remainder, 1000)
+    return (
+        f"{hours:02d}:{minutes:02d}:{whole_seconds:02d}."
+        f"{milliseconds:03d}"
+    )
+
+
+def _bounded_text(value: str) -> str:
+    return value[-2000:]
 
 
 def _raw_summary(lines: list[str]) -> str | None:
     if not lines:
         return None
-    return "\n".join(lines)[-2000:]
+    return _bounded_text("\n".join(lines))
 
 
 def _optional_number(
@@ -3150,19 +3161,38 @@ def _optional_number(
     try:
         if allow_fraction and isinstance(value, str) and "/" in value:
             numerator, denominator = value.split("/", 1)
-            return float(numerator) / float(denominator)
-        return float(value)
+            number = float(numerator) / float(denominator)
+        else:
+            number = float(value)
+        if not isfinite(number):
+            raise ValueError
+        return number
     except (TypeError, ValueError, ZeroDivisionError):
         failures.append(f"{label}: {value}")
         return None
 
 
+def _legacy_number(value: object, normalized: float | None) -> float:
+    if normalized is not None:
+        return normalized
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _stream_record(
     stream: dict[str, Any],
-    *,
-    index: int,
 ) -> StreamRecord:
     failures: list[str] = []
+    raw_index = stream.get("index")
+    if isinstance(raw_index, int) and not isinstance(raw_index, bool):
+        index = raw_index
+    else:
+        index = None
+        failures.append(
+            "index: <missing>" if raw_index is None else f"index: {raw_index}"
+        )
     tags = stream.get("tags")
     tag_values = tags if isinstance(tags, dict) else {}
     common = {
@@ -3218,7 +3248,7 @@ def _stream_record(
             channel_layout=stream.get("channel_layout"),
             raw_summary=_raw_summary(failures),
         )
-    else:
+    elif codec_type == "subtitle":
         record = SubtitleStreamRecord(
             **common,
             codec_type="subtitle",
@@ -3227,6 +3257,28 @@ def _stream_record(
                 if tag_values.get("title") is not None
                 else None
             ),
+            raw_summary=_raw_summary(failures),
+        )
+    else:
+        if codec_type in {"data", "attachment"}:
+            normalized_codec_type = codec_type
+            reason = "unsupported_codec_type"
+        elif codec_type is None:
+            normalized_codec_type = "unknown"
+            reason = "missing_codec_type"
+            failures.append("codec_type: <missing>")
+        elif isinstance(codec_type, str):
+            normalized_codec_type = "unknown"
+            reason = "unrecognized_codec_type"
+            failures.append(f"codec_type: {codec_type}")
+        else:
+            normalized_codec_type = "unknown"
+            reason = "malformed_codec_type"
+            failures.append(f"codec_type: {codec_type}")
+        record = UnsupportedStreamRecord(
+            **common,
+            codec_type=normalized_codec_type,
+            reason=reason,
             raw_summary=_raw_summary(failures),
         )
     return record
@@ -3262,11 +3314,14 @@ def media_info(path: str) -> ToolOutcome[MediaInfoResult]:
         label="bit_rate",
         failures=failures,
     )
+    legacy_duration = _legacy_number(fmt.get("duration"), duration)
+    legacy_size = _legacy_number(fmt.get("size"), size)
+    legacy_bitrate = _legacy_number(fmt.get("bit_rate"), bitrate)
     summary = {
         "filename": fmt.get("filename"),
-        "duration": f"{duration or 0:.2f}s",
-        "size_mb": f"{(size or 0) / 1048576:.1f}",
-        "bitrate_kbps": f"{(bitrate or 0) / 1000:.0f}",
+        "duration": f"{legacy_duration:.2f}s",
+        "size_mb": f"{legacy_size / 1048576:.1f}",
+        "bitrate_kbps": f"{legacy_bitrate / 1000:.0f}",
         "format": fmt.get("format_long_name"),
         "streams": [],
     }
@@ -3298,8 +3353,8 @@ def media_info(path: str) -> ToolOutcome[MediaInfoResult]:
             size_mb=size / 1048576 if size is not None else None,
             bitrate_kbps=bitrate / 1000 if bitrate is not None else None,
             streams=[
-                _stream_record(stream, index=index)
-                for index, stream in enumerate(streams)
+                _stream_record(stream)
+                for stream in streams
             ],
             raw_summary=_raw_summary(failures),
         ),
@@ -3434,6 +3489,7 @@ def media_loudness(path: str) -> ToolOutcome[LoudnessResult]:
         ],
         timeout=120,
     )
+    legacy_result: dict[str, float] = {}
     result: dict[str, float] = {}
     warnings: list[ParserWarningRecord] = []
     raw_lines: list[str] = []
@@ -3444,14 +3500,12 @@ def media_loudness(path: str) -> ToolOutcome[LoudnessResult]:
     )
     for raw_line in (command_result.stderr or "").splitlines():
         line = raw_line.strip()
-        matched = False
         for marker, unit, field in fields:
             if marker not in line or unit not in line:
                 continue
-            matched = True
             raw_value = line.split(marker, 1)[1].split(unit, 1)[0].strip()
             try:
-                result[field] = float(raw_value)
+                value = float(raw_value)
             except ValueError:
                 warnings.append(
                     ParserWarningRecord(
@@ -3461,23 +3515,35 @@ def media_loudness(path: str) -> ToolOutcome[LoudnessResult]:
                     )
                 )
                 raw_lines.append(line)
+            else:
+                legacy_result[field] = value
+                if isfinite(value):
+                    result[field] = value
+                else:
+                    warnings.append(
+                        ParserWarningRecord(
+                            kind="malformed_value",
+                            field=field,
+                            message=f"{field} was not finite",
+                        )
+                    )
+                    raw_lines.append(line)
             break
-        if not matched and "warning:" in line.lower():
+        if "warning:" in line.lower():
             warnings.append(
                 ParserWarningRecord(
                     kind="command_warning",
                     field=None,
-                    message="FFmpeg reported a loudness warning",
+                    message=_bounded_text(line),
                 )
             )
-            raw_lines.append(line)
-    if not result:
+    if not legacy_result:
         raise FCPMCPError(
             ErrorCode.OUTPUT_MISSING,
             "FFmpeg returned no loudness summary; the file may have no audio",
         )
     return ToolOutcome(
-        text=json.dumps(result, indent=2),
+        text=json.dumps(legacy_result, indent=2),
         structured=LoudnessResult(
             integrated_lufs=result.get("integrated_lufs"),
             loudness_range_lu=result.get("loudness_range_lu"),
@@ -3580,8 +3646,8 @@ def media_list_streams(path: str) -> ToolOutcome[StreamListResult]:
         text=json.dumps(result, indent=2),
         structured=StreamListResult(
             streams=[
-                _stream_record(stream, index=index)
-                for index, stream in enumerate(streams)
+                _stream_record(stream)
+                for stream in streams
             ],
         ),
     )
@@ -3620,17 +3686,27 @@ def media_scene_detect(
         ],
         timeout=300,
     )
-    scenes: list[dict[str, float]] = []
+    legacy_scenes: list[dict[str, float]] = []
     scene_changes: list[SceneChangeRecord] = []
     warnings: list[ParserWarningRecord] = []
     raw_lines: list[str] = []
     for raw_line in (command_result.stderr or "").splitlines():
         line = raw_line.strip()
+        if "warning:" in line.lower():
+            warnings.append(
+                ParserWarningRecord(
+                    kind="command_warning",
+                    field=None,
+                    message=_bounded_text(line),
+                )
+            )
         if "pts_time:" in line:
             raw_time = line.split("pts_time:", 1)[1].split()[0]
+            line_failed = False
             try:
-                time_seconds = float(raw_time)
+                legacy_time_seconds = float(raw_time)
             except ValueError:
+                time_seconds = None
                 warnings.append(
                     ParserWarningRecord(
                         kind="malformed_value",
@@ -3638,14 +3714,30 @@ def media_scene_detect(
                         message="scene timestamp was not numeric",
                     )
                 )
-                raw_lines.append(line)
-                continue
+                line_failed = True
+            else:
+                legacy_scenes.append({"time": legacy_time_seconds})
+                if isfinite(legacy_time_seconds):
+                    time_seconds = legacy_time_seconds
+                else:
+                    time_seconds = None
+                    warnings.append(
+                        ParserWarningRecord(
+                            kind="malformed_value",
+                            field="time_seconds",
+                            message="scene timestamp was not finite",
+                        )
+                    )
+                    line_failed = True
             score = None
             if "lavfi.scene_score:" in line:
                 raw_score = line.split("lavfi.scene_score:", 1)[1].split()[0]
                 try:
                     score = float(raw_score)
+                    if not isfinite(score):
+                        raise ValueError
                 except ValueError:
+                    score = None
                     warnings.append(
                         ParserWarningRecord(
                             kind="malformed_value",
@@ -3653,32 +3745,34 @@ def media_scene_detect(
                             message="scene score was not numeric",
                         )
                     )
-                    raw_lines.append(line)
-            scenes.append({"time": time_seconds})
+                    line_failed = True
+            if line_failed:
+                raw_lines.append(line)
             scene_changes.append(
                 SceneChangeRecord(
                     time_seconds=time_seconds,
-                    timecode=_seconds_timecode(time_seconds),
+                    timecode=(
+                        _seconds_timecode(time_seconds)
+                        if time_seconds is not None
+                        else None
+                    ),
                     score=score,
                 )
             )
-        elif "warning:" in line.lower():
-            warnings.append(
-                ParserWarningRecord(
-                    kind="command_warning",
-                    field=None,
-                    message="FFmpeg reported a scene-detection warning",
-                )
-            )
-            raw_lines.append(line)
     return ToolOutcome(
         text=json.dumps(
-            {"scene_count": len(scenes), "scenes": scenes},
+            {
+                "scene_count": len(legacy_scenes),
+                "scenes": legacy_scenes,
+            },
             indent=2,
         ),
         structured=SceneDetectionResult(
             threshold=threshold,
-            scene_count=len(scene_changes),
+            scene_count=sum(
+                change.time_seconds is not None
+                for change in scene_changes
+            ),
             scene_changes=scene_changes,
             warnings=warnings,
             raw_summary=_raw_summary(raw_lines),
