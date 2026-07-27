@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -89,6 +91,34 @@ def test_doctor_uses_profile_registry_as_catalog_expectation(tmp_path):
     assert catalog["status"] == "pass"
     assert catalog["details"]["profile"] == "inspect"
     assert catalog["details"]["tool_names"] == sorted(expected_tools)
+
+
+def test_doctor_rejects_same_sized_catalog_substitution(
+    tmp_path,
+    monkeypatch,
+):
+    from fcp_mcp import server
+
+    monkeypatch.setenv("FCP_MCP_OUTPUT_DIR", str(tmp_path))
+    registered = asyncio.run(server.mcp.list_tools())
+    observed_names = [tool.name for tool in registered]
+    removed = observed_names[0]
+    observed_names[0] = "unexpected-substitute"
+
+    async def substituted_tools():
+        return [SimpleNamespace(name=name) for name in observed_names]
+
+    monkeypatch.setattr(server.mcp, "list_tools", substituted_tools)
+    report = asyncio.run(cli._doctor())
+    catalog = next(check for check in report.checks if check.id == "mcp_catalog")
+
+    assert report.tool_count == len(registered)
+    assert catalog.status == "fail"
+    assert catalog.details["tool_names"] == sorted(observed_names)
+    assert catalog.details["missing_tool_names"] == [removed]
+    assert catalog.details["unexpected_tool_names"] == [
+        "unexpected-substitute"
+    ]
 
 
 def test_no_arguments_starts_stdio(monkeypatch):

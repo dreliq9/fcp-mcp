@@ -15,15 +15,17 @@ async def test_doctor_has_stable_schema_and_catalog(tmp_path: Path):
         {"FCP_MCP_OUTPUT_DIR": str(tmp_path)},
         home=tmp_path,
     )
+    tool_names = {"second", "first"} | {f"tool-{i}" for i in range(87)}
+    prompt_names = {f"prompt-{i}" for i in range(5)}
 
     async def catalog():
-        return 89, 5
+        return tool_names, prompt_names
 
     report = await collect_doctor(
         config,
         catalog_provider=catalog,
-        expected_tool_names={"second", "first"} | {f"tool-{i}" for i in range(87)},
-        expected_prompt_count=5,
+        expected_tool_names=tool_names,
+        expected_prompt_names=prompt_names,
     )
     assert report.schema_version == "1"
     assert report.package_version == "0.2.1"
@@ -47,6 +49,7 @@ async def test_doctor_has_stable_schema_and_catalog(tmp_path: Path):
     assert catalog_check.details["tool_names"] == sorted(
         ["first", "second", *[f"tool-{i}" for i in range(87)]]
     )
+    assert catalog_check.summary == "MCP catalog contains 89 tools and 5 prompts"
 
 
 @pytest.mark.asyncio
@@ -56,15 +59,17 @@ async def test_missing_output_directory_blocks_doctor(tmp_path: Path):
         {"FCP_MCP_OUTPUT_DIR": str(missing)},
         home=tmp_path,
     )
+    tool_names = {f"tool-{i}" for i in range(89)}
+    prompt_names = {f"prompt-{i}" for i in range(5)}
 
     async def catalog():
-        return 89, 5
+        return tool_names, prompt_names
 
     report = await collect_doctor(
         config,
         catalog_provider=catalog,
-        expected_tool_names={f"tool-{i}" for i in range(89)},
-        expected_prompt_count=5,
+        expected_tool_names=tool_names,
+        expected_prompt_names=prompt_names,
     )
     output_check = next(check for check in report.checks if check.id == "output_writable")
     assert report.status == "blocked"
@@ -78,20 +83,51 @@ async def test_catalog_mismatch_blocks_doctor(tmp_path: Path):
         {"FCP_MCP_OUTPUT_DIR": str(tmp_path)},
         home=tmp_path,
     )
+    prompt_names = {f"prompt-{i}" for i in range(5)}
 
     async def catalog():
-        return 88, 5
+        return {f"tool-{i}" for i in range(88)}, prompt_names
 
     report = await collect_doctor(
         config,
         catalog_provider=catalog,
         expected_tool_names={f"tool-{i}" for i in range(89)},
-        expected_prompt_count=5,
+        expected_prompt_names=prompt_names,
     )
     catalog_check = next(check for check in report.checks if check.id == "mcp_catalog")
     assert report.status == "blocked"
     assert catalog_check.status == "fail"
     assert report.tool_count == 88
+
+
+@pytest.mark.asyncio
+async def test_same_sized_substituted_catalog_is_invalid(tmp_path: Path):
+    config = RuntimeConfig.from_env(
+        {"FCP_MCP_OUTPUT_DIR": str(tmp_path)},
+        home=tmp_path,
+    )
+
+    async def catalog():
+        return {"expected-a", "unexpected"}, {"prompt-a"}
+
+    report = await collect_doctor(
+        config,
+        catalog_provider=catalog,
+        expected_tool_names={"expected-a", "expected-b"},
+        expected_prompt_names={"prompt-a"},
+    )
+    catalog_check = next(check for check in report.checks if check.id == "mcp_catalog")
+
+    assert report.status == "blocked"
+    assert report.tool_count == 2
+    assert catalog_check.status == "fail"
+    assert catalog_check.details["tool_names"] == ["expected-a", "unexpected"]
+    assert catalog_check.details["expected_tool_names"] == [
+        "expected-a",
+        "expected-b",
+    ]
+    assert catalog_check.details["missing_tool_names"] == ["expected-b"]
+    assert catalog_check.details["unexpected_tool_names"] == ["unexpected"]
 
 
 def test_output_probe_failure_is_reported_and_cleaned_up(
@@ -216,7 +252,7 @@ async def test_catalog_provider_failure_blocks_doctor(tmp_path: Path):
         config,
         catalog_provider=broken_catalog,
         expected_tool_names={f"tool-{i}" for i in range(89)},
-        expected_prompt_count=5,
+        expected_prompt_names={f"prompt-{i}" for i in range(5)},
     )
     catalog_check = next(check for check in report.checks if check.id == "mcp_catalog")
 
@@ -224,6 +260,7 @@ async def test_catalog_provider_failure_blocks_doctor(tmp_path: Path):
     assert catalog_check.status == "fail"
     assert catalog_check.details["error"] == "catalog exploded"
     assert catalog_check.details["profile"] == "workflow"
-    assert catalog_check.details["tool_names"] == sorted(
+    assert catalog_check.details["tool_names"] == []
+    assert catalog_check.details["expected_tool_names"] == sorted(
         f"tool-{index}" for index in range(89)
     )

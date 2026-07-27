@@ -14,7 +14,10 @@ from fcp_mcp.media.ffprobe import _find_ffmpeg, _find_ffprobe, _run_checked
 from fcp_mcp.utils.paths import compressor_binary
 from fcp_mcp.version import distribution_version, package_version
 
-CatalogProvider = Callable[[], Awaitable[tuple[int, int]]]
+CatalogProvider = Callable[
+    [],
+    Awaitable[tuple[Collection[str], Collection[str]]],
+]
 
 
 def _configuration_check(config: RuntimeConfig) -> DoctorCheck:
@@ -280,14 +283,21 @@ async def collect_doctor(
     catalog_provider: CatalogProvider,
     *,
     expected_tool_names: Collection[str] | None = None,
-    expected_prompt_count: int | None = None,
+    expected_prompt_names: Collection[str] | None = None,
 ) -> DoctorReport:
     checks = [_configuration_check(config), _output_check(config)]
     tool_count = 0
     prompt_count = 0
-    tool_names = sorted(expected_tool_names or ())
+    tool_names: list[str] = []
+    prompt_names: list[str] = []
+    expected_tools = sorted(expected_tool_names or ())
+    expected_prompts = sorted(expected_prompt_names or ())
     try:
-        tool_count, prompt_count = await catalog_provider()
+        observed_tools, observed_prompts = await catalog_provider()
+        tool_names = sorted(observed_tools)
+        prompt_names = sorted(observed_prompts)
+        tool_count = len(tool_names)
+        prompt_count = len(prompt_names)
     except Exception as error:  # noqa: BLE001 - diagnostics must report provider failures
         checks.append(
             DoctorCheck(
@@ -298,23 +308,30 @@ async def collect_doctor(
                     "error": str(error),
                     "profile": config.profile.value,
                     "tool_names": tool_names,
+                    "expected_tool_names": expected_tools,
+                    "prompt_names": prompt_names,
+                    "expected_prompt_names": expected_prompts,
                 },
             )
         )
     else:
-        expected_tool_count = (
-            len(tool_names)
+        expected_tools = (
+            expected_tools
             if expected_tool_names is not None
-            else tool_count
+            else tool_names
         )
         expected_prompts = (
-            expected_prompt_count
-            if expected_prompt_count is not None
-            else prompt_count
+            expected_prompts
+            if expected_prompt_names is not None
+            else prompt_names
         )
+        missing_tools = sorted(set(expected_tools) - set(tool_names))
+        unexpected_tools = sorted(set(tool_names) - set(expected_tools))
+        missing_prompts = sorted(set(expected_prompts) - set(prompt_names))
+        unexpected_prompts = sorted(set(prompt_names) - set(expected_prompts))
         catalog_valid = (
-            tool_count == expected_tool_count
-            and prompt_count == expected_prompts
+            tool_names == expected_tools
+            and prompt_names == expected_prompts
         )
         checks.append(
             DoctorCheck(
@@ -331,6 +348,13 @@ async def collect_doctor(
                     "prompt_count": prompt_count,
                     "profile": config.profile.value,
                     "tool_names": tool_names,
+                    "expected_tool_names": expected_tools,
+                    "missing_tool_names": missing_tools,
+                    "unexpected_tool_names": unexpected_tools,
+                    "prompt_names": prompt_names,
+                    "expected_prompt_names": expected_prompts,
+                    "missing_prompt_names": missing_prompts,
+                    "unexpected_prompt_names": unexpected_prompts,
                 },
                 remediation=(
                     None

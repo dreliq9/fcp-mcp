@@ -69,12 +69,18 @@ _parser = FCPXMLParser()
 _validator = FCPXMLValidator()
 
 
-def catalog_expectations(profile: Profile) -> tuple[frozenset[str], int]:
+def catalog_expectations(
+    profile: Profile,
+) -> tuple[frozenset[str], frozenset[str]]:
     visible_tools = TOOLS.for_profile(profile)
     visible_tool_names = frozenset(
         definition.name for definition in visible_tools
     )
-    return visible_tool_names, len(PROMPTS.for_tools(visible_tool_names))
+    visible_prompt_names = frozenset(
+        definition.name
+        for definition in PROMPTS.for_tools(visible_tool_names)
+    )
+    return visible_tool_names, visible_prompt_names
 
 
 def _resolve_input(
@@ -280,17 +286,22 @@ def _serializable(obj: Any) -> Any:
 async def fcp_doctor() -> DoctorReport:
     """Report structured runtime readiness without prompting or mutating user data."""
 
-    async def catalog() -> tuple[int, int]:
-        return len(await mcp.list_tools()), len(await mcp.list_prompts())
+    async def catalog() -> tuple[tuple[str, ...], tuple[str, ...]]:
+        tools = await mcp.list_tools()
+        prompts = await mcp.list_prompts()
+        return (
+            tuple(tool.name for tool in tools),
+            tuple(prompt.name for prompt in prompts),
+        )
 
-    visible_tool_names, visible_prompt_count = catalog_expectations(
+    visible_tool_names, visible_prompt_names = catalog_expectations(
         CONFIG.profile
     )
     return await collect_doctor(
         CONFIG,
         catalog_provider=catalog,
         expected_tool_names=visible_tool_names,
-        expected_prompt_count=visible_prompt_count,
+        expected_prompt_names=visible_prompt_names,
     )
 
 

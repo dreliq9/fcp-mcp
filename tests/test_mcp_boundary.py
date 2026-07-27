@@ -51,7 +51,10 @@ def test_boundary_preserves_text_and_validates_structured_content(tmp_path):
     assert schema["properties"]["count"]["type"] == "integer"
 
 
-def test_boundary_rejects_structured_content_that_misses_result_schema(tmp_path):
+def test_boundary_sanitizes_structured_result_validation_defects(
+    tmp_path,
+    caplog,
+):
     tools = ToolRegistry()
 
     @tools.tool(tool_class=ToolClass.INSPECT, result_model=CountResult)
@@ -62,8 +65,13 @@ def test_boundary_rejects_structured_content_that_misses_result_schema(tmp_path)
         )
 
     server = build_mcp_server(_config(tmp_path), tools, PromptRegistry())
-    with pytest.raises(ToolError, match="invalid_arguments"):
+    with pytest.raises(ToolError) as caught:
         asyncio.run(server.call_tool("invalid_count", {}))
+
+    assert "internal_error: Unexpected internal failure" in str(caught.value)
+    assert "wrong" not in str(caught.value)
+    assert "valid integer" not in str(caught.value)
+    assert "validation error" in caplog.text.lower()
 
 
 def test_boundary_coerces_legacy_text_without_changing_text(tmp_path):

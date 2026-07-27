@@ -22,6 +22,10 @@ from .tool_metadata import SafetyHints
 logger = logging.getLogger(__name__)
 
 
+class _ResultValidationError(RuntimeError):
+    """Marks invalid handler output as an internal implementation defect."""
+
+
 class FCPFastMCP(FastMCP):
     """FastMCP boundary that preserves domain codes and sanitizes defects."""
 
@@ -92,11 +96,16 @@ def _invoker(definition: ToolDefinition):
         returned = definition.handler(**arguments)
         if inspect.isawaitable(returned):
             returned = await returned
-        outcome = coerce_outcome(returned, definition.result_model)
-        return CallToolResult(
-            content=[TextContent(type="text", text=outcome.text)],
-            structuredContent=outcome.structured.model_dump(mode="json"),
-        )
+        try:
+            outcome = coerce_outcome(returned, definition.result_model)
+            return CallToolResult(
+                content=[TextContent(type="text", text=outcome.text)],
+                structuredContent=outcome.structured.model_dump(mode="json"),
+            )
+        except ValidationError as error:
+            raise _ResultValidationError(
+                "Tool result did not match its declared schema"
+            ) from error
 
     signature = inspect.signature(definition.handler)
     invoke.__signature__ = signature.replace(  # type: ignore[attr-defined]

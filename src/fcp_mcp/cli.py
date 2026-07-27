@@ -25,17 +25,22 @@ async def _doctor() -> DoctorReport:
 
     from fcp_mcp.server import catalog_expectations, mcp
 
-    async def catalog() -> tuple[int, int]:
-        return len(await mcp.list_tools()), len(await mcp.list_prompts())
+    async def catalog() -> tuple[tuple[str, ...], tuple[str, ...]]:
+        tools = await mcp.list_tools()
+        prompts = await mcp.list_prompts()
+        return (
+            tuple(tool.name for tool in tools),
+            tuple(prompt.name for prompt in prompts),
+        )
 
-    expected_tool_names, expected_prompt_count = catalog_expectations(
+    expected_tool_names, expected_prompt_names = catalog_expectations(
         config.profile
     )
     return await collect_doctor(
         config,
         catalog_provider=catalog,
         expected_tool_names=expected_tool_names,
-        expected_prompt_count=expected_prompt_count,
+        expected_prompt_names=expected_prompt_names,
     )
 
 
