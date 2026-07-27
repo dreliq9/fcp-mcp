@@ -10,6 +10,7 @@ import logging
 import subprocess
 from collections.abc import Collection
 from dataclasses import asdict
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote as url_unquote
@@ -86,6 +87,28 @@ from .result_models.fcpxml import (
     ShareDestinationListResult,
     TemplateListResult,
     TimelineStatsResult,
+)
+from .result_models.media import (
+    AudioStreamRecord,
+    BeatCadenceRecord,
+    BeatDetectionResult,
+    BeatRecord,
+    LoudnessResult,
+    MediaInfoResult,
+    ParserWarningRecord,
+    SceneChangeRecord,
+    SceneDetectionResult,
+    SilenceDetectionResult,
+    SilenceRangeRecord,
+    StreamListResult,
+    StreamRecord,
+    SubtitleStreamRecord,
+    VideoStreamRecord,
+)
+from .result_models.puppet import (
+    PuppetPresetListResult,
+    PuppetPresetParameterRecord,
+    PuppetPresetRecord,
 )
 from .security.paths import PathPolicy
 from .tool_metadata import (
@@ -3102,8 +3125,119 @@ def fcpxml_export_edl(path: str, output_path: str = "") -> str:
 # Category 5: Media Analysis — FFmpeg (8 tools)
 # ============================================================================
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def media_info(path: str) -> str:
+
+def _seconds_timecode(seconds: float) -> str:
+    hours, remainder = divmod(seconds, 3600)
+    minutes, remainder = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{remainder:06.3f}"
+
+
+def _raw_summary(lines: list[str]) -> str | None:
+    if not lines:
+        return None
+    return "\n".join(lines)[-2000:]
+
+
+def _optional_number(
+    value: object,
+    *,
+    label: str,
+    failures: list[str],
+    allow_fraction: bool = False,
+) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        if allow_fraction and isinstance(value, str) and "/" in value:
+            numerator, denominator = value.split("/", 1)
+            return float(numerator) / float(denominator)
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        failures.append(f"{label}: {value}")
+        return None
+
+
+def _stream_record(
+    stream: dict[str, Any],
+    *,
+    index: int,
+) -> StreamRecord:
+    failures: list[str] = []
+    tags = stream.get("tags")
+    tag_values = tags if isinstance(tags, dict) else {}
+    common = {
+        "index": index,
+        "codec": stream.get("codec_name"),
+        "codec_long_name": stream.get("codec_long_name"),
+        "language": str(tag_values.get("language", "")),
+        "duration_seconds": _optional_number(
+            stream.get("duration"),
+            label="duration",
+            failures=failures,
+        ),
+        "bitrate_kbps": (
+            value / 1000
+            if (
+                value := _optional_number(
+                    stream.get("bit_rate"),
+                    label="bit_rate",
+                    failures=failures,
+                )
+            )
+            is not None
+            else None
+        ),
+    }
+    codec_type = stream.get("codec_type")
+    if codec_type == "video":
+        record: StreamRecord = VideoStreamRecord(
+            **common,
+            codec_type="video",
+            width=stream.get("width"),
+            height=stream.get("height"),
+            frame_rate=_optional_number(
+                stream.get("r_frame_rate"),
+                label="r_frame_rate",
+                failures=failures,
+                allow_fraction=True,
+            ),
+            pixel_format=stream.get("pix_fmt"),
+            raw_summary=_raw_summary(failures),
+        )
+    elif codec_type == "audio":
+        sample_rate = _optional_number(
+            stream.get("sample_rate"),
+            label="sample_rate",
+            failures=failures,
+        )
+        record = AudioStreamRecord(
+            **common,
+            codec_type="audio",
+            sample_rate_hz=int(sample_rate) if sample_rate is not None else None,
+            channels=stream.get("channels"),
+            channel_layout=stream.get("channel_layout"),
+            raw_summary=_raw_summary(failures),
+        )
+    else:
+        record = SubtitleStreamRecord(
+            **common,
+            codec_type="subtitle",
+            title=(
+                str(tag_values["title"])
+                if tag_values.get("title") is not None
+                else None
+            ),
+            raw_summary=_raw_summary(failures),
+        )
+    return record
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=MediaInfoResult,
+)
+def media_info(path: str) -> ToolOutcome[MediaInfoResult]:
     """Get detailed media file info (codec, resolution, duration, bitrate, etc.).
 
     Args:
@@ -3116,11 +3250,23 @@ def media_info(path: str) -> str:
     # Simplify for readability
     fmt = info.get("format", {})
     streams = info.get("streams", [])
+    failures: list[str] = []
+    duration = _optional_number(
+        fmt.get("duration"),
+        label="duration",
+        failures=failures,
+    )
+    size = _optional_number(fmt.get("size"), label="size", failures=failures)
+    bitrate = _optional_number(
+        fmt.get("bit_rate"),
+        label="bit_rate",
+        failures=failures,
+    )
     summary = {
         "filename": fmt.get("filename"),
-        "duration": f"{float(fmt.get('duration', 0)):.2f}s",
-        "size_mb": f"{int(fmt.get('size', 0)) / 1048576:.1f}",
-        "bitrate_kbps": f"{int(fmt.get('bit_rate', 0)) / 1000:.0f}",
+        "duration": f"{duration or 0:.2f}s",
+        "size_mb": f"{(size or 0) / 1048576:.1f}",
+        "bitrate_kbps": f"{(bitrate or 0) / 1000:.0f}",
         "format": fmt.get("format_long_name"),
         "streams": [],
     }
@@ -3143,15 +3289,33 @@ def media_info(path: str) -> str:
                 "channel_layout": stream.get("channel_layout"),
             })
         summary["streams"].append(stream_info)
-    return json.dumps(summary, indent=2)
+    return ToolOutcome(
+        text=json.dumps(summary, indent=2),
+        structured=MediaInfoResult(
+            filename=fmt.get("filename"),
+            format=fmt.get("format_long_name"),
+            duration_seconds=duration,
+            size_mb=size / 1048576 if size is not None else None,
+            bitrate_kbps=bitrate / 1000 if bitrate is not None else None,
+            streams=[
+                _stream_record(stream, index=index)
+                for index, stream in enumerate(streams)
+            ],
+            raw_summary=_raw_summary(failures),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=SilenceDetectionResult,
+)
 def media_detect_silence(
     path: str,
     noise_threshold: str = "-30dB",
     min_duration: float = 0.5,
-) -> str:
+) -> ToolOutcome[SilenceDetectionResult]:
     """Detect silent sections in audio/video files.
 
     Args:
@@ -3167,13 +3331,35 @@ def media_detect_silence(
         noise_threshold,
         min_duration,
     )
+    structured = SilenceDetectionResult(
+        noise_threshold=noise_threshold,
+        minimum_duration_seconds=min_duration,
+        ranges=[
+            SilenceRangeRecord(
+                start_seconds=item["start"],
+                end_seconds=item["end"],
+                duration_seconds=item["duration"],
+            )
+            for item in silences
+        ],
+    )
     if not silences:
-        return "No silent sections detected."
-    return json.dumps(silences, indent=2)
+        return ToolOutcome(
+            text="No silent sections detected.",
+            structured=structured,
+        )
+    return ToolOutcome(
+        text=json.dumps(silences, indent=2),
+        structured=structured,
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def media_detect_beats(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=BeatDetectionResult,
+)
+def media_detect_beats(path: str) -> ToolOutcome[BeatDetectionResult]:
     """Detect beat positions in audio/music files.
 
     Returns beat timestamps that can be used for music-synced editing.
@@ -3185,11 +3371,46 @@ def media_detect_beats(path: str) -> str:
 
     source = _resolve_input(path)
     beats = detect_beats(str(source))
-    return json.dumps({"beat_count": len(beats), "beats": beats}, indent=2)
+    intervals = [
+        round(current - previous, 3)
+        for previous, current in pairwise(beats)
+    ]
+    average_interval = (
+        sum(intervals) / len(intervals) if intervals else None
+    )
+    return ToolOutcome(
+        text=json.dumps(
+            {"beat_count": len(beats), "beats": beats},
+            indent=2,
+        ),
+        structured=BeatDetectionResult(
+            beat_count=len(beats),
+            beats=[
+                BeatRecord(
+                    seconds=seconds,
+                    timecode=_seconds_timecode(seconds),
+                )
+                for seconds in beats
+            ],
+            cadence=BeatCadenceRecord(
+                intervals_seconds=intervals,
+                average_interval_seconds=average_interval,
+                estimated_bpm=(
+                    60 / average_interval
+                    if average_interval is not None and average_interval > 0
+                    else None
+                ),
+            ),
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def media_loudness(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=LoudnessResult,
+)
+def media_loudness(path: str) -> ToolOutcome[LoudnessResult]:
     """Analyze audio loudness (EBU R128 / LUFS).
 
     Returns integrated loudness, loudness range, and true peak.
@@ -3197,16 +3418,74 @@ def media_loudness(path: str) -> str:
     Args:
         path: Path to audio/video file
     """
-    from .media.ffprobe import analyze_loudness
+    from .media.ffprobe import _find_ffmpeg, _run_checked
 
     source = _resolve_input(path)
-    result = analyze_loudness(str(source))
+    command_result = _run_checked(
+        [
+            _find_ffmpeg(),
+            "-i",
+            str(source),
+            "-af",
+            "ebur128=peak=true",
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout=120,
+    )
+    result: dict[str, float] = {}
+    warnings: list[ParserWarningRecord] = []
+    raw_lines: list[str] = []
+    fields = (
+        ("I:", "LUFS", "integrated_lufs"),
+        ("LRA:", "LU", "loudness_range_lu"),
+        ("Peak:", "dBFS", "true_peak_dbfs"),
+    )
+    for raw_line in (command_result.stderr or "").splitlines():
+        line = raw_line.strip()
+        matched = False
+        for marker, unit, field in fields:
+            if marker not in line or unit not in line:
+                continue
+            matched = True
+            raw_value = line.split(marker, 1)[1].split(unit, 1)[0].strip()
+            try:
+                result[field] = float(raw_value)
+            except ValueError:
+                warnings.append(
+                    ParserWarningRecord(
+                        kind="malformed_value",
+                        field=field,
+                        message=f"{field} was not numeric",
+                    )
+                )
+                raw_lines.append(line)
+            break
+        if not matched and "warning:" in line.lower():
+            warnings.append(
+                ParserWarningRecord(
+                    kind="command_warning",
+                    field=None,
+                    message="FFmpeg reported a loudness warning",
+                )
+            )
+            raw_lines.append(line)
     if not result:
         raise FCPMCPError(
             ErrorCode.OUTPUT_MISSING,
             "FFmpeg returned no loudness summary; the file may have no audio",
         )
-    return json.dumps(result, indent=2)
+    return ToolOutcome(
+        text=json.dumps(result, indent=2),
+        structured=LoudnessResult(
+            integrated_lufs=result.get("integrated_lufs"),
+            loudness_range_lu=result.get("loudness_range_lu"),
+            true_peak_dbfs=result.get("true_peak_dbfs"),
+            warnings=warnings,
+            raw_summary=_raw_summary(raw_lines),
+        ),
+    )
 
 
 @TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
@@ -3273,8 +3552,12 @@ def media_extract_thumbnails(
     return json.dumps({"count": len(thumbs), "thumbnails": thumbs}, indent=2)
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def media_list_streams(path: str) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=StreamListResult,
+)
+def media_list_streams(path: str) -> ToolOutcome[StreamListResult]:
     """List all audio, video, and subtitle streams in a media file.
 
     Args:
@@ -3293,11 +3576,26 @@ def media_list_streams(path: str) -> str:
             "language": stream.get("tags", {}).get("language", ""),
             "duration": stream.get("duration"),
         })
-    return json.dumps(result, indent=2)
+    return ToolOutcome(
+        text=json.dumps(result, indent=2),
+        structured=StreamListResult(
+            streams=[
+                _stream_record(stream, index=index)
+                for index, stream in enumerate(streams)
+            ],
+        ),
+    )
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def media_scene_detect(path: str, threshold: float = 0.3) -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=SceneDetectionResult,
+)
+def media_scene_detect(
+    path: str,
+    threshold: float = 0.3,
+) -> ToolOutcome[SceneDetectionResult]:
     """Detect scene changes in video.
 
     Useful for automatic clip segmentation.
@@ -3306,11 +3604,86 @@ def media_scene_detect(path: str, threshold: float = 0.3) -> str:
         path: Path to video file
         threshold: Scene change sensitivity (0.0-1.0, lower = more sensitive)
     """
-    from .media.ffprobe import detect_scenes
+    from .media.ffprobe import _find_ffmpeg, _run_checked
 
     source = _resolve_input(path)
-    scenes = detect_scenes(str(source), threshold)
-    return json.dumps({"scene_count": len(scenes), "scenes": scenes}, indent=2)
+    command_result = _run_checked(
+        [
+            _find_ffmpeg(),
+            "-i",
+            str(source),
+            "-vf",
+            f"select='gt(scene,{threshold})',showinfo",
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout=300,
+    )
+    scenes: list[dict[str, float]] = []
+    scene_changes: list[SceneChangeRecord] = []
+    warnings: list[ParserWarningRecord] = []
+    raw_lines: list[str] = []
+    for raw_line in (command_result.stderr or "").splitlines():
+        line = raw_line.strip()
+        if "pts_time:" in line:
+            raw_time = line.split("pts_time:", 1)[1].split()[0]
+            try:
+                time_seconds = float(raw_time)
+            except ValueError:
+                warnings.append(
+                    ParserWarningRecord(
+                        kind="malformed_value",
+                        field="time_seconds",
+                        message="scene timestamp was not numeric",
+                    )
+                )
+                raw_lines.append(line)
+                continue
+            score = None
+            if "lavfi.scene_score:" in line:
+                raw_score = line.split("lavfi.scene_score:", 1)[1].split()[0]
+                try:
+                    score = float(raw_score)
+                except ValueError:
+                    warnings.append(
+                        ParserWarningRecord(
+                            kind="malformed_value",
+                            field="score",
+                            message="scene score was not numeric",
+                        )
+                    )
+                    raw_lines.append(line)
+            scenes.append({"time": time_seconds})
+            scene_changes.append(
+                SceneChangeRecord(
+                    time_seconds=time_seconds,
+                    timecode=_seconds_timecode(time_seconds),
+                    score=score,
+                )
+            )
+        elif "warning:" in line.lower():
+            warnings.append(
+                ParserWarningRecord(
+                    kind="command_warning",
+                    field=None,
+                    message="FFmpeg reported a scene-detection warning",
+                )
+            )
+            raw_lines.append(line)
+    return ToolOutcome(
+        text=json.dumps(
+            {"scene_count": len(scenes), "scenes": scenes},
+            indent=2,
+        ),
+        structured=SceneDetectionResult(
+            threshold=threshold,
+            scene_count=len(scene_changes),
+            scene_changes=scene_changes,
+            warnings=warnings,
+            raw_summary=_raw_summary(raw_lines),
+        ),
+    )
 
 
 @TOOLS.tool(tool_class=ToolClass.OFFLINE_WRITE, safety_hints=OFFLINE_WRITE)
@@ -3988,8 +4361,12 @@ def puppet_multi_scene(
     }, indent=2)
 
 
-@TOOLS.tool(tool_class=ToolClass.INSPECT, safety_hints=OFFLINE_READ)
-def puppet_list_presets() -> str:
+@TOOLS.tool(
+    tool_class=ToolClass.INSPECT,
+    safety_hints=OFFLINE_READ,
+    result_model=PuppetPresetListResult,
+)
+def puppet_list_presets() -> ToolOutcome[PuppetPresetListResult]:
     """List all available puppet animation presets with descriptions.
 
     Returns details on each preset, what body parts it uses,
@@ -4027,7 +4404,27 @@ def puppet_list_presets() -> str:
             "good_for": "Greetings, goodbyes, getting attention",
         },
     }
-    return json.dumps(presets, indent=2)
+    return ToolOutcome(
+        text=json.dumps(presets, indent=2),
+        structured=PuppetPresetListResult(
+            presets=[
+                PuppetPresetRecord(
+                    name=name,
+                    description=details["description"],
+                    parts=details["parts_used"],
+                    parameters=[
+                        PuppetPresetParameterRecord(
+                            name=parameter,
+                            default=default,
+                        )
+                        for parameter, default in details["parameters"].items()
+                    ],
+                    usage=details["good_for"],
+                )
+                for name, details in presets.items()
+            ],
+        ),
+    )
 
 
 # ============================================================================
