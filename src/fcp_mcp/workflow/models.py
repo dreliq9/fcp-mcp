@@ -146,6 +146,19 @@ class WorkflowState(str, Enum):
     RECOVERY_REQUIRED = "recovery_required"
 
 
+_PRUNE_ELIGIBLE_STATES = frozenset(
+    {
+        WorkflowState.COMMITTED,
+        WorkflowState.FAILED,
+        WorkflowState.REJECTED,
+        WorkflowState.CANCELLED,
+        WorkflowState.EXPIRED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+    }
+)
+
+
 LEGAL_TRANSITIONS: Mapping[WorkflowState, frozenset[WorkflowState]] = MappingProxyType(
     {
         WorkflowState.PREPARING: frozenset(
@@ -727,16 +740,6 @@ class WorkflowStatusV1(_FrozenStrictModel):
         if self.diff_sha256 is not None and self.candidate_sha256 is None:
             raise ValueError("diff evidence requires candidate evidence")
 
-        terminal_states = {
-            WorkflowState.COMMITTED,
-            WorkflowState.FAILED,
-            WorkflowState.REJECTED,
-            WorkflowState.CANCELLED,
-            WorkflowState.EXPIRED,
-            WorkflowState.STALE,
-            WorkflowState.ROLLED_BACK,
-            WorkflowState.RECOVERY_REQUIRED,
-        }
         for label, digest, artifact in (
             ("candidate", self.candidate_sha256, self.candidate_artifact),
             ("diff", self.diff_sha256, self.diff_artifact),
@@ -750,10 +753,12 @@ class WorkflowStatusV1(_FrozenStrictModel):
             if artifact.sha256 != digest:
                 raise ValueError(f"{label} milestone and artifact hashes must match")
             if (
-                self.state not in terminal_states
-                and artifact.state is not ArtifactState.PRESENT
+                artifact.state is ArtifactState.PRUNED
+                and self.state not in _PRUNE_ELIGIBLE_STATES
             ):
-                raise ValueError(f"preterminal {label} artifact body must be present")
+                raise ValueError(
+                    f"{label} artifact can be pruned only in a prune-eligible terminal state"
+                )
 
         prepared_states = {
             WorkflowState.AWAITING_APPROVAL,

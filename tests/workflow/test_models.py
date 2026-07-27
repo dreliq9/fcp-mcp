@@ -703,6 +703,143 @@ def test_terminal_status_retains_hashes_for_explicit_artifact_state(artifact_sta
     )
 
 
+def _approval_history() -> dict[str, object]:
+    return {
+        "approval_decision": ApprovalDecision.APPROVED,
+        "approval_source": ApprovalSource.CLI,
+        "approved_at": UTC_2,
+        "updated_at": UTC_3,
+    }
+
+
+def _artifact_with_state(
+    artifact_field: str, state: ArtifactState
+) -> ArtifactAvailabilityV1:
+    if artifact_field == "candidate_artifact":
+        return ArtifactAvailabilityV1(
+            state=state,
+            sha256=HASH_C,
+            size_bytes=1024,
+        )
+    return ArtifactAvailabilityV1(
+        state=state,
+        sha256=HASH_D,
+        size_bytes=256,
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkflowState.AWAITING_APPROVAL,
+        WorkflowState.APPROVED,
+        WorkflowState.COMMITTING,
+    ],
+)
+@pytest.mark.parametrize("artifact_field", ["candidate_artifact", "diff_artifact"])
+def test_read_only_status_reports_corrupt_artifacts_without_state_mutation(
+    state, artifact_field
+):
+    changes: dict[str, object] = {"state": state}
+    if state in {WorkflowState.APPROVED, WorkflowState.COMMITTING}:
+        changes.update(_approval_history())
+    changes[artifact_field] = _artifact_with_state(
+        artifact_field, ArtifactState.CORRUPT
+    )
+
+    result = _status(**changes)
+
+    assert getattr(result, artifact_field).state is ArtifactState.CORRUPT
+    assert result.state is state
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkflowState.AWAITING_APPROVAL,
+        WorkflowState.APPROVED,
+        WorkflowState.COMMITTING,
+    ],
+)
+def test_nonterminal_status_rejects_pruned_artifacts(state):
+    changes: dict[str, object] = {"state": state}
+    if state in {WorkflowState.APPROVED, WorkflowState.COMMITTING}:
+        changes.update(_approval_history())
+    changes["candidate_artifact"] = _artifact_with_state(
+        "candidate_artifact", ArtifactState.PRUNED
+    )
+    with pytest.raises(ValidationError):
+        _status(**changes)
+
+
+def test_recovery_required_status_rejects_pruned_artifacts():
+    with pytest.raises(ValidationError):
+        _status(
+            state=WorkflowState.RECOVERY_REQUIRED,
+            **_approval_history(),
+            terminal_error=_terminal_error(),
+            candidate_artifact=_artifact_with_state(
+                "candidate_artifact", ArtifactState.PRUNED
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        WorkflowState.COMMITTED,
+        WorkflowState.FAILED,
+        WorkflowState.REJECTED,
+        WorkflowState.CANCELLED,
+        WorkflowState.EXPIRED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+    ],
+)
+def test_prune_eligible_terminal_states_accept_pruned_artifacts(state):
+    changes: dict[str, object] = {
+        "state": state,
+        "candidate_artifact": _artifact_with_state(
+            "candidate_artifact", ArtifactState.PRUNED
+        ),
+        "diff_artifact": _artifact_with_state("diff_artifact", ArtifactState.PRUNED),
+    }
+    if state in {
+        WorkflowState.COMMITTED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+    }:
+        changes.update(_approval_history())
+    if state is WorkflowState.COMMITTED:
+        changes.update(
+            committed_at=UTC_3,
+            updated_at=UTC_4,
+            expires_at=None,
+            receipt_artifact=ArtifactAvailabilityV1(
+                state=ArtifactState.PRESENT,
+                sha256=HASH_A,
+                size_bytes=512,
+            ),
+        )
+    elif state is WorkflowState.FAILED:
+        changes.update(terminal_error=_terminal_error(), expires_at=None)
+    elif state is WorkflowState.REJECTED:
+        changes.update(
+            approval_decision=ApprovalDecision.REJECTED,
+            approval_source=ApprovalSource.CLI,
+            approved_at=None,
+        )
+    elif state is WorkflowState.CANCELLED:
+        changes["expires_at"] = None
+    elif state is WorkflowState.EXPIRED:
+        changes["updated_at"] = UTC_3
+
+    result = _status(**changes)
+
+    assert result.candidate_artifact.state is ArtifactState.PRUNED
+    assert result.diff_artifact.state is ArtifactState.PRUNED
+
+
 def test_status_enforces_state_specific_commit_and_error_fields():
     _status()
     _status(
