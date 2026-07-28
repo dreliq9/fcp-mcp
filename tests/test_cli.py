@@ -54,7 +54,7 @@ def test_doctor_json_is_machine_readable(capsys, tmp_path, monkeypatch):
     assert code in {0, 1, 2}
     assert payload["schema_version"] == "1"
     assert payload["package_version"] == "0.2.1"
-    assert payload["tool_count"] == 89
+    assert payload["tool_count"] == 93
     assert payload["prompt_count"] == 5
 
 

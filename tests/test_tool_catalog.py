@@ -100,13 +100,17 @@ EXPECTED_TOOLS = {
     "puppet_multi_scene",
     "puppet_list_presets",
     "fcp_doctor",
+    "fcpxml_workflow_prepare",
+    "fcpxml_workflow_status",
+    "fcpxml_workflow_commit",
+    "fcpxml_workflow_cancel",
 }
 
 
-def test_catalog_is_exactly_89_annotated_tools():
+def test_full_catalog_is_exactly_93_annotated_tools():
     tools = asyncio.run(mcp.list_tools())
     assert {tool.name for tool in tools} == EXPECTED_TOOLS
-    assert len(tools) == 89
+    assert len(tools) == 93
     assert all(tool.annotations is not None for tool in tools)
 
 
@@ -132,9 +136,10 @@ def test_real_no_environment_default_exposes_workflow_safe_catalog():
     )
     catalog = json.loads(completed.stdout)
 
-    assert len(catalog["tools"]) == 30
+    assert len(catalog["tools"]) == 34
     assert catalog["tools"][0] == "fcp_doctor"
-    assert catalog["tools"][-1] == "puppet_list_presets"
+    assert catalog["tools"][-1] == "fcpxml_workflow_cancel"
     assert "fcpxml_add_marker" not in catalog["tools"]
     assert "fcp_open_library" not in catalog["tools"]
+    assert "fcpxml_workflow_prepare" in catalog["tools"]
     assert catalog["prompts"] == ["qc-check", "youtube-chapters"]

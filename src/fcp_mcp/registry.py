@@ -1,4 +1,4 @@
-"""SDK-neutral tool and prompt definitions."""
+"""SDK-neutral tool, prompt, and resource definitions."""
 
 from __future__ import annotations
 
@@ -42,6 +42,18 @@ class PromptDefinition:
     handler: Callable[..., Any]
     description: str
     dependencies: frozenset[str]
+    registration_order: int
+
+
+@dataclass(frozen=True)
+class ResourceDefinition:
+    uri_template: str
+    name: str
+    handler: Callable[..., Any]
+    mime_type: str
+    profiles: frozenset[Profile]
+    read_only: bool
+    description: str
     registration_order: int
 
 
@@ -145,9 +157,59 @@ class PromptRegistry:
         )
 
 
+class ResourceRegistry:
+    def __init__(self) -> None:
+        self._definitions: dict[str, ResourceDefinition] = {}
+
+    @property
+    def definitions(self) -> Mapping[str, ResourceDefinition]:
+        return MappingProxyType(self._definitions)
+
+    def resource(
+        self,
+        uri_template: str,
+        *,
+        name: str,
+        mime_type: str,
+        profiles: Iterable[Profile],
+        description: str | None = None,
+    ) -> Callable[[HandlerT], HandlerT]:
+        profile_set = frozenset(profiles)
+        if not profile_set:
+            raise ValueError("Resource profile membership cannot be empty")
+
+        def decorator(handler: HandlerT) -> HandlerT:
+            if uri_template in self._definitions:
+                raise ValueError(f"Duplicate resource template: {uri_template}")
+            self._definitions[uri_template] = ResourceDefinition(
+                uri_template=uri_template,
+                name=name,
+                handler=handler,
+                mime_type=mime_type,
+                profiles=profile_set,
+                read_only=True,
+                description=(
+                    description if description is not None else handler.__doc__ or ""
+                ),
+                registration_order=len(self._definitions),
+            )
+            return handler
+
+        return decorator
+
+    def for_profile(self, profile: Profile) -> tuple[ResourceDefinition, ...]:
+        return tuple(
+            definition
+            for definition in self._definitions.values()
+            if profile in definition.profiles
+        )
+
+
 __all__ = [
     "PromptDefinition",
     "PromptRegistry",
+    "ResourceDefinition",
+    "ResourceRegistry",
     "ToolDefinition",
     "ToolRegistry",
 ]

@@ -46,7 +46,7 @@ def test_real_stdio_initialize_catalog_and_doctor(tmp_path: Path):
 
     assert report["package_version"] == "0.2.1"
     assert report["server_name"] == "fcp-mcp"
-    assert report["tool_count"] == 89
+    assert report["tool_count"] == 93
     assert report["prompt_count"] == 5
     assert report["doctor_status"] in {"ready", "degraded"}
     assert report["doctor_is_error"] is False
@@ -73,6 +73,6 @@ def test_quickstart_uses_stdio_without_writing_roundtrip(tmp_path: Path):
     assert result.returncode == 0, result.stderr or result.stdout
     payload = json.loads(result.stdout)
     assert payload["package_version"] == "0.2.1"
-    assert payload["tool_count"] == 89
+    assert payload["tool_count"] == 93
     assert payload["prompt_count"] == 5
     assert not roundtrip.exists()

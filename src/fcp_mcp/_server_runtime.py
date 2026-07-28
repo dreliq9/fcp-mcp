@@ -60,7 +60,7 @@ from .fcpxml.validator import FCPXMLValidator
 from .fcpxml.writer import FCPXMLModifier
 from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
 from .profiles import Profile, ToolClass
-from .registry import PromptRegistry, ToolRegistry
+from .registry import PromptRegistry, ResourceRegistry, ToolRegistry
 from .result_models.common import ArtifactReference, ToolOutcome
 from .result_models.fcpxml import (
     AppliedEffectRecord,
@@ -210,6 +210,7 @@ from .tool_metadata import (
     STATEFUL_WRITE,
 )
 from .utils.atomic_write import AtomicWriteReceipt, atomic_replace_bytes
+from .workflow.surface import register_workflow_surface
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,7 @@ CONFIG = RuntimeConfig.from_env()
 PATHS = PathPolicy(CONFIG)
 TOOLS = ToolRegistry()
 PROMPTS = PromptRegistry()
+RESOURCES = ResourceRegistry()
 
 _parser = FCPXMLParser()
 _validator = FCPXMLValidator()
@@ -7735,4 +7737,5 @@ def prompt_beat_sync(audio_path: str, clips_json: str, project_name: str = "Beat
 # Entry point
 # ============================================================================
 
-mcp = build_mcp_server(CONFIG, TOOLS, PROMPTS)
+WORKFLOW_RUNTIME = register_workflow_surface(CONFIG, TOOLS, RESOURCES)
+mcp = build_mcp_server(CONFIG, TOOLS, PROMPTS, RESOURCES)

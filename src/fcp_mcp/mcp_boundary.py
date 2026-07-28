@@ -6,7 +6,7 @@ import functools
 import inspect
 import json
 import logging
-from typing import Annotated, Any
+from typing import Annotated, Any, get_type_hints
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 from .config import RuntimeConfig
 from .contracts import ErrorCode, FCPMCPError
-from .registry import PromptRegistry, ToolDefinition, ToolRegistry
+from .registry import PromptRegistry, ResourceRegistry, ToolDefinition, ToolRegistry
 from .result_models.common import LegacyTextResult, ToolOutcome
 from .tool_metadata import SafetyHints
 
@@ -108,7 +108,23 @@ def _invoker(definition: ToolDefinition):
             ) from error
 
     signature = inspect.signature(definition.handler)
+    try:
+        resolved_hints = get_type_hints(definition.handler)
+    except (NameError, TypeError):
+        resolved_hints = {}
+    simple_forward_annotations = {"str", "int", "float", "bool", "bytes", "Any"}
+    parameters = [
+        parameter.replace(
+            annotation=(
+                resolved_hints.get(name, parameter.annotation)
+                if parameter.annotation not in simple_forward_annotations
+                else parameter.annotation
+            )
+        )
+        for name, parameter in signature.parameters.items()
+    ]
     invoke.__signature__ = signature.replace(  # type: ignore[attr-defined]
+        parameters=parameters,
         return_annotation=Annotated[CallToolResult, definition.result_model]
     )
     return invoke
@@ -128,10 +144,24 @@ def _legacy_output_schema(name: str) -> dict[str, Any]:
     }
 
 
+def _json_output_validator(result_model: type[BaseModel]):
+    """Validate JSON-compatible structured content against strict result models."""
+
+    class JSONOutputValidator:
+        @classmethod
+        def model_validate(cls, value: Any) -> BaseModel:
+            return result_model.model_validate_json(
+                json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+            )
+
+    return JSONOutputValidator
+
+
 def build_mcp_server(
     config: RuntimeConfig,
     tools: ToolRegistry,
     prompts: PromptRegistry,
+    resources: ResourceRegistry | None = None,
 ) -> FCPFastMCP:
     server = FCPFastMCP(
         "fcp-mcp",
@@ -148,8 +178,11 @@ def build_mcp_server(
             description=definition.description,
             annotations=_tool_annotations(definition.safety_hints),
         )(invoke)
+        registered = server._tool_manager.get_tool(definition.name)
+        registered.fn_metadata.output_model = _json_output_validator(
+            definition.result_model
+        )
         if definition.result_model is LegacyTextResult:
-            registered = server._tool_manager.get_tool(definition.name)
             registered.fn_metadata.output_schema = _legacy_output_schema(
                 definition.name
             )
@@ -160,6 +193,14 @@ def build_mcp_server(
             name=definition.name,
             description=definition.description,
         )(definition.handler)
+    if resources is not None:
+        for definition in resources.for_profile(config.profile):
+            server.resource(
+                definition.uri_template,
+                name=definition.name,
+                description=definition.description,
+                mime_type=definition.mime_type,
+            )(definition.handler)
     return server
 
 

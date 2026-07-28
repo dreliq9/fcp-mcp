@@ -21,8 +21,8 @@ def test_v021_snapshot_matches_names_inputs_and_annotations():
         Path("tests/contracts/v0_2_1_catalog.json").read_text(encoding="utf-8")
     )
     tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
-    assert len(snapshot["tools"]) == len(tools) == 89
-    assert set(snapshot["tools"]) == set(tools)
+    assert len(snapshot["tools"]) == 89
+    assert set(snapshot["tools"]) < set(tools)
     assert snapshot["prompts"] == sorted(
         prompt.name for prompt in asyncio.run(mcp.list_prompts())
     )

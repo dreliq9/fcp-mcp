@@ -17,7 +17,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 EXPECTED_VERSION = "0.2.1"
-EXPECTED_TOOL_COUNT = 89
+EXPECTED_TOOL_COUNT = 93
 EXPECTED_PROMPT_COUNT = 5
 VERSION_PATTERN = re.compile(r"^fcp-mcp (?P<version>\d+\.\d+\.\d+)$")
 Page = TypeVar("Page")

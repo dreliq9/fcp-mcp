@@ -89,7 +89,7 @@ def _assert_doctor(model: BaseModel) -> None:
     report = DoctorReport.model_validate(model)
     assert report.profile is Profile.FULL
     assert report.tool_names == sorted(report.tool_names)
-    assert len(report.tool_names) == 89
+    assert len(report.tool_names) == 93
     assert report.resource_count == 0
     assert report.tool_count == len(report.tool_names)
     catalog = next(check for check in report.checks if check.id == "mcp_catalog")
