@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 import shlex
 import sys
@@ -48,7 +49,8 @@ MACOS_CLASSIFIER = "Operating System :: MacOS :: MacOS X"
 
 
 def _relative(path: Path, root: Path) -> str:
-    return path.relative_to(root).as_posix()
+    relative = path.relative_to(root).as_posix()
+    return json.dumps(relative, ensure_ascii=True)[1:-1]
 
 
 def _read_text(path: Path, root: Path, findings: list[str]) -> str | None:
@@ -147,6 +149,8 @@ def _check_gate_job(
 ) -> None:
     if isinstance(job, dict) and ({"if", "continue-on-error"} & set(job)):
         findings.append(f"{relative}: {job_name} job can mask architecture gate failure")
+    if isinstance(job, dict) and ({"defaults", "env"} & set(job)):
+        findings.append(f"{relative}: {job_name} job can alter architecture gate execution")
     if not _has_architecture_gate(job):
         findings.append(
             f"{relative}: {job_name} job does not run an unconditional architecture gate"
@@ -178,6 +182,14 @@ def _check_ci(root: Path, findings: list[str]) -> None:
     workflow = _load_yaml(path, root, findings)
     if workflow is None:
         return
+    if "defaults" in workflow:
+        findings.append(
+            ".github/workflows/ci.yml: workflow defaults can alter architecture gate"
+        )
+    if "env" in workflow:
+        findings.append(
+            ".github/workflows/ci.yml: workflow environment can alter architecture gate"
+        )
     jobs = _jobs(workflow, ".github/workflows/ci.yml", findings)
     if jobs is None:
         return
@@ -294,11 +306,102 @@ def _check_verify_producer(verify: Any, findings: list[str]) -> None:
         findings.append(f"{prefix} job lacks exact verified artifact upload")
 
 
+def _expected_verify_job() -> dict[str, Any]:
+    return {
+        "name": "Reverify tagged release candidate",
+        "runs-on": MACOS_RUNNER,
+        "steps": [
+            {
+                "uses": CHECKOUT_ACTION,
+                "with": {"persist-credentials": False},
+            },
+            {
+                "uses": SETUP_PYTHON_ACTION,
+                "with": {
+                    "python-version": "3.12",
+                    "cache": "pip",
+                    "cache-dependency-path": "pyproject.toml",
+                },
+            },
+            {
+                "name": "Install release dependencies",
+                "run": (
+                    "python -m pip install --upgrade pip\n"
+                    'python -m pip install -e ".[dev]"\n'
+                ),
+            },
+            {
+                "name": "Verify tag matches package",
+                "run": (
+                    'test "${GITHUB_REF_NAME}" = "v$(python -c \'from '
+                    "fcp_mcp.version import package_version; "
+                    "print(package_version())')\"\n"
+                ),
+            },
+            {
+                "name": "Re-run release gates",
+                "run": (
+                    "ruff check src tests scripts\n"
+                    "FCP_MCP_PROFILE=full python scripts/check_contracts.py\n"
+                    "python -m pytest -q\n"
+                    "pip-audit --local\n"
+                ),
+            },
+            {
+                "name": "Enforce macOS-only architecture",
+                "run": ARCHITECTURE_GATE,
+            },
+            {
+                "name": "Rebuild distributions from tag",
+                "run": (
+                    "rm -rf build dist\n"
+                    "python -m build\n"
+                    "python -m twine check dist/*\n"
+                ),
+            },
+            {
+                "name": "Smoke-test installed wheel",
+                "env": {"FCP_MCP_PROFILE": "full"},
+                "run": (
+                    "python -m venv /tmp/fcp-mcp-wheel-smoke\n"
+                    "/tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip\n"
+                    "/tmp/fcp-mcp-wheel-smoke/bin/python -m pip install "
+                    "dist/fcp_mcp-0.2.1-py3-none-any.whl\n"
+                    'mkdir -p "${RUNNER_TEMP}/fcp-mcp-output"\n'
+                    'FCP_MCP_OUTPUT_DIR="${RUNNER_TEMP}/fcp-mcp-output" \\\n'
+                    'FCP_MCP_ALLOWED_ROOTS="${RUNNER_TEMP}/fcp-mcp-output" \\\n'
+                    "FCP_MCP_ENABLE_LIVE_CONTROL=0 \\\n"
+                    "/tmp/fcp-mcp-wheel-smoke/bin/python scripts/wheel_smoke.py \\\n"
+                    "  --command /tmp/fcp-mcp-wheel-smoke/bin/fcp-mcp\n"
+                ),
+            },
+            {
+                "name": "Upload verified distributions",
+                "uses": UPLOAD_ACTION,
+                "with": {
+                    "name": RELEASE_ARTIFACT,
+                    "path": "dist/",
+                    "if-no-files-found": "error",
+                    "retention-days": 1,
+                },
+            },
+        ],
+    }
+
+
 def _check_publish(root: Path, findings: list[str]) -> None:
     path = root / ".github" / "workflows" / "publish.yml"
     workflow = _load_yaml(path, root, findings)
     if workflow is None:
         return
+    if "defaults" in workflow:
+        findings.append(
+            ".github/workflows/publish.yml: workflow defaults can alter architecture gate"
+        )
+    if "env" in workflow:
+        findings.append(
+            ".github/workflows/publish.yml: workflow environment can alter architecture gate"
+        )
     expected_trigger = {"push": {"tags": ["v*"]}}
     if workflow.get("on") != expected_trigger:
         findings.append(
@@ -330,6 +433,10 @@ def _check_publish(root: Path, findings: list[str]) -> None:
             findings,
         )
         _check_verify_producer(verify, findings)
+        if verify != _expected_verify_job():
+            findings.append(
+                ".github/workflows/publish.yml: verify job differs from reviewed release trajectory"
+            )
 
     for job_name, job in jobs.items():
         if job_name == "publish":
@@ -381,6 +488,191 @@ def _require_text(
         findings.append(f"{relative}: {finding}")
 
 
+def _glob_path_matches(path: str, pattern: str) -> bool:
+    path_parts = tuple(part for part in path.split("/") if part not in {"", "."})
+    pattern_parts = tuple(
+        part for part in pattern.split("/") if part not in {"", "."}
+    )
+
+    def match(path_index: int, pattern_index: int) -> bool:
+        if pattern_index == len(pattern_parts):
+            return path_index == len(path_parts)
+        part = pattern_parts[pattern_index]
+        if part == "**":
+            return match(path_index, pattern_index + 1) or (
+                path_index < len(path_parts)
+                and match(path_index + 1, pattern_index)
+            )
+        return (
+            path_index < len(path_parts)
+            and fnmatch.fnmatchcase(path_parts[path_index], part)
+            and match(path_index + 1, pattern_index + 1)
+        )
+
+    return match(0, 0)
+
+
+def _recursive_manifest_matches(
+    path: str, directory_pattern: str, file_patterns: list[str]
+) -> bool:
+    parts = path.split("/")
+    if directory_pattern.strip("./") == "":
+        return any(
+            _glob_path_matches(path, pattern)
+            or ("/" not in pattern and fnmatch.fnmatchcase(parts[-1], pattern))
+            for pattern in file_patterns
+        )
+    for boundary in range(1, len(parts)):
+        directory = "/".join(parts[:boundary])
+        if not _glob_path_matches(directory, directory_pattern):
+            continue
+        relative = "/".join(parts[boundary:])
+        basename = parts[-1]
+        if any(
+            _glob_path_matches(relative, pattern)
+            or ("/" not in pattern and fnmatch.fnmatchcase(basename, pattern))
+            for pattern in file_patterns
+        ):
+            return True
+    return False
+
+
+def _directory_manifest_matches(path: str, directory_pattern: str) -> bool:
+    if directory_pattern.strip("./") == "":
+        return True
+    parts = path.split("/")
+    return any(
+        _glob_path_matches("/".join(parts[:boundary]), directory_pattern)
+        for boundary in range(1, len(parts))
+    )
+
+
+def _required_manifest_paths(
+    root: Path, findings: list[str]
+) -> dict[str, set[str]]:
+    groups: dict[str, set[str]] = {
+        "top": set(),
+        "examples": set(),
+        "docs": set(),
+        "scripts": set(),
+    }
+    for relative in ("README.md", "ROADMAP.md", "WORKFLOWS.md", "server.json"):
+        path = root / relative
+        if path.is_file() and not path.is_symlink():
+            groups["top"].add(relative)
+        else:
+            findings.append(f"MANIFEST.in: required repository path {relative} is unsafe")
+
+    suffixes = {
+        "examples": {".py", ".md"},
+        "docs": {".md"},
+        "scripts": {".py"},
+    }
+    for tree, allowed_suffixes in suffixes.items():
+        directory = root / tree
+        if not directory.is_dir() or directory.is_symlink():
+            findings.append(f"MANIFEST.in: required repository tree {tree} is unsafe")
+            continue
+        for current, directory_names, file_names in os.walk(
+            directory, followlinks=False
+        ):
+            base = Path(current)
+            for name in list(directory_names):
+                candidate = base / name
+                if candidate.is_symlink():
+                    findings.append(
+                        f"{_relative(candidate, root)}: unsafe manifest tree symlink"
+                    )
+                    directory_names.remove(name)
+            for name in file_names:
+                candidate = base / name
+                if candidate.suffix not in allowed_suffixes:
+                    continue
+                if candidate.is_symlink():
+                    findings.append(
+                        f"{_relative(candidate, root)}: unsafe manifest file symlink"
+                    )
+                    continue
+                groups[tree].add(candidate.relative_to(root).as_posix())
+        if not groups[tree]:
+            findings.append(f"MANIFEST.in: required repository tree {tree} is empty")
+    return groups
+
+
+def _check_manifest(root: Path, manifest: str, findings: list[str]) -> None:
+    groups = _required_manifest_paths(root, findings)
+    candidates = set().union(*groups.values())
+    included: set[str] = set()
+    manifest_tokens: list[str] = []
+
+    for line in manifest.splitlines():
+        try:
+            tokens = shlex.split(line, comments=True, posix=True)
+        except ValueError:
+            findings.append("MANIFEST.in: invalid manifest directive")
+            continue
+        if not tokens:
+            continue
+        manifest_tokens.extend(tokens)
+        command, arguments = tokens[0], tokens[1:]
+        matches: set[str] = set()
+        if command in {"include", "exclude"}:
+            matches = {
+                path
+                for path in candidates
+                if any(_glob_path_matches(path, pattern) for pattern in arguments)
+            }
+        elif command in {"global-include", "global-exclude"}:
+            matches = {
+                path
+                for path in candidates
+                if any(
+                    fnmatch.fnmatchcase(path.rsplit("/", 1)[-1], pattern)
+                    for pattern in arguments
+                )
+            }
+        elif (
+            command in {"recursive-include", "recursive-exclude"}
+            and len(arguments) >= 2
+        ):
+            directory_pattern, file_patterns = arguments[0], arguments[1:]
+            matches = {
+                path
+                for path in candidates
+                if _recursive_manifest_matches(
+                    path, directory_pattern, file_patterns
+                )
+            }
+        elif command in {"graft", "prune"}:
+            matches = {
+                path
+                for path in candidates
+                if any(
+                    _directory_manifest_matches(path, pattern)
+                    for pattern in arguments
+                )
+            }
+
+        if command in {"include", "global-include", "recursive-include", "graft"}:
+            included.update(matches)
+        elif command in {
+            "exclude",
+            "global-exclude",
+            "recursive-exclude",
+            "prune",
+        }:
+            included.difference_update(matches)
+
+    for required_file in ("README.md", "ROADMAP.md", "WORKFLOWS.md", "server.json"):
+        if required_file not in included:
+            findings.append(f"MANIFEST.in: manifest lacks {required_file}")
+    for tree in ("examples", "docs", "scripts"):
+        if not groups[tree] <= included:
+            findings.append(f"MANIFEST.in: manifest lacks recursive tree {tree}")
+    if "smithery.yaml" in manifest_tokens:
+        findings.append("MANIFEST.in: manifest names smithery.yaml")
+
+
 def _check_support_surfaces(root: Path, findings: list[str]) -> None:
     _check_pyproject(root, findings)
     _require_text(
@@ -408,64 +700,7 @@ def _check_support_surfaces(root: Path, findings: list[str]) -> None:
     manifest_path = root / "MANIFEST.in"
     manifest = _read_text(manifest_path, root, findings)
     if manifest is not None:
-        included_files: set[str] = set()
-        excluded_files: set[str] = set()
-        recursive_trees: dict[str, set[str]] = {}
-        recursive_excludes: dict[str, set[str]] = {}
-        pruned_trees: set[str] = set()
-        global_excludes: set[str] = set()
-        manifest_tokens: list[str] = []
-        for line in manifest.splitlines():
-            try:
-                tokens = shlex.split(line, comments=True, posix=True)
-            except ValueError:
-                findings.append("MANIFEST.in: invalid manifest directive")
-                continue
-            if not tokens:
-                continue
-            manifest_tokens.extend(tokens)
-            if tokens[0] == "include":
-                included_files.update(tokens[1:])
-            elif tokens[0] == "exclude":
-                excluded_files.update(tokens[1:])
-            elif tokens[0] == "recursive-include" and len(tokens) >= 3:
-                recursive_trees.setdefault(tokens[1], set()).update(tokens[2:])
-            elif tokens[0] == "recursive-exclude" and len(tokens) >= 3:
-                recursive_excludes.setdefault(tokens[1], set()).update(tokens[2:])
-            elif tokens[0] == "prune":
-                pruned_trees.update(tokens[1:])
-            elif tokens[0] == "global-exclude":
-                global_excludes.update(tokens[1:])
-
-        for required_file in ("README.md", "ROADMAP.md", "WORKFLOWS.md", "server.json"):
-            globally_excluded = any(
-                fnmatch.fnmatch(required_file, pattern) for pattern in global_excludes
-            )
-            if (
-                required_file not in included_files
-                or required_file in excluded_files
-                or globally_excluded
-            ):
-                findings.append(f"MANIFEST.in: manifest lacks {required_file}")
-        required_tree_patterns = {
-            "examples": {"*.py", "*.md"},
-            "docs": {"*.md"},
-            "scripts": {"*.py"},
-        }
-        for required_tree, required_patterns in required_tree_patterns.items():
-            included_patterns = recursive_trees.get(required_tree, set())
-            excluded_patterns = recursive_excludes.get(required_tree, set())
-            if (
-                required_tree in pruned_trees
-                or not required_patterns <= included_patterns
-                or bool(required_patterns & excluded_patterns)
-                or bool(required_patterns & global_excludes)
-            ):
-                findings.append(
-                    f"MANIFEST.in: manifest lacks recursive tree {required_tree}"
-                )
-        if "smithery.yaml" in manifest_tokens:
-            findings.append("MANIFEST.in: manifest names smithery.yaml")
+        _check_manifest(root, manifest, findings)
 
     smithery = root / "smithery.yaml"
     if smithery.exists() or smithery.is_symlink():

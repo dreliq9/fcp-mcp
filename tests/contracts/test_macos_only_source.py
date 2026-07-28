@@ -50,10 +50,50 @@ permissions:
   contents: read
 jobs:
   verify:
+    name: Reverify tagged release candidate
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install release dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Verify tag matches package
+        run: |
+          test "${{GITHUB_REF_NAME}}" = "v$(python -c 'from fcp_mcp.version import package_version; print(package_version())')"
+      - name: Re-run release gates
+        run: |
+          ruff check src tests scripts
+          FCP_MCP_PROFILE=full python scripts/check_contracts.py
+          python -m pytest -q
+          pip-audit --local
       - name: Enforce macOS-only architecture
         run: python scripts/check_macos_only.py
+      - name: Rebuild distributions from tag
+        run: |
+          rm -rf build dist
+          python -m build
+          python -m twine check dist/*
+      - name: Smoke-test installed wheel
+        env:
+          FCP_MCP_PROFILE: full
+        run: |
+          python -m venv /tmp/fcp-mcp-wheel-smoke
+          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install dist/fcp_mcp-0.2.1-py3-none-any.whl
+          mkdir -p "${{RUNNER_TEMP}}/fcp-mcp-output"
+          FCP_MCP_OUTPUT_DIR="${{RUNNER_TEMP}}/fcp-mcp-output" \\
+          FCP_MCP_ALLOWED_ROOTS="${{RUNNER_TEMP}}/fcp-mcp-output" \\
+          FCP_MCP_ENABLE_LIVE_CONTROL=0 \\
+          /tmp/fcp-mcp-wheel-smoke/bin/python scripts/wheel_smoke.py \\
+            --command /tmp/fcp-mcp-wheel-smoke/bin/fcp-mcp
       - name: Upload verified distributions
         uses: {UPLOAD_ACTION}
         with:
@@ -102,6 +142,20 @@ fcp-mcp = "fcp_mcp.cli:main"
     (root / "ROADMAP.md").write_text(
         "Python 3.10–3.13 CI on macOS.\n", encoding="utf-8"
     )
+    (root / "WORKFLOWS.md").write_text("Workflow guide.\n", encoding="utf-8")
+    (root / "server.json").write_text("{}\n", encoding="utf-8")
+    required_tree_files = {
+        "examples/quickstart.py": "print('example')\n",
+        "examples/README.md": "Examples.\n",
+        "docs/guide.md": "Guide.\n",
+        "docs/research/architecture.md": "Research.\n",
+        "scripts/check_contracts.py": "print('contracts')\n",
+        "scripts/check_macos_only.py": "print('architecture')\n",
+    }
+    for relative, contents in required_tree_files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
     (root / "MANIFEST.in").write_text(
         """include README.md ROADMAP.md WORKFLOWS.md
 include server.json
@@ -319,6 +373,136 @@ def test_checker_rejects_modified_duplicate_architecture_gate(tmp_path):
     )
 
 
+@pytest.mark.parametrize("workflow_name", ["ci.yml", "publish.yml"])
+@pytest.mark.parametrize(
+    "defaults",
+    [
+        "defaults:\n  run:\n    shell: true {0}\n",
+        "defaults:\n  run:\n    working-directory: /tmp\n",
+    ],
+)
+def test_checker_rejects_workflow_level_run_defaults(
+    tmp_path, workflow_name, defaults
+):
+    _write_valid_repository(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / workflow_name
+    text = workflow.read_text(encoding="utf-8")
+    workflow.write_text(text.replace("jobs:\n", defaults + "jobs:\n", 1), encoding="utf-8")
+
+    assert any("workflow defaults can alter architecture gate" in item for item in check(tmp_path))
+
+
+@pytest.mark.parametrize("workflow_name", ["ci.yml", "publish.yml"])
+@pytest.mark.parametrize(
+    "defaults",
+    [
+        "    defaults:\n      run:\n        shell: true {0}\n",
+        "    defaults:\n      run:\n        working-directory: /tmp\n",
+        (
+            "    defaults: &poison\n"
+            "      run:\n"
+            "        shell: true {0}\n"
+        ),
+    ],
+)
+def test_checker_rejects_gate_job_run_defaults(
+    tmp_path, workflow_name, defaults
+):
+    _write_valid_repository(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / workflow_name
+    text = workflow.read_text(encoding="utf-8")
+    job_name = "quality" if workflow_name == "ci.yml" else "verify"
+    needle = f"  {job_name}:\n"
+    workflow.write_text(text.replace(needle, needle + defaults, 1), encoding="utf-8")
+
+    assert any(
+        f"{job_name} job can alter architecture gate execution" in item
+        for item in check(tmp_path)
+    )
+
+
+@pytest.mark.parametrize("workflow_name", ["ci.yml", "publish.yml"])
+def test_checker_rejects_aliased_gate_job_defaults(tmp_path, workflow_name):
+    _write_valid_repository(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / workflow_name
+    text = workflow.read_text(encoding="utf-8")
+    text = text.replace(
+        "jobs:\n",
+        "x-poison: &poison\n"
+        "  run:\n"
+        "    working-directory: /tmp\n"
+        "jobs:\n",
+        1,
+    )
+    job_name = "quality" if workflow_name == "ci.yml" else "verify"
+    text = text.replace(f"  {job_name}:\n", f"  {job_name}:\n    defaults: *poison\n", 1)
+    workflow.write_text(text, encoding="utf-8")
+
+    assert any(
+        f"{job_name} job can alter architecture gate execution" in item
+        for item in check(tmp_path)
+    )
+
+
+@pytest.mark.parametrize("workflow_name", ["ci.yml", "publish.yml"])
+@pytest.mark.parametrize(
+    "scope,needle,replacement",
+    [
+        (
+            "workflow",
+            "jobs:\n",
+            "env:\n  BASH_ENV: /tmp/neutralize-gate\njobs:\n",
+        ),
+        (
+            "job",
+            "JOB_NEEDLE",
+            "JOB_NEEDLE    env:\n      BASH_ENV: /tmp/neutralize-gate\n",
+        ),
+    ],
+)
+def test_checker_rejects_inherited_gate_environment(
+    tmp_path, workflow_name, scope, needle, replacement
+):
+    _write_valid_repository(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / workflow_name
+    text = workflow.read_text(encoding="utf-8")
+    job_name = "quality" if workflow_name == "ci.yml" else "verify"
+    if scope == "job":
+        needle = f"  {job_name}:\n"
+        replacement = replacement.replace("JOB_NEEDLE", needle)
+    workflow.write_text(text.replace(needle, replacement, 1), encoding="utf-8")
+
+    assert any("can alter architecture gate" in item for item in check(tmp_path))
+
+
+@pytest.mark.parametrize("workflow_name", ["ci.yml", "publish.yml"])
+def test_checker_rejects_yaml_merge_inherited_job_defaults(tmp_path, workflow_name):
+    _write_valid_repository(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / workflow_name
+    text = workflow.read_text(encoding="utf-8")
+    text = text.replace(
+        "jobs:\n",
+        "x-job-poison: &job-poison\n"
+        "  defaults:\n"
+        "    run:\n"
+        "      shell: true {0}\n"
+        "jobs:\n",
+        1,
+    )
+    job_name = "quality" if workflow_name == "ci.yml" else "verify"
+    text = text.replace(
+        f"  {job_name}:\n",
+        f"  {job_name}:\n    <<: *job-poison\n",
+        1,
+    )
+    workflow.write_text(text, encoding="utf-8")
+
+    assert any(
+        f"{job_name} job can alter architecture gate execution" in item
+        for item in check(tmp_path)
+    )
+
+
 @pytest.mark.parametrize(
     "mutation,expected_marker",
     [
@@ -396,6 +580,161 @@ def test_checker_binds_published_artifact_to_exact_verify_producer(
     publish.write_text(text, encoding="utf-8")
 
     assert any(expected_marker in item for item in check(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "checkout_repository",
+        "checkout_ref",
+        "checkout_path",
+        "duplicate_checkout",
+        "duplicate_setup",
+        "setup_version",
+        "setup_cache",
+        "poison_run",
+        "renamed_run",
+        "reordered_run",
+        "install_command",
+        "gate_command",
+        "build_command",
+        "smoke_command",
+        "extra_run",
+    ],
+)
+def test_checker_requires_exact_ordered_verify_trajectory(tmp_path, mutation):
+    _write_valid_repository(tmp_path)
+    publish = tmp_path / ".github" / "workflows" / "publish.yml"
+    text = publish.read_text(encoding="utf-8")
+    checkout = (
+        "      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n"
+        "        with:\n"
+        "          persist-credentials: false\n"
+    )
+    setup = (
+        "      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405\n"
+        "        with:\n"
+        '          python-version: "3.12"\n'
+        "          cache: pip\n"
+        "          cache-dependency-path: pyproject.toml\n"
+    )
+    install = (
+        "      - name: Install release dependencies\n"
+        "        run: |\n"
+        "          python -m pip install --upgrade pip\n"
+        '          python -m pip install -e ".[dev]"\n'
+    )
+    tag_check = (
+        "      - name: Verify tag matches package\n"
+        "        run: |\n"
+        "          test \"${GITHUB_REF_NAME}\" = \"v$(python -c 'from fcp_mcp.version import package_version; print(package_version())')\"\n"
+    )
+
+    if mutation == "checkout_repository":
+        text = text.replace(
+            "          persist-credentials: false\n",
+            "          persist-credentials: false\n          repository: attacker/repo\n",
+            1,
+        )
+    elif mutation == "checkout_ref":
+        text = text.replace(
+            "          persist-credentials: false\n",
+            "          persist-credentials: false\n          ref: main\n",
+            1,
+        )
+    elif mutation == "checkout_path":
+        text = text.replace(
+            "          persist-credentials: false\n",
+            "          persist-credentials: false\n          path: alternate\n",
+            1,
+        )
+    elif mutation == "duplicate_checkout":
+        text = text.replace(setup, checkout + setup, 1)
+    elif mutation == "duplicate_setup":
+        text = text.replace(install, setup + install, 1)
+    elif mutation == "setup_version":
+        text = text.replace('python-version: "3.12"', 'python-version: "3.13"', 1)
+    elif mutation == "setup_cache":
+        text = text.replace("cache: pip", "cache: poetry", 1)
+    elif mutation == "poison_run":
+        text = text.replace(
+            "      - name: Upload verified distributions\n",
+            "      - name: Replace verified distributions\n"
+            "        run: printf malicious > dist/release.whl\n"
+            "      - name: Upload verified distributions\n",
+        )
+    elif mutation == "renamed_run":
+        text = text.replace(
+            "name: Install release dependencies",
+            "name: Maybe install release dependencies",
+            1,
+        )
+    elif mutation == "reordered_run":
+        text = text.replace(install + tag_check, tag_check + install, 1)
+    elif mutation == "install_command":
+        text = text.replace(
+            'python -m pip install -e ".[dev]"',
+            "python -m pip install attacker-package",
+            1,
+        )
+    elif mutation == "gate_command":
+        text = text.replace(
+            "FCP_MCP_PROFILE=full python scripts/check_contracts.py",
+            "python scripts/check_contracts.py",
+            1,
+        )
+    elif mutation == "build_command":
+        text = text.replace("python -m build", "python setup.py bdist_wheel", 1)
+    elif mutation == "smoke_command":
+        text = text.replace(
+            "FCP_MCP_ENABLE_LIVE_CONTROL=0",
+            "FCP_MCP_ENABLE_LIVE_CONTROL=1",
+            1,
+        )
+    elif mutation == "extra_run":
+        text = text.replace(
+            "      - name: Rebuild distributions from tag\n",
+            "      - name: Extra command\n"
+            "        run: echo extra\n"
+            "      - name: Rebuild distributions from tag\n",
+        )
+    publish.write_text(text, encoding="utf-8")
+
+    assert (
+        ".github/workflows/publish.yml: verify job differs from reviewed release trajectory"
+        in check(tmp_path)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["checkout_credentials", "checkout_missing_inputs", "setup_extra_input"],
+)
+def test_checker_rejects_exact_action_with_unsafe_input_variant(tmp_path, mutation):
+    _write_valid_repository(tmp_path)
+    publish = tmp_path / ".github" / "workflows" / "publish.yml"
+    text = publish.read_text(encoding="utf-8")
+    if mutation == "checkout_credentials":
+        text = text.replace("persist-credentials: false", "persist-credentials: true", 1)
+    elif mutation == "checkout_missing_inputs":
+        text = text.replace(
+            "        with:\n          persist-credentials: false\n",
+            "",
+            1,
+        )
+    elif mutation == "setup_extra_input":
+        text = text.replace(
+            "          cache-dependency-path: pyproject.toml\n",
+            "          cache-dependency-path: pyproject.toml\n"
+            "          check-latest: true\n",
+            1,
+        )
+    publish.write_text(text, encoding="utf-8")
+
+    assert (
+        ".github/workflows/publish.yml: verify job differs from reviewed release trajectory"
+        in check(tmp_path)
+    )
 
 
 @pytest.mark.parametrize(
@@ -597,6 +936,117 @@ def test_checker_parses_manifest_directives_semantically(
         ) is (tree in missing_trees)
 
 
+@pytest.mark.parametrize(
+    "directive,missing_file,missing_docs",
+    [
+        ("exclude *.md\n", True, False),
+        ("recursive-exclude docs *\n", False, True),
+        ("recursive-exclude docs *.m?\n", False, True),
+        ("recursive-exclude docs [ag]*.md\n", False, True),
+        ("recursive-exclude docs **/*.md\n", False, True),
+        ("prune docs/research\n", False, True),
+        ("global-exclude *.md\n", True, True),
+    ],
+)
+def test_checker_applies_manifest_globs_to_real_required_paths(
+    tmp_path, directive, missing_file, missing_docs
+):
+    _write_valid_repository(tmp_path)
+    manifest = tmp_path / "MANIFEST.in"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8") + directive,
+        encoding="utf-8",
+    )
+
+    findings = check(tmp_path)
+
+    assert any("manifest lacks README.md" in item for item in findings) is missing_file
+    assert any("manifest lacks recursive tree docs" in item for item in findings) is missing_docs
+
+
+@pytest.mark.parametrize(
+    "tail,missing_readme,missing_docs",
+    [
+        ("exclude README.md\ninclude README.md\n", False, False),
+        ("include README.md\nexclude README.md\n", True, False),
+        ("prune docs\ngraft docs\n", False, False),
+        ("graft docs\nprune docs\n", False, True),
+        (
+            "recursive-exclude docs *.md\nrecursive-include docs *.md\n",
+            False,
+            False,
+        ),
+        (
+            "recursive-include docs *.md\nrecursive-exclude docs *.md\n",
+            False,
+            True,
+        ),
+        ("global-exclude *.md\nglobal-include *.md\n", False, False),
+        ("global-include *.md\nglobal-exclude *.md\n", True, True),
+    ],
+)
+def test_checker_applies_manifest_add_remove_directives_in_order(
+    tmp_path, tail, missing_readme, missing_docs
+):
+    _write_valid_repository(tmp_path)
+    manifest = tmp_path / "MANIFEST.in"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8") + tail,
+        encoding="utf-8",
+    )
+
+    findings = check(tmp_path)
+
+    assert any("manifest lacks README.md" in item for item in findings) is missing_readme
+    assert any("manifest lacks recursive tree docs" in item for item in findings) is missing_docs
+
+
+@pytest.mark.parametrize(
+    "tail,missing_docs",
+    [
+        ("prune docs\ngraft .\n", False),
+        ("prune docs\nrecursive-include . **/*.md\n", False),
+        ("prune docs/researc?\n", True),
+        ("prune docs/[a-z]*\n", True),
+        ("prune docs/**\n", True),
+    ],
+)
+def test_checker_handles_root_and_wildcard_manifest_directories(
+    tmp_path, tail, missing_docs
+):
+    _write_valid_repository(tmp_path)
+    manifest = tmp_path / "MANIFEST.in"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8") + tail,
+        encoding="utf-8",
+    )
+
+    findings = check(tmp_path)
+
+    assert any("manifest lacks recursive tree docs" in item for item in findings) is missing_docs
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "exclude **/*.md\n",
+        "global-exclude *.[mM][dD]\n",
+    ],
+)
+def test_checker_handles_double_star_and_class_manifest_excludes(tmp_path, tail):
+    _write_valid_repository(tmp_path)
+    manifest = tmp_path / "MANIFEST.in"
+    manifest.write_text(
+        manifest.read_text(encoding="utf-8") + tail,
+        encoding="utf-8",
+    )
+
+    findings = check(tmp_path)
+
+    assert any("manifest lacks README.md" in item for item in findings)
+    assert any("manifest lacks recursive tree docs" in item for item in findings)
+
+
 @pytest.mark.parametrize("suffix", [".yml", ".yaml"])
 def test_checker_rejects_unexpected_workflow_files(tmp_path, suffix):
     _write_valid_repository(tmp_path)
@@ -609,6 +1059,25 @@ def test_checker_rejects_unexpected_workflow_files(tmp_path, suffix):
         f".github/workflows/extra{suffix}: unexpected workflow file"
         in check(tmp_path)
     )
+
+
+@pytest.mark.parametrize(
+    "control,escaped", [("\n", r"\n"), ("\t", r"\t"), ("\r", r"\r")]
+)
+def test_checker_escapes_control_characters_in_finding_paths(
+    tmp_path, control, escaped
+):
+    _write_valid_repository(tmp_path)
+    filename = f"evil{control}FORGED.yml"
+    (tmp_path / ".github" / "workflows" / filename).write_text(
+        "jobs:\n  product:\n    runs-on: ubuntu-latest\n", encoding="utf-8"
+    )
+
+    findings = check(tmp_path)
+
+    expected = f".github/workflows/evil{escaped}FORGED.yml: unexpected workflow file"
+    assert expected in findings
+    assert all(control not in finding for finding in findings)
 
 
 def test_checker_returns_sorted_path_relative_findings_without_source_contents(tmp_path):
