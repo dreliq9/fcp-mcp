@@ -712,6 +712,6 @@ async def test_wire_identity_and_doctor_versions_are_truthful(tmp_path: Path):
     assert server_info.name == "fcp-mcp"
     assert server_info.version == package_version()
     assert result.is_error is False
-    assert result.structured_content["package_version"] == "0.2.1"
+    assert result.structured_content["package_version"] == "0.3.0"
     assert result.structured_content["mcp_sdk_version"] == distribution_version("mcp")
     assert result.structured_content["wire_server_version"] == package_version()

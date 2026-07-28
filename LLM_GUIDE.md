@@ -1,10 +1,31 @@
 # fcp-mcp LLM Guide
 
 MCP server giving you (Claude) professional-grade Final Cut Pro editing
-via FCPXML + AppleScript + ffprobe. 89 tools across 12 categories and
-5 prompts.
+via FCPXML + AppleScript + ffprobe. The default `workflow` profile exposes
+34 tools, three prompts, and three workflow resources; `full` exposes 93
+tools across 13 categories and five prompts.
 Modified FCPXMLs are written alongside their input with a `_modified`
 suffix unless `output_path` is specified.
+
+## Default transactional contract
+
+In the default profile, do not call a direct mutator. Call
+`fcpxml_workflow_prepare` with an explicit source, destination, and bounded
+operation list. Prepare changes only private workflow evidence. Show the
+returned summary, warnings, `diff_uri`, and `candidate_sha256` to the user.
+After explicit approval of that exact candidate, call
+`fcpxml_workflow_commit` with the same run ID and
+`expected_candidate_sha256` set to the exact hash returned by prepare.
+
+Never infer approval, omit the hash, or commit a different candidate. Client
+approval is recorded as `client_unverified_human`: the hash binding is
+verified, but the server cannot verify who approved the surrounding chat.
+
+Read durable evidence from `fcp-workflow://runs/{run_id}`,
+`fcp-workflow://runs/{run_id}/events`, and
+`fcp-workflow://runs/{run_id}/diff`. There is intentionally no candidate XML
+resource. Use `fcp-mcp workflow reconcile RUN_ID --json` only for explicit
+recovery assessment; no background agent reconciles runs.
 
 ## Critical: order of operations
 
@@ -43,7 +64,7 @@ Don't pass raw floats like `30.0` — they may silently quantize wrong.
 
 ## QC report anatomy
 
-`fcpxml_qc_report` returns Markdown in v0.2.1:
+`fcpxml_qc_report` returns Markdown:
 
 ```tool-call
 {"name":"fcpxml_qc_report","arguments":{"path":"show.fcpxml"}}
@@ -217,7 +238,7 @@ Then pass a concrete `.cmprstng` path:
 ```
 
 The tool invokes Compressor's CLI and returns its captured submission
-output. v0.2.1 does not expose a normalized job ID or completion
+output. The current tool does not expose a normalized job ID or completion
 tracking.
 
 ## Runtime boundaries
@@ -242,13 +263,18 @@ when the canonical variable is unset.
 }
 ```
 
+`FCP_MCP_PROFILE` selects `inspect`, `workflow` (default), `edit`, or `full`.
+`edit` and `full` expose direct mutators; `full` still does not enable live
+control. `FCP_MCP_STATE_DIR` contains the private workflow ledger and
+artifacts.
+
 `FCP_MCP_ALLOWED_ROOTS` uses the platform path separator. Inputs are
 resolved after symlinks and must remain beneath one of these roots;
 external volumes are not implicitly available. Live FCP, Accessibility,
 and Compressor actions require an explicit true value for
 `FCP_MCP_ENABLE_LIVE_CONTROL`.
 
-Never ask an edit tool to write back to its source path: v0.2.1 returns
+Never ask an edit tool to write back to its source path: fcp-mcp returns
 `same_file_forbidden`. Existing destinations receive a sibling backup
 before atomic replacement. The built-in validator proves safe parsing
 and its implemented structural invariants, not complete Apple/FCP

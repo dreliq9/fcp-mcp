@@ -58,6 +58,8 @@ jobs:
         run: python scripts/check_macos_only.py
       - name: Validate documented calls
         run: FCP_MCP_PROFILE=full python scripts/check_contracts.py
+      - name: Validate structured tool results
+        run: FCP_MCP_PROFILE=full python scripts/check_tool_results.py
 
   coverage:
     name: Coverage floors
@@ -128,7 +130,7 @@ jobs:
           python -m twine check dist/*
       - name: Verify source-distribution support files
         run: |
-          tar -tf dist/fcp_mcp-0.2.1.tar.gz > /tmp/fcp-mcp-sdist-files
+          tar -tf dist/fcp_mcp-0.3.0.tar.gz > /tmp/fcp-mcp-sdist-files
           rg -q 'examples/quickstart.py' /tmp/fcp-mcp-sdist-files
           rg -q 'docs/research/' /tmp/fcp-mcp-sdist-files
           rg -q 'WORKFLOWS.md' /tmp/fcp-mcp-sdist-files
@@ -139,17 +141,29 @@ jobs:
         run: |
           python -m venv /tmp/fcp-mcp-wheel-smoke
           /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip
-          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install dist/fcp_mcp-0.2.1-py3-none-any.whl
+          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install dist/fcp_mcp-0.3.0-py3-none-any.whl
           mkdir -p "${RUNNER_TEMP}/fcp-mcp-output"
+          mkdir -p "${RUNNER_TEMP}/fcp-mcp-state"
+          chmod 700 "${RUNNER_TEMP}/fcp-mcp-state"
           FCP_MCP_OUTPUT_DIR="${RUNNER_TEMP}/fcp-mcp-output" \
           FCP_MCP_ALLOWED_ROOTS="${RUNNER_TEMP}/fcp-mcp-output" \
+          FCP_MCP_STATE_DIR="${RUNNER_TEMP}/fcp-mcp-state" \
           FCP_MCP_ENABLE_LIVE_CONTROL=0 \
           /tmp/fcp-mcp-wheel-smoke/bin/python scripts/wheel_smoke.py \
             --command /tmp/fcp-mcp-wheel-smoke/bin/fcp-mcp
+      - name: Verify installed wheel on Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.10"
+      - name: Import installed workflow package on Python 3.10
+        run: |
+          python -m venv /tmp/fcp-mcp-wheel-py310
+          /tmp/fcp-mcp-wheel-py310/bin/python -m pip install dist/fcp_mcp-0.3.0-py3-none-any.whl
+          /tmp/fcp-mcp-wheel-py310/bin/python -c "import fcp_mcp.workflow.locking"
       - name: Upload verified distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: fcp-mcp-v0.2.1-dist
+          name: fcp-mcp-v0.3.0-dist
           path: dist/
           if-no-files-found: error
           retention-days: 14

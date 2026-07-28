@@ -2,9 +2,9 @@
 
 <!-- mcp-name: io.github.dreliq9/fcp-mcp -->
 
-**A local MCP server for Final Cut Pro** — 89 tools and five prompts
+**A local MCP server for Final Cut Pro** — up to 93 tools and five prompts
 covering FCPXML editing, opt-in live FCP control, parametric puppets,
-media analysis, and runtime diagnostics.
+media analysis, transactional edit approval, and runtime diagnostics.
 
 ```
 You: "Open the library, find flash frames in the hero timeline, fix them, and bounce to ProRes."
@@ -23,9 +23,26 @@ editing stack:
 - **Compressor** — dispatch encodes to Apple Compressor — 2 tools
 - **Runtime diagnostics** — structured offline/live readiness — 1 tool
 
-## Available Tools (89)
+## Catalog Profiles
 
-The catalog contains 88 domain tools across 12 functional categories,
+The default `workflow` profile is the safe AI-piloting surface: 34 tools,
+three prompts, and three workflow resource templates. Select a profile with
+`FCP_MCP_PROFILE`:
+
+| Profile | Tools | Prompts | Resources | Purpose |
+|---|---:|---:|---:|---|
+| `inspect` | 30 | 2 | 0 | Offline inspection and diagnostics |
+| `workflow` (default) | 34 | 3 | 3 | Inspection plus reviewable transactional edits |
+| `edit` | 74 | 5 | 3 | Direct offline mutators plus workflows |
+| `full` | 93 | 5 | 3 | All offline, live FCP, media, and Compressor tools |
+
+Live FCP control remains independently disabled unless
+`FCP_MCP_ENABLE_LIVE_CONTROL=1`; choosing `full` does not grant that
+authority.
+
+## Available Tools (93 in `full`)
+
+The full catalog contains 92 domain tools across 13 functional categories,
 plus `fcp_doctor`.
 
 | Category | Count | What it does |
@@ -36,12 +53,13 @@ plus `fcp_doctor`.
 | **heal** | 3 | Fix flash frames, fill gaps, remove silence |
 | **batch** | 4 | Markers, rename, role assign, apply transition across many clips |
 | **generate** | 4 | New project/timeline, auto rough cut, montage from a shotlist |
-| **templates** | 3 | List and save FCPXML templates; `fcpxml_apply_template` is registered but returns `unsupported_contract` in v0.2.1 |
+| **templates** | 3 | List and save FCPXML templates; `fcpxml_apply_template` remains `unsupported_contract` in v0.3.0 |
 | **io** | 5 | Import SRT/EDL, export EDL + DaVinci Resolve XML + Premiere FCP7 XMEML |
 | **live** | 20 | AppleScript-backed: library/events/projects, playback, menu/keyboard, share, discover effects & motion templates |
 | **puppet** | 7 | Parametric character rigs in FCPXML with motion presets (walk, talk, wave, multi-scene composition) |
 | **media** | 10 | ffprobe + ffmpeg: info, streams, EBU R128 loudness, silence, beat detection, scene detect, thumbnails, audio-to-MIDI |
 | **compressor** | 2 | List Compressor settings, dispatch encode jobs |
+| **workflow** | 4 | Prepare, inspect, hash-approve, commit, or cancel durable edit runs |
 
 ## Project Structure
 
@@ -55,7 +73,7 @@ fcp-mcp/
 │   ├── contracts.py             # stable errors + structured diagnostics
 │   ├── diagnostics.py           # non-mutating runtime readiness checks
 │   ├── observability.py         # text/JSON transaction events
-│   ├── server.py                # FastMCP entry + all 89 tool handlers
+│   ├── server.py                # MCP v2 entry and profile-selected handlers
 │   ├── tool_metadata.py         # MCP safety annotation presets
 │   ├── automation/
 │   │   └── osascript.py         # argv-isolated AppleScript/JXA runner
@@ -76,6 +94,7 @@ fcp-mcp/
 │   ├── media/
 │   │   └── ffprobe.py           # ffprobe wrapper for media analysis
 │   ├── pipeline/                # multi-step workflows
+│   ├── workflow/                # durable prepare, approval, commit, recovery
 │   └── utils/
 │       ├── atomic_write.py       # backup, replace, rollback
 │       ├── safe_xml.py          # defusedxml hardening
@@ -197,7 +216,7 @@ concatenating.
 
 All `.fcpxml` reads go through `defusedxml` via `utils/safe_xml.py` —
 XXE, entity expansion, and external entities are blocked by default.
-v0.2.1 does not claim explicit XML size or depth limits.
+The parser enforces configured XML size and depth limits.
 
 User paths are resolved beneath configured roots after symlink
 resolution. FCPXML writes are serialized to a secure temporary file
@@ -206,6 +225,35 @@ an existing destination, atomically committed, and validated again.
 The built-in validator checks the invariants it implements; it is not a
 complete Apple schema validator. Import into a disposable Final Cut Pro
 project is the authoritative compatibility gate for important outputs.
+
+### Reviewable transactional edits
+
+The default profile exposes four workflow tools:
+`fcpxml_workflow_prepare`, `fcpxml_workflow_status`,
+`fcpxml_workflow_commit`, and `fcpxml_workflow_cancel`.
+
+Prepare runs a fixed, bounded edit graph and stores the candidate, semantic
+diff, validation evidence, and event chain beneath the private
+`FCP_MCP_STATE_DIR`. It does not create or change the public destination.
+Review the returned summary and `diff_uri`, then pass the exact returned
+`candidate_sha256` to commit as `expected_candidate_sha256`. Client approval
+is cryptographically bound to that candidate but is recorded as
+`client_unverified_human`; the server cannot independently prove that a human
+approved a chat message.
+
+Three read-only templates expose durable evidence:
+`fcp-workflow://runs/{run_id}`,
+`fcp-workflow://runs/{run_id}/events`, and
+`fcp-workflow://runs/{run_id}/diff`. Candidate XML is deliberately private
+and is not exposed as a resource. Interrupted commits are assessed from
+durable evidence and can be explicitly reconciled with:
+
+```bash
+fcp-mcp workflow reconcile RUN_ID --json
+```
+
+This is a bounded workflow engine, not a generic graph runtime. It does not
+use MCP Tasks or run background autonomous agents.
 
 ### Cross-NLE export
 
@@ -288,6 +336,13 @@ export FCP_MCP_ENABLE_LIVE_CONTROL=1
 Leave it unset for offline-only use. Runtime and transaction events use
 text by default; set `FCP_MCP_LOG_FORMAT=json` for JSON lines.
 
+Workflow state defaults to the macOS application-support directory. Override
+it when isolation is required:
+
+```bash
+export FCP_MCP_STATE_DIR=/your/private/state
+```
+
 ---
 
 ## Examples
@@ -352,12 +407,12 @@ result into a disposable Final Cut Pro project before relying on it.
 **`path_outside_scope`** — add the media location to
 `FCP_MCP_ALLOWED_ROOTS`. External volumes are not implicitly trusted.
 
-**`same_file_forbidden`** — choose a different output. v0.2.1 never
+**`same_file_forbidden`** — choose a different output. fcp-mcp never
 overwrites its source path, even when the caller supplies it explicitly.
 
 **`unsupported_contract` from `fcpxml_apply_template`** — template
 listing and saving remain available, but clip substitution has no stable
-v0.2.1 schema and is intentionally unavailable.
+schema and remains intentionally unavailable in v0.3.0.
 
 **Tests failing on import** — activate the venv and reinstall: `pip install -e ".[dev]"`.
 

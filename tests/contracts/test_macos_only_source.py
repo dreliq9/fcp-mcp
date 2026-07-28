@@ -17,7 +17,7 @@ UPLOAD_ACTION = (
 PUBLISH_ACTION = (
     "pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e"
 )
-RELEASE_ARTIFACT = "fcp-mcp-v0.2.1-release-dist"
+RELEASE_ARTIFACT = "fcp-mcp-v0.3.0-release-dist"
 
 
 def _write_valid_repository(root: Path) -> None:
@@ -57,6 +57,8 @@ jobs:
         run: python scripts/check_macos_only.py
       - name: Validate documented calls
         run: FCP_MCP_PROFILE=full python scripts/check_contracts.py
+      - name: Validate structured tool results
+        run: FCP_MCP_PROFILE=full python scripts/check_tool_results.py
 """.lstrip(),
         encoding="utf-8",
     )
@@ -91,6 +93,7 @@ jobs:
         run: |
           ruff check src tests scripts
           FCP_MCP_PROFILE=full python scripts/check_contracts.py
+          FCP_MCP_PROFILE=full python scripts/check_tool_results.py
           python -m pytest -q
           pip-audit --local
       - name: Enforce macOS-only architecture
@@ -106,13 +109,25 @@ jobs:
         run: |
           python -m venv /tmp/fcp-mcp-wheel-smoke
           /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip
-          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install dist/fcp_mcp-0.2.1-py3-none-any.whl
+          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install dist/fcp_mcp-0.3.0-py3-none-any.whl
           mkdir -p "${{RUNNER_TEMP}}/fcp-mcp-output"
+          mkdir -p "${{RUNNER_TEMP}}/fcp-mcp-state"
+          chmod 700 "${{RUNNER_TEMP}}/fcp-mcp-state"
           FCP_MCP_OUTPUT_DIR="${{RUNNER_TEMP}}/fcp-mcp-output" \\
           FCP_MCP_ALLOWED_ROOTS="${{RUNNER_TEMP}}/fcp-mcp-output" \\
+          FCP_MCP_STATE_DIR="${{RUNNER_TEMP}}/fcp-mcp-state" \\
           FCP_MCP_ENABLE_LIVE_CONTROL=0 \\
           /tmp/fcp-mcp-wheel-smoke/bin/python scripts/wheel_smoke.py \\
             --command /tmp/fcp-mcp-wheel-smoke/bin/fcp-mcp
+      - name: Verify installed wheel on Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.10"
+      - name: Import installed workflow package on Python 3.10
+        run: |
+          python -m venv /tmp/fcp-mcp-wheel-py310
+          /tmp/fcp-mcp-wheel-py310/bin/python -m pip install dist/fcp_mcp-0.3.0-py3-none-any.whl
+          /tmp/fcp-mcp-wheel-py310/bin/python -c "import fcp_mcp.workflow.locking"
       - name: Upload verified distributions
         uses: {UPLOAD_ACTION}
         with:
@@ -977,7 +992,7 @@ def test_checker_binds_published_artifact_to_exact_verify_producer(
         text = text.replace(
             "  publish:\n",
             "      - name: Post-upload mutation\n"
-            "        run: echo unsafe > dist/fcp_mcp-0.2.1.tar.gz\n"
+            "        run: echo unsafe > dist/fcp_mcp-0.3.0.tar.gz\n"
             "  publish:\n",
         )
 

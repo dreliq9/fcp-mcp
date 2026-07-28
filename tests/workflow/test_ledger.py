@@ -5090,6 +5090,8 @@ def test_client_approval_is_created_only_inside_commit_intent_cas(
     assert result.run.state is WorkflowState.COMMITTING
     assert result.approval.source is ApprovalSource.CLIENT
     assert ledger.get_approval(RUN_ID) == result.approval
+    assert result.event.payload["binding_sha256"] == binding
+    assert ledger.verify_integrity(RUN_ID).valid is True
 
 
 def test_unreleased_v03_schema_is_one_baseline_with_current_artifact_contract(

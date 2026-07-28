@@ -8,6 +8,11 @@ For a one-shot verification that your install works, see
 [`examples/quickstart.py`](examples/quickstart.py). For a visual gallery
 with renders and narratives, see [`examples/GALLERY.md`](examples/GALLERY.md).
 
+The default `workflow` profile supports inspection plus durable
+prepare/review/commit editing. Recipes below that name direct mutators require
+the `edit` or `full` profile. Prefer the transactional form whenever the
+requested change can be expressed by a workflow operation.
+
 ---
 
 ## 1. Structural QC pass on a locked cut
@@ -27,7 +32,7 @@ You: "Run the structural QC report on hero.fcpxml and give me the summary."
 
 **What you get back:** a Markdown report containing structural validation,
 timeline statistics, gaps, flash frames, duplicate sources, and pacing.
-In v0.2.1 this aggregate tool does not include the separate media-link,
+This aggregate tool does not include the separate media-link,
 frame-rate, audio-level, or safe-zone checks.
 
 **Why fcp-mcp:** one call produces a deterministic structural summary
@@ -46,20 +51,23 @@ You: "Fix the flash frames and close the gaps, then re-run QC."
 
 **Tools:**
 
-1. Extend clips shorter than the configured minimum:
+1. Prepare both changes without touching `hero_heal.fcpxml`:
 
 ```tool-call
-{"name":"fcpxml_fix_flash_frames","arguments":{"path":"hero.fcpxml","output_path":"hero_heal.fcpxml"}}
+{"name":"fcpxml_workflow_prepare","arguments":{"source_path":"hero.fcpxml","destination_path":"hero_heal.fcpxml","operations":[{"kind":"fix_flash_frames","min_frames":3,"frame_duration":"1001/30000s"},{"kind":"fill_gaps","fill_ref":"r2","fill_name":"Fill"}]}}
 ```
 
-2. Replace gap elements with an existing media asset. Replace `r2` with
-   the resource ID you selected from the file:
+2. Review the returned summary, warnings, hashes, and `diff_uri`. After the
+   user explicitly approves that exact candidate, commit it:
 
 ```tool-call
-{"name":"fcpxml_fill_gaps","arguments":{"path":"hero_heal.fcpxml","fill_asset_ref":"r2","output_path":"hero_heal.fcpxml"}}
+{"name":"fcpxml_workflow_commit","arguments":{"run_id":"123e4567-e89b-42d3-a456-426614174000","expected_candidate_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}
 ```
 
-3. Re-run the structural report:
+Replace the example run ID and hash with the exact values returned by prepare.
+The selected `r2` resource must already exist in the source FCPXML.
+
+3. Re-run the structural report after commit:
 
 ```tool-call
 {"name":"fcpxml_qc_report","arguments":{"path":"hero_heal.fcpxml"}}
@@ -154,7 +162,7 @@ You: "Build a 60-second rough cut from shots_01–12, synced to song.mp3."
 {"name":"fcpxml_timeline_stats","arguments":{"path":"promo_with_audio.fcpxml"}}
 ```
 
-**Why fcp-mcp:** v0.2.1 can derive a beat cadence and use it to constrain
+**Why fcp-mcp:** The current tools can derive a beat cadence and use it to constrain
 shot length. It does not yet accept individual beat cut points, so this
 is an approximation rather than frame-exact beat placement.
 
@@ -262,7 +270,7 @@ You: "Check that all proxy clips have originals, then export for online."
 ```
 
 **Why fcp-mcp:** link checking happens before the cross-NLE export.
-v0.2.1 has no relink tool; repair missing paths in Final Cut Pro or the
+There is no relink tool; repair missing paths in Final Cut Pro or the
 source FCPXML before exporting.
 
 ---
@@ -303,5 +311,5 @@ You: "Bounce hero.mov to the four deliverable presets I have configured."
 ```
 
 **Why fcp-mcp:** each call invokes the checked Compressor CLI and
-reports its captured submission output. v0.2.1 does not track encode
+reports its captured submission output. The current tool does not track encode
 completion or normalize the output into a portable job-ID schema.

@@ -44,7 +44,7 @@ SETUP_PYTHON_ACTION = (
 PUBLISH_ACTION = (
     "pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e"
 )
-RELEASE_ARTIFACT = "fcp-mcp-v0.2.1-release-dist"
+RELEASE_ARTIFACT = "fcp-mcp-v0.3.0-release-dist"
 MACOS_CLASSIFIER = "Operating System :: MacOS :: MacOS X"
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 
@@ -254,6 +254,10 @@ def _expected_quality_job() -> dict[str, Any]:
                 "name": "Validate documented calls",
                 "run": "FCP_MCP_PROFILE=full python scripts/check_contracts.py",
             },
+            {
+                "name": "Validate structured tool results",
+                "run": "FCP_MCP_PROFILE=full python scripts/check_tool_results.py",
+            },
         ],
     }
 
@@ -392,6 +396,7 @@ def _expected_verify_job() -> dict[str, Any]:
                 "run": (
                     "ruff check src tests scripts\n"
                     "FCP_MCP_PROFILE=full python scripts/check_contracts.py\n"
+                    "FCP_MCP_PROFILE=full python scripts/check_tool_results.py\n"
                     "python -m pytest -q\n"
                     "pip-audit --local\n"
                 ),
@@ -415,13 +420,31 @@ def _expected_verify_job() -> dict[str, Any]:
                     "python -m venv /tmp/fcp-mcp-wheel-smoke\n"
                     "/tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip\n"
                     "/tmp/fcp-mcp-wheel-smoke/bin/python -m pip install "
-                    "dist/fcp_mcp-0.2.1-py3-none-any.whl\n"
+                    "dist/fcp_mcp-0.3.0-py3-none-any.whl\n"
                     'mkdir -p "${RUNNER_TEMP}/fcp-mcp-output"\n'
+                    'mkdir -p "${RUNNER_TEMP}/fcp-mcp-state"\n'
+                    'chmod 700 "${RUNNER_TEMP}/fcp-mcp-state"\n'
                     'FCP_MCP_OUTPUT_DIR="${RUNNER_TEMP}/fcp-mcp-output" \\\n'
                     'FCP_MCP_ALLOWED_ROOTS="${RUNNER_TEMP}/fcp-mcp-output" \\\n'
+                    'FCP_MCP_STATE_DIR="${RUNNER_TEMP}/fcp-mcp-state" \\\n'
                     "FCP_MCP_ENABLE_LIVE_CONTROL=0 \\\n"
                     "/tmp/fcp-mcp-wheel-smoke/bin/python scripts/wheel_smoke.py \\\n"
                     "  --command /tmp/fcp-mcp-wheel-smoke/bin/fcp-mcp\n"
+                ),
+            },
+            {
+                "name": "Verify installed wheel on Python 3.10",
+                "uses": SETUP_PYTHON_ACTION,
+                "with": {"python-version": "3.10"},
+            },
+            {
+                "name": "Import installed workflow package on Python 3.10",
+                "run": (
+                    "python -m venv /tmp/fcp-mcp-wheel-py310\n"
+                    "/tmp/fcp-mcp-wheel-py310/bin/python -m pip install "
+                    "dist/fcp_mcp-0.3.0-py3-none-any.whl\n"
+                    "/tmp/fcp-mcp-wheel-py310/bin/python -c "
+                    '"import fcp_mcp.workflow.locking"\n'
                 ),
             },
             {

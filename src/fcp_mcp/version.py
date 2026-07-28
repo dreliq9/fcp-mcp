@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from importlib.metadata import PackageNotFoundError, version
 
-FALLBACK_VERSION = "0.2.1"
+FALLBACK_VERSION = "0.3.0"
 
 
 def distribution_version(name: str) -> str:

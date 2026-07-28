@@ -11,7 +11,8 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Self
+
+from typing_extensions import Self
 
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.workflow.artifacts import StatePaths

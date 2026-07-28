@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from fcp_mcp.workflow.artifacts import ArtifactKind, ArtifactStore, StatePaths
 from fcp_mcp.workflow.engine import WorkflowEngine
 from fcp_mcp.workflow.ledger import WorkflowLedger
 from fcp_mcp.workflow.models import AddMarkerOperation, WorkflowPrepareRequestV1, WorkflowState
+from fcp_mcp.workflow.surface import WorkflowRuntime
 
 RUN_ID = "123e4567-e89b-42d3-a456-426614174000"
 ATTEMPT_ID = "223e4567-e89b-42d3-a456-426614174000"
@@ -33,6 +35,8 @@ def _engine(
     *,
     mode: ApprovalMode = ApprovalMode.CLI,
     prior_destination: bytes | None = None,
+    ledger_clock: Callable[[], datetime] = lambda: NOW,
+    utc_clock: Callable[[], datetime] = lambda: NOW,
 ) -> tuple[WorkflowEngine, WorkflowLedger, Path, ClientApproval | None]:
     config = RuntimeConfig.from_env(
         {
@@ -44,7 +48,7 @@ def _engine(
         home=tmp_path,
     )
     paths = StatePaths.from_config(config)
-    ledger = WorkflowLedger(paths, clock=lambda: NOW, package_version="0.3.0-test")
+    ledger = WorkflowLedger(paths, clock=ledger_clock, package_version="0.3.0-test")
     ledger.initialize()
     engine = WorkflowEngine(
         config,
@@ -52,7 +56,7 @@ def _engine(
         ledger,
         ArtifactStore(paths, max_artifact_bytes=config.max_artifact_bytes),
         uuid_factory=iter((RUN_ID, ATTEMPT_ID)).__next__,
-        utc_clock=lambda: NOW,
+        utc_clock=utc_clock,
         monotonic_clock=lambda: 1.0,
     )
     source = tmp_path / "source.fcpxml"
@@ -106,6 +110,36 @@ def test_successful_commit_has_exact_trajectory_and_idempotent_receipt(
     events = [event.event_type for event in ledger.list_events(RUN_ID, limit=100)]
     assert events[-2:] == ["commit_started", "committed"]
     assert engine.commit(RUN_ID) == receipt
+
+
+def test_commit_timestamp_preserves_subsecond_order_across_restart(
+    tmp_path: Path,
+) -> None:
+    ledger_now = [datetime(2026, 7, 28, 12, 0, 0, 500000, tzinfo=timezone.utc)]
+    committed = datetime(2026, 7, 28, 12, 0, 0, 600000, tzinfo=timezone.utc)
+    engine, _, _, _ = _engine(
+        tmp_path,
+        ledger_clock=lambda: ledger_now[0],
+        utc_clock=lambda: committed,
+    )
+    ledger_now[0] = datetime(
+        2026, 7, 28, 12, 0, 0, 700000, tzinfo=timezone.utc
+    )
+
+    receipt = engine.commit(RUN_ID)
+    restarted = WorkflowRuntime(
+        RuntimeConfig.from_env(
+            {
+                "FCP_MCP_OUTPUT_DIR": str(tmp_path),
+                "FCP_MCP_ALLOWED_ROOTS": str(tmp_path),
+                "FCP_MCP_STATE_DIR": str(tmp_path / "state"),
+            },
+            home=tmp_path,
+        )
+    )
+
+    assert receipt.committed_at == "2026-07-28T12:00:00.600000Z"
+    assert restarted.status(RUN_ID).state is WorkflowState.COMMITTED
 
 
 def test_commit_rehashes_under_lock_and_stales_without_mutation(tmp_path: Path) -> None:

@@ -9,7 +9,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from scripts.wheel_smoke import check_version, inspect_server
+from scripts.wheel_smoke import (
+    PROFILE_COUNTS,
+    check_version,
+    inspect_server,
+    smoke_workflow,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -27,12 +32,13 @@ def _environment(tmp_path: Path) -> dict[str, str]:
         "FCP_MCP_PROFILE": "full",
         "FCP_MCP_OUTPUT_DIR": str(tmp_path),
         "FCP_MCP_ALLOWED_ROOTS": str(tmp_path),
+        "FCP_MCP_STATE_DIR": str(tmp_path / "state"),
         "FCP_MCP_ENABLE_LIVE_CONTROL": "0",
     }
 
 
 def test_installed_command_reports_release_version():
-    assert check_version(str(_command())) == "0.2.1"
+    assert check_version(str(_command())) == "0.3.0"
 
 
 def test_real_stdio_initialize_catalog_and_doctor(tmp_path: Path):
@@ -44,10 +50,11 @@ def test_real_stdio_initialize_catalog_and_doctor(tmp_path: Path):
         )
     )
 
-    assert report["package_version"] == "0.2.1"
+    assert report["package_version"] == "0.3.0"
     assert report["server_name"] == "fcp-mcp"
     assert report["tool_count"] == 93
     assert report["prompt_count"] == 5
+    assert report["resource_template_count"] == 3
     assert report["doctor_status"] in {"ready", "degraded"}
     assert report["doctor_is_error"] is False
 
@@ -72,7 +79,35 @@ def test_quickstart_uses_stdio_without_writing_roundtrip(tmp_path: Path):
 
     assert result.returncode == 0, result.stderr or result.stdout
     payload = json.loads(result.stdout)
-    assert payload["package_version"] == "0.2.1"
+    assert payload["package_version"] == "0.3.0"
     assert payload["tool_count"] == 93
     assert payload["prompt_count"] == 5
     assert not roundtrip.exists()
+
+
+def test_profile_contract_includes_workflow_default():
+    assert PROFILE_COUNTS == {
+        "inspect": (30, 2, 0),
+        "workflow": (34, 3, 3),
+        "edit": (74, 5, 3),
+        "full": (93, 5, 3),
+    }
+
+
+def test_real_stdio_hash_bound_workflow_and_cli_reconcile(tmp_path: Path):
+    report = asyncio.run(
+        smoke_workflow(
+            str(_command()),
+            cwd=ROOT,
+            env=_environment(tmp_path),
+        )
+    )
+
+    assert report["state"] == "committed"
+    assert report["prepare_left_destination_untouched"] is True
+    assert report["candidate_matches_destination"] is True
+    assert report["resource_count"] == 3
+    assert report["ledger_integrity_valid"] is True
+    assert report["ledger_checked_runs"] >= 1
+    assert report["reconcile_state"] == "committed"
+    assert report["reconcile_recovery"] is None

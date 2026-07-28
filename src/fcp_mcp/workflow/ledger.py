@@ -4167,7 +4167,10 @@ class WorkflowLedger:
             )
             if cursor.rowcount != 1:
                 raise _state_conflict("workflow state or revision is stale")
-            payload, payload_text = _event_payload(patch)
+            event_payload = dict(patch)
+            if approval.source is ApprovalSource.CLIENT:
+                event_payload["binding_sha256"] = approval.binding_sha256
+            payload, payload_text = _event_payload(event_payload)
             event = self._append_event_locked(
                 connection,
                 run_id=canonical_run_id,

@@ -10,11 +10,11 @@ from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.version import distribution_version, package_version
 
 
-def test_release_manifests_are_0_2_1():
+def test_release_manifests_are_0_3_0():
     registry = json.loads(Path("server.json").read_text())
-    assert registry["version"] == "0.2.1"
-    assert registry["packages"][0]["version"] == "0.2.1"
-    assert "89 tools" in registry["description"]
+    assert registry["version"] == "0.3.0"
+    assert registry["packages"][0]["version"] == "0.3.0"
+    assert "transactional" in registry["description"]
     assert len(registry["description"]) <= 100
     assert {
         variable["name"]
@@ -25,13 +25,15 @@ def test_release_manifests_are_0_2_1():
         "FCP_MCP_ALLOWED_ROOTS",
         "FCP_MCP_ENABLE_LIVE_CONTROL",
         "FCP_MCP_LOG_FORMAT",
+        "FCP_MCP_PROFILE",
+        "FCP_MCP_STATE_DIR",
     }
-    assert "0.2.1" in Path("CHANGELOG.md").read_text()
+    assert "0.3.0" in Path("CHANGELOG.md").read_text()
 
 
-def test_package_and_module_versions_are_0_2_1():
-    assert package_version() == "0.2.1"
-    assert __version__ == "0.2.1"
+def test_package_and_module_versions_are_0_3_0():
+    assert package_version() == "0.3.0"
+    assert __version__ == "0.3.0"
 
 
 def test_runtime_dependency_requires_stable_mcp_v2_only():

@@ -28,7 +28,7 @@ async def test_doctor_has_stable_schema_and_catalog(tmp_path: Path):
         expected_prompt_names=prompt_names,
     )
     assert report.schema_version == "1"
-    assert report.package_version == "0.2.1"
+    assert report.package_version == "0.3.0"
     assert report.server_name == "fcp-mcp"
     assert report.tool_count == 89
     assert report.prompt_count == 5

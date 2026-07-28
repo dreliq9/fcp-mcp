@@ -1,8 +1,9 @@
 # fcp-mcp Roadmap
 
-Status as of 2026-07-26: **89 tools across 12 functional categories
-plus runtime diagnostics, and five prompts.** v0.2.1 is the trust
-baseline release candidate. Planned work below is grouped by priority.
+Status as of 2026-07-28: **v0.3.0 provides up to 93 tools across 13
+functional categories, five prompts, and three workflow resources.** The
+default `workflow` profile is the transactional AI-piloting surface. Planned
+work below is grouped by priority.
 
 ---
 
@@ -23,7 +24,7 @@ sees them in the MCP prompt list and can invoke them by name.
 - **`beat-sync`** — `media_detect_beats` + `auto_rough_cut` using median
   beat cadence; exact beat cut points are not supported
 
-### 0.2.1 Trust baseline (release candidate)
+### 0.2.1 Trust baseline (shipped)
 
 - Stable coded MCP failures and structured `fcp_doctor`
 - Allowed-root path policy and symlink containment
@@ -34,8 +35,7 @@ sees them in the MCP prompt list and can invoke them by name.
 - Executable documentation and prompt contracts
 - Python 3.10–3.13 CI on macOS, dependency audit,
   coverage floors, package checks, and installed-wheel smoke
-- FastMCP v1 bounded below v2, with package and wire versions disclosed
-  separately
+- An explicit MCP boundary with package and SDK versions disclosed separately
 
 ### Release automation
 
@@ -58,8 +58,8 @@ crash-recoverable, and machine-verifiable.
 - Meaningful typed structured outputs while preserving successful text content
 - Deterministic inspect-plan-dry-run-validate-diff-approve-commit graph
 - Durable SQLite event ledger, private hashed artifacts, and recovery tooling
-- CLI approval by default with explicit client-approval opt-in
-- Stable MCP SDK v2 migration after the final SDK/specification research gate
+- Hash-bound client approval by default with CLI approval as an explicit mode
+- Stable MCP SDK v2 boundary with the package version on the wire
 
 ---
 

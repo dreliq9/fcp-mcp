@@ -2,17 +2,17 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.dreliq9/fcp-mcp",
   "title": "fcp-mcp — Final Cut Pro MCP Server",
-  "description": "Final Cut Pro MCP with 89 tools and 5 prompts for FCPXML, media analysis, puppets, and diagnostics.",
+  "description": "Final Cut Pro MCP with transactional FCPXML workflows, analysis, live control, and diagnostics.",
   "repository": {
     "url": "https://github.com/dreliq9/fcp-mcp",
     "source": "github"
   },
-  "version": "0.2.1",
+  "version": "0.3.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "fcp-mcp",
-      "version": "0.2.1",
+      "version": "0.3.0",
       "transport": {
         "type": "stdio"
       },
@@ -51,6 +51,20 @@
           "format": "string",
           "isSecret": false,
           "name": "FCP_MCP_LOG_FORMAT"
+        },
+        {
+          "description": "Catalog profile: inspect, workflow (default), edit, or full",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "FCP_MCP_PROFILE"
+        },
+        {
+          "description": "Private directory for workflow ledger, artifacts, receipts, and locks",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "FCP_MCP_STATE_DIR"
         }
       ]
     }

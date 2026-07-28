@@ -3,6 +3,38 @@
 All notable changes to fcp-mcp are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## v0.3.0 — 2026-07-28 — Transactional AI piloting
+
+### Added
+
+- A default `workflow` profile with 34 tools, three prompts, and three
+  read-only durable evidence resources.
+- A fixed prepare, review, hash-bound client approval, atomic commit, cancel,
+  status, and explicit recovery flow for bounded FCPXML operations.
+- Private SQLite workflow state with tamper-evident events, candidate and diff
+  hashes, receipts, destination locks, idempotency, and bounded diagnostics.
+- Installed-wheel evidence covering all four profiles and a real
+  two-operation prepare/commit/reconcile trajectory.
+
+### Changed
+
+- The full profile now contains 93 tools, five prompts, and three resource
+  templates; `inspect`, `edit`, and `full` remain explicit alternatives.
+- The MCP boundary now uses the stable Python SDK v2 line and reports the
+  fcp-mcp package version as its wire server version.
+- Client commits must repeat the exact candidate SHA-256 returned by prepare.
+  This proves candidate identity but is recorded as unverified-human approval.
+- Python 3.10 compatibility is preserved through `typing_extensions.Self`.
+- Commit timestamps retain subsecond precision so restart validation preserves
+  event ordering.
+
+### Boundaries
+
+- No candidate XML resource, MCP Tasks, background autonomy, or generic graph
+  engine is introduced.
+- Selecting `full` does not bypass the independent live-control opt-in.
+- `fcpxml_apply_template` remains `unsupported_contract`.
+
 ## v0.2.1 — 2026-07-26 — Trust baseline
 
 This patch preserves the existing public tool names and successful text

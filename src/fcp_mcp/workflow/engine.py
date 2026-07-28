@@ -464,7 +464,7 @@ def _snapshot_regular(
 def _canonical_utc(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() != timedelta(0):
         raise _coded(ErrorCode.INVALID_CONFIGURATION, "workflow clock must return UTC")
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _identity(result: os.stat_result) -> tuple[int, int, int]:

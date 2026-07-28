@@ -27,7 +27,7 @@ PUBLISH_STEPS = [
             "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
         ),
         "with": {
-            "name": "fcp-mcp-v0.2.1-release-dist",
+            "name": "fcp-mcp-v0.3.0-release-dist",
             "path": "dist/",
         },
     },

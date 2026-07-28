@@ -25,7 +25,7 @@ SOURCE_XML = b"""<?xml version="1.0" encoding="UTF-8"?>
 
 def test_version_prints_package_version(capsys):
     assert main(["--version"]) == 0
-    assert capsys.readouterr().out.strip() == "fcp-mcp 0.2.1"
+    assert capsys.readouterr().out.strip() == "fcp-mcp 0.3.0"
 
 
 @pytest.mark.parametrize(
@@ -66,7 +66,7 @@ def test_doctor_json_is_machine_readable(capsys, tmp_path, monkeypatch):
     payload = json.loads(capsys.readouterr().out)
     assert code in {0, 1, 2}
     assert payload["schema_version"] == "1"
-    assert payload["package_version"] == "0.2.1"
+    assert payload["package_version"] == "0.3.0"
     assert payload["tool_count"] == 93
     assert payload["prompt_count"] == 5
     ledger = next(

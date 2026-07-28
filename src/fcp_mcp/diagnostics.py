@@ -435,7 +435,7 @@ async def collect_doctor(
                 remediation=(
                     None
                     if catalog_valid
-                    else "Reinstall a verified fcp-mcp 0.2.1 artifact"
+                    else "Reinstall a verified fcp-mcp 0.3.0 artifact"
                 ),
             )
         )
