@@ -137,3 +137,26 @@ def test_preassigned_backup_is_created_exclusively_after_absence_check(
 
     assert destination.read_bytes() == b"before"
     assert backup.read_bytes() == b"concurrent owner"
+
+
+def test_short_backup_write_removes_partial_backup_without_mutating_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out.txt"
+    destination.write_bytes(b"before")
+    attempt = "223e4567-e89b-42d3-a456-426614174000"
+    backup = tmp_path / f"out.txt.bak.{attempt}"
+    monkeypatch.setattr(atomic_write_module.os, "write", lambda *_args: 0)
+
+    with pytest.raises(FCPMCPError, match="Backup creation failed"):
+        atomic_replace_bytes(
+            destination,
+            b"after",
+            transaction_id=attempt,
+            backup_path=backup,
+        )
+
+    assert destination.read_bytes() == b"before"
+    assert backup.exists() is False
+    assert list(tmp_path.glob("*.tmp")) == []
