@@ -33,6 +33,8 @@ jobs:
           FCP_MCP_PROFILE=full python scripts/check_contracts.py
           python -m pytest -q
           pip-audit --local
+      - name: Enforce macOS-only architecture
+        run: python scripts/check_macos_only.py
       - name: Rebuild distributions from tag
         run: |
           rm -rf build dist

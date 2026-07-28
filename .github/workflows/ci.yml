@@ -54,6 +54,8 @@ jobs:
           python -m pip install -e ".[dev]"
       - name: Ruff
         run: ruff check src tests scripts
+      - name: Enforce macOS-only architecture
+        run: python scripts/check_macos_only.py
       - name: Validate documented calls
         run: FCP_MCP_PROFILE=full python scripts/check_contracts.py
 

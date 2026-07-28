@@ -5,6 +5,10 @@ tests, and submit changes.
 
 ## Setup
 
+Supported development and all product/release verification require macOS 15.6
+or later. Final Cut Pro is required for live-control development and the
+release canary.
+
 ```bash
 git clone https://github.com/dreliq9/fcp-mcp.git
 cd fcp-mcp
