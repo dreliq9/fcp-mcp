@@ -10,6 +10,7 @@ import re
 import secrets
 import sqlite3
 import stat
+import struct
 import sys
 import threading
 import zlib
@@ -53,7 +54,16 @@ _MAX_IDEMPOTENCY_KEY_CHARS = 128
 _MAX_READ_LIMIT = 1000
 _MAX_INTEGRITY_FINDINGS = 100
 _MAX_CREATE_RACE_RETRIES = 3
+_FINGERPRINT_BATCH_SIZE = 100
+_MAX_FINGERPRINT_COLUMNS = 4096
 _SQLITE_MAX_INTEGER = 2**63 - 1
+_BACKUP_PERSISTENT_PRAGMAS = (
+    "application_id",
+    "user_version",
+    "page_size",
+    "auto_vacuum",
+    "encoding",
+)
 _BOOTSTRAP_TABLE = "__fcp_ledger_identity"
 _BOOTSTRAP_SCHEMA_SQL = (
     "CREATE TABLE __fcp_ledger_identity("
@@ -712,6 +722,26 @@ _COMMIT_RESULT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
 }
 _COMMIT_INTENT_FIELDS = frozenset(_COMMIT_INTENT_PROJECTION_EVENTS)
 _COMMIT_RESULT_FIELDS = frozenset(_COMMIT_RESULT_PROJECTION_EVENTS)
+_PREPARE_PROJECTION_EVENT_NAMES = frozenset(
+    event_type
+    for event_types in _PREPARE_PROJECTION_EVENTS.values()
+    for event_type in event_types
+)
+_COMMIT_INTENT_EVENT_NAMES = frozenset(
+    event_type
+    for event_types in _COMMIT_INTENT_PROJECTION_EVENTS.values()
+    for event_type in event_types
+)
+_COMMIT_RESULT_EVENT_NAMES = frozenset(
+    event_type
+    for event_types in _COMMIT_RESULT_PROJECTION_EVENTS.values()
+    for event_type in event_types
+)
+_PROJECTION_EVENT_NAMES = (
+    _PREPARE_PROJECTION_EVENT_NAMES
+    | _COMMIT_INTENT_EVENT_NAMES
+    | _COMMIT_RESULT_EVENT_NAMES
+)
 _TERMINAL_ERROR_FIELDS = frozenset(
     {"terminal_error_code", "terminal_error_summary"}
 )
@@ -758,6 +788,34 @@ def _stat_identity(result: os.stat_result) -> tuple[int, int, int]:
         result.st_ino,
         stat.S_IFMT(result.st_mode),
     )
+
+
+def _fingerprint_frame(tag: bytes, payload: bytes) -> bytes:
+    if len(tag) != 1:
+        raise _MigrationError("database fingerprint tag is invalid")
+    return tag + len(payload).to_bytes(8, "big") + payload
+
+
+def _fingerprint_value(value: object) -> bytes:
+    if value is None:
+        return _fingerprint_frame(b"N", b"")
+    if type(value) is int:
+        if not -(2**63) <= value <= 2**63 - 1:
+            raise _MigrationError("database integer is outside SQLite range")
+        return _fingerprint_frame(b"I", value.to_bytes(8, "big", signed=True))
+    if type(value) is float:
+        return _fingerprint_frame(b"R", struct.pack(">d", value))
+    if isinstance(value, str):
+        return _fingerprint_frame(b"T", value.encode("utf-8"))
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return _fingerprint_frame(b"B", bytes(value))
+    raise _MigrationError("database value has an unsupported SQLite type")
+
+
+def _quote_sqlite_identifier(value: object) -> str:
+    if not isinstance(value, str) or "\x00" in value:
+        raise _MigrationError("database identifier is invalid")
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _attach_cleanup_failures(
@@ -858,6 +916,34 @@ def _validate_projection_policy(
     fields = frozenset(patch)
     if fields & _APPROVAL_PROJECTION_FIELDS:
         raise _state_conflict("approval fields require record_decision")
+    if event_type in _PREPARE_PROJECTION_EVENT_NAMES:
+        expected_fields = frozenset(
+            field
+            for field, event_types in _PREPARE_PROJECTION_EVENTS.items()
+            if event_type in event_types
+        )
+        if source is not WorkflowState.PREPARING or fields != expected_fields:
+            raise _state_conflict(
+                "prepare evidence events require their authoritative projection"
+            )
+    elif event_type in _COMMIT_INTENT_EVENT_NAMES:
+        if not (
+            event_type == "commit_started"
+            and source is WorkflowState.APPROVED
+            and target is WorkflowState.COMMITTING
+            and fields == _COMMIT_INTENT_FIELDS
+        ):
+            raise _state_conflict(
+                "commit intent events require their authoritative transition"
+            )
+    elif event_type in _COMMIT_RESULT_EVENT_NAMES and not (
+        source is WorkflowState.COMMITTING
+        and target is WorkflowState.COMMITTED
+        and fields == _COMMIT_RESULT_FIELDS
+    ):
+        raise _state_conflict(
+            "commit result events require their authoritative transition"
+        )
 
     allowed: set[str] = set()
     if source is WorkflowState.PREPARING:
@@ -1620,14 +1706,22 @@ class WorkflowLedger:
     def _backup_schema_identity(
         self,
         connection: sqlite3.Connection,
-    ) -> tuple[tuple[object, ...], ...]:
-        return tuple(
-            tuple(row)
-            for row in connection.execute(
-                "SELECT type, name, tbl_name, rootpage, sql "
-                "FROM sqlite_master ORDER BY type, name"
-            ).fetchall()
+    ) -> str:
+        digest = hashlib.sha256()
+        cursor = connection.execute(
+            "SELECT type, name, tbl_name, rootpage, sql "
+            "FROM sqlite_master "
+            "ORDER BY type COLLATE BINARY, name COLLATE BINARY"
         )
+        while True:
+            rows = cursor.fetchmany(_FINGERPRINT_BATCH_SIZE)
+            if not rows:
+                break
+            for row in rows:
+                digest.update(_fingerprint_frame(b"S", b""))
+                for value in row:
+                    digest.update(_fingerprint_value(value))
+        return digest.hexdigest()
 
     def _backup_migration_identity(
         self,
@@ -1640,17 +1734,175 @@ class WorkflowLedger:
         connection: sqlite3.Connection,
     ) -> str:
         digest = hashlib.sha256()
-        for statement in connection.iterdump():
-            encoded = statement.encode("utf-8")
-            digest.update(len(encoded).to_bytes(8, "big"))
-            digest.update(encoded)
+        digest.update(_fingerprint_frame(b"V", b"fcp-backup-fingerprint-v2"))
+        for pragma in _BACKUP_PERSISTENT_PRAGMAS:
+            row = connection.execute(f"PRAGMA {pragma}").fetchone()
+            if row is None or len(row) != 1:
+                raise _MigrationError("persistent database pragma is unavailable")
+            digest.update(_fingerprint_frame(b"P", pragma.encode("ascii")))
+            digest.update(_fingerprint_value(row[0]))
+
+        function_name = "__fcp_backup_fingerprint_value_v2"
+        connection.create_function(
+            function_name,
+            1,
+            _fingerprint_value,
+            deterministic=True,
+        )
+        table_cursor = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "ORDER BY name COLLATE BINARY"
+        )
+        table_count = 0
+        try:
+            while True:
+                tables = table_cursor.fetchmany(_FINGERPRINT_BATCH_SIZE)
+                if not tables:
+                    break
+                for table_row in tables:
+                    table_name = table_row[0]
+                    quoted_table = _quote_sqlite_identifier(table_name)
+                    digest.update(
+                        _fingerprint_frame(
+                            b"T",
+                            table_name.encode("utf-8"),
+                        )
+                    )
+                    column_cursor = connection.execute(
+                        "SELECT cid, name, type, \"notnull\", dflt_value, "
+                        "pk, hidden FROM pragma_table_xinfo(?) ORDER BY cid",
+                        (table_name,),
+                    )
+                    columns = tuple(
+                        column_cursor.fetchmany(_MAX_FINGERPRINT_COLUMNS + 1)
+                    )
+                    if (
+                        not columns
+                        or len(columns) > _MAX_FINGERPRINT_COLUMNS
+                        or column_cursor.fetchone() is not None
+                    ):
+                        raise _MigrationError(
+                            "database table column count is unsupported"
+                        )
+                    column_names: list[str] = []
+                    primary_key_columns: list[tuple[int, str]] = []
+                    for column in columns:
+                        column_name = column["name"]
+                        quoted_column = _quote_sqlite_identifier(column_name)
+                        column_names.append(quoted_column)
+                        digest.update(_fingerprint_frame(b"C", b""))
+                        for value in column:
+                            digest.update(_fingerprint_value(value))
+                        if type(column["pk"]) is int and column["pk"] > 0:
+                            primary_key_columns.append(
+                                (column["pk"], quoted_column)
+                            )
+
+                    table_list_row = connection.execute(
+                        "SELECT type, wr, strict FROM pragma_table_list "
+                        "WHERE schema = 'main' AND name = ?",
+                        (table_name,),
+                    ).fetchone()
+                    if table_list_row is None:
+                        raise _MigrationError(
+                            "database table metadata disappeared"
+                        )
+                    without_rowid = table_list_row["wr"] == 1
+                    digest.update(_fingerprint_frame(b"M", b""))
+                    for value in table_list_row:
+                        digest.update(_fingerprint_value(value))
+
+                    encoded_columns = [
+                        f"{function_name}({column})"
+                        for column in column_names
+                    ]
+                    if without_rowid:
+                        ordered_primary_key = [
+                            column
+                            for _, column in sorted(primary_key_columns)
+                        ]
+                        if not ordered_primary_key:
+                            raise _MigrationError(
+                                "WITHOUT ROWID table lacks a primary key"
+                            )
+                        identity_columns = [
+                            f"{function_name}({column})"
+                            for column in ordered_primary_key
+                        ]
+                        select_columns = identity_columns + encoded_columns
+                        order_clause = ", ".join(identity_columns)
+                        identity_count = len(identity_columns)
+                    else:
+                        observed_names = {
+                            str(column["name"]).casefold()
+                            for column in columns
+                        }
+                        rowid_name = next(
+                            (
+                                candidate
+                                for candidate in ("_rowid_", "rowid", "oid")
+                                if candidate.casefold() not in observed_names
+                            ),
+                            None,
+                        )
+                        if rowid_name is None:
+                            raise _MigrationError(
+                                "rowid table hides its row identity"
+                            )
+                        quoted_rowid = _quote_sqlite_identifier(rowid_name)
+                        select_columns = [quoted_rowid] + encoded_columns
+                        order_clause = quoted_rowid
+                        identity_count = 1
+
+                    row_cursor = connection.execute(
+                        f"SELECT {', '.join(select_columns)} "
+                        f"FROM {quoted_table} ORDER BY {order_clause}"
+                    )
+                    row_count = 0
+                    while True:
+                        rows = row_cursor.fetchmany(_FINGERPRINT_BATCH_SIZE)
+                        if not rows:
+                            break
+                        for row in rows:
+                            digest.update(_fingerprint_frame(b"W", b""))
+                            for position, value in enumerate(row):
+                                if not isinstance(value, (bytes, bytearray)):
+                                    if not (
+                                        not without_rowid
+                                        and position == 0
+                                        and type(value) is int
+                                    ):
+                                        raise _MigrationError(
+                                            "database fingerprint row is invalid"
+                                        )
+                                    encoded = _fingerprint_value(value)
+                                else:
+                                    encoded = bytes(value)
+                                tag = b"K" if position < identity_count else b"D"
+                                digest.update(_fingerprint_frame(tag, encoded))
+                            row_count += 1
+                    digest.update(
+                        _fingerprint_frame(
+                            b"N",
+                            row_count.to_bytes(8, "big"),
+                        )
+                    )
+                    table_count += 1
+        finally:
+            connection.create_function(function_name, 1, None)
+        digest.update(
+            _fingerprint_frame(
+                b"Z",
+                table_count.to_bytes(8, "big"),
+            )
+        )
         return digest.hexdigest()
 
     def _validate_backup_content(
         self,
         connection: sqlite3.Connection,
         *,
-        source_schema: tuple[tuple[object, ...], ...],
+        source_schema: str,
         source_migrations: tuple[tuple[object, ...], ...],
         source_content_sha256: str,
     ) -> None:
@@ -2411,7 +2663,7 @@ class WorkflowLedger:
             consistent = False
         if not consistent:
             raise _state_conflict("commit intent contradicts prior destination evidence")
-        if any(payload.get(field) != patch[field] for field in _COMMIT_INTENT_FIELDS):
+        if any(payload[field] != patch[field] for field in _COMMIT_INTENT_FIELDS):
             raise _state_conflict(
                 "commit_started payload must match projected commit evidence"
             )
@@ -2426,6 +2678,13 @@ class WorkflowLedger:
         payload: Mapping[str, object],
         patch: Mapping[str, object],
     ) -> None:
+        if (
+            event_type in _PROJECTION_EVENT_NAMES
+            and frozenset(payload) != frozenset(patch)
+        ):
+            raise _state_conflict(
+                "projection event payload keys must match its projection"
+            )
         if current.state is WorkflowState.PREPARING:
             event_prepare_fields = {
                 field

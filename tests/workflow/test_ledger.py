@@ -2932,6 +2932,177 @@ def test_prepare_projection_payload_must_carry_exact_owned_evidence(
 
 
 @pytest.mark.parametrize(
+    ("event_type", "family"),
+    (
+        ("source_inspected", "prepare"),
+        ("plan_built", "prepare"),
+        ("plan_normalized", "prepare"),
+        ("awaiting_approval", "prepare"),
+        ("prepare_completed", "prepare"),
+        ("prepared", "prepare"),
+        ("preview_persisted", "prepare"),
+        ("backup_created", "intent"),
+        ("commit_started", "intent"),
+        ("commit_completed", "result"),
+        ("committed", "result"),
+    ),
+)
+def test_projection_owning_event_names_reject_non_authoritative_context(
+    tmp_path: Path,
+    event_type: str,
+    family: str,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    if family == "prepare":
+        current = _complete_prepare(ledger).run
+        if event_type == "source_inspected":
+            payload: dict[str, object] = {
+                "source_sha256": HASH_B,
+                "prior_destination_state": PriorDestinationState.PRESENT,
+                "prior_destination_sha256": HASH_E,
+            }
+        elif event_type in {"plan_built", "plan_normalized"}:
+            payload = {"plan_sha256": HASH_E}
+        else:
+            payload = {"expires_at": "2026-08-30T01:02:03Z"}
+    elif family == "intent":
+        current = ledger.get_run(RUN_ID)
+        assert current is not None
+        payload = (
+            {"backup_sha256": None}
+            if event_type == "backup_created"
+            else {
+                "commit_attempt_id": ATTEMPT_ID,
+                "expected_backup_path": None,
+                "backup_sha256": None,
+            }
+        )
+    else:
+        approved = _approve(ledger, _complete_prepare(ledger))
+        current = ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.APPROVED,
+            expected_revision=approved.run.revision,
+            target_state=WorkflowState.COMMITTING,
+            event_type="commit_started",
+            payload={
+                "commit_attempt_id": ATTEMPT_ID,
+                "expected_backup_path": None,
+                "backup_sha256": None,
+            },
+            projection_patch={
+                "commit_attempt_id": ATTEMPT_ID,
+                "expected_backup_path": None,
+                "backup_sha256": None,
+            },
+        ).run
+        payload = {
+            "destination_sha256": HASH_C,
+            "backup_sha256": None,
+            "receipt_sha256": HASH_E,
+            "receipt_size_bytes": 42,
+            "committed_at": "2026-07-27T02:02:03Z",
+        }
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=current.state,
+            expected_revision=current.revision,
+            event_type=event_type,
+            payload=payload,
+        )
+
+    _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+    assert ledger.verify_integrity(RUN_ID).valid is True
+
+
+@pytest.mark.parametrize("family", ("prepare", "intent", "result"))
+@pytest.mark.parametrize("asymmetry", ("missing", "extra"))
+def test_projection_event_payload_and_projection_key_sets_are_exact(
+    tmp_path: Path,
+    family: str,
+    asymmetry: str,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    if family == "prepare":
+        current = ledger.get_run(RUN_ID)
+        assert current is not None
+        target = WorkflowState.PREPARING
+        event_type = "plan_built"
+        patch: dict[str, object] = {"plan_sha256": HASH_B}
+    else:
+        approved = _approve(ledger, _complete_prepare(ledger))
+        if family == "intent":
+            current = approved.run
+            target = WorkflowState.COMMITTING
+            event_type = "commit_started"
+            patch = {
+                "commit_attempt_id": ATTEMPT_ID,
+                "expected_backup_path": None,
+                "backup_sha256": None,
+            }
+        else:
+            current = ledger.transition(
+                RUN_ID,
+                expected_state=WorkflowState.APPROVED,
+                expected_revision=approved.run.revision,
+                target_state=WorkflowState.COMMITTING,
+                event_type="commit_started",
+                payload={
+                    "commit_attempt_id": ATTEMPT_ID,
+                    "expected_backup_path": None,
+                    "backup_sha256": None,
+                },
+                projection_patch={
+                    "commit_attempt_id": ATTEMPT_ID,
+                    "expected_backup_path": None,
+                    "backup_sha256": None,
+                },
+            ).run
+            target = WorkflowState.COMMITTED
+            event_type = "committed"
+            patch = {
+                "destination_sha256": HASH_C,
+                "backup_sha256": None,
+                "receipt_sha256": HASH_E,
+                "receipt_size_bytes": 42,
+                "committed_at": "2026-07-27T02:02:03Z",
+            }
+    payload = dict(patch)
+    if asymmetry == "missing":
+        payload.pop(next(iter(payload)))
+    else:
+        payload["extra"] = "not projection evidence"
+
+    with pytest.raises(FCPMCPError) as error:
+        if family == "prepare":
+            ledger.append_event(
+                RUN_ID,
+                expected_state=current.state,
+                expected_revision=current.revision,
+                event_type=event_type,
+                payload=payload,
+                projection_patch=patch,
+            )
+        else:
+            ledger.transition(
+                RUN_ID,
+                expected_state=current.state,
+                expected_revision=current.revision,
+                target_state=target,
+                event_type=event_type,
+                payload=payload,
+                projection_patch=patch,
+            )
+
+    _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+    assert ledger.verify_integrity(RUN_ID).valid is True
+
+
+@pytest.mark.parametrize(
     ("mode", "source"),
     (
         (ApprovalMode.CLI, ApprovalSource.CLIENT),
@@ -3576,6 +3747,340 @@ def test_backup_destination_same_inode_corruption_is_rejected_before_publish(
 
     _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
     assert paths.database.read_bytes().startswith(b"SQLite format 3\x00")
+    assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
+    assert list(paths.root.glob(".runs.sqlite3.backup-*.tmp")) == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "user_version",
+        "application_id",
+        "embedded_nul_text",
+        "ordinary_text",
+        "blob",
+        "rowid_identity",
+        "without_rowid",
+        "sequence",
+    ),
+)
+def test_backup_valid_content_mutation_is_rejected_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute(
+        'CREATE TABLE "quoted table"('
+        '"row value" TEXT NOT NULL, "blob value" BLOB NOT NULL)'
+    )
+    legacy.execute(
+        'INSERT INTO "quoted table" VALUES (?, ?)',
+        ("prefix\x00SOURCE", sqlite3.Binary(b"\x00SOURCE\xff")),
+    )
+    legacy.execute(
+        'CREATE TABLE "without rowid"('
+        '"key" TEXT PRIMARY KEY, "value" BLOB) WITHOUT ROWID'
+    )
+    legacy.execute(
+        'INSERT INTO "without rowid" VALUES (?, ?)',
+        ("kept", sqlite3.Binary(b"\x01SOURCE")),
+    )
+    legacy.execute(
+        'CREATE TABLE "sequence table"('
+        '"id" INTEGER PRIMARY KEY AUTOINCREMENT, "value" TEXT)'
+    )
+    legacy.execute('INSERT INTO "sequence table"("value") VALUES ("kept")')
+    legacy.execute("PRAGMA user_version=7")
+    legacy.execute("PRAGMA application_id=314159")
+    legacy.close()
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original_backup = ledger_module._LedgerConnection.backup
+
+    def mutate_after_backup(
+        source: ledger_module._LedgerConnection,
+        target: sqlite3.Connection,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        original_backup(source, target, *args, **kwargs)
+        if mutation == "user_version":
+            target.execute("PRAGMA user_version=99")
+        elif mutation == "application_id":
+            target.execute("PRAGMA application_id=271828")
+        elif mutation == "embedded_nul_text":
+            target.execute(
+                'UPDATE "quoted table" SET "row value" = ?',
+                ("prefix\x00ATTACK",),
+            )
+        elif mutation == "ordinary_text":
+            target.execute(
+                'UPDATE "quoted table" SET "row value" = ?',
+                ("ordinary attack",),
+            )
+        elif mutation == "blob":
+            target.execute(
+                'UPDATE "quoted table" SET "blob value" = ?',
+                (sqlite3.Binary(b"\x00ATTACK\xff"),),
+            )
+        elif mutation == "rowid_identity":
+            target.execute('UPDATE "quoted table" SET rowid = rowid + 10')
+        elif mutation == "without_rowid":
+            target.execute(
+                'UPDATE "without rowid" SET "value" = ? WHERE "key" = ?',
+                (sqlite3.Binary(b"\x01ATTACK"), "kept"),
+            )
+        else:
+            target.execute(
+                "UPDATE sqlite_sequence SET seq = 99 "
+                'WHERE name = "sequence table"'
+            )
+
+    monkeypatch.setattr(
+        ledger_module._LedgerConnection,
+        "backup",
+        mutate_after_backup,
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    source = _raw(paths.database)
+    try:
+        assert tuple(
+            source.execute(
+                'SELECT "row value", "blob value" FROM "quoted table"'
+            ).fetchone()
+        ) == ("prefix\x00SOURCE", b"\x00SOURCE\xff")
+        assert source.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert source.execute("PRAGMA application_id").fetchone()[0] == 314159
+        assert source.execute(
+            'SELECT rowid FROM "quoted table"'
+        ).fetchone()[0] == 1
+        assert source.execute(
+            'SELECT "value" FROM "without rowid"'
+        ).fetchone()[0] == b"\x01SOURCE"
+        assert source.execute(
+            'SELECT seq FROM sqlite_sequence WHERE name = "sequence table"'
+        ).fetchone()[0] == 1
+    finally:
+        source.close()
+    assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
+    assert list(paths.root.glob(".runs.sqlite3.backup-*.tmp")) == []
+
+
+def test_backup_fingerprint_accepts_typed_quoted_and_ordered_database(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute(
+        'CREATE TABLE "rowid table"('
+        '"select" TEXT, "blob data" BLOB, "real data" REAL)'
+    )
+    legacy.execute(
+        'INSERT INTO "rowid table"(rowid, "select", "blob data", "real data") '
+        "VALUES (?, ?, ?, ?)",
+        (9, "line\nprefix\x00suffix'\"", sqlite3.Binary(b"\x00\xff"), -0.0),
+    )
+    legacy.execute(
+        'CREATE TABLE "without rowid"('
+        '"key part" TEXT COLLATE NOCASE, "number" INTEGER, "value" BLOB, '
+        'PRIMARY KEY("key part", "number")) WITHOUT ROWID'
+    )
+    legacy.executemany(
+        'INSERT INTO "without rowid" VALUES (?, ?, ?)',
+        (
+            ("beta", 2, sqlite3.Binary(b"\x02")),
+            ("Alpha", 1, sqlite3.Binary(b"\x01")),
+        ),
+    )
+    legacy.execute(
+        'CREATE TABLE "sequence table"('
+        '"id" INTEGER PRIMARY KEY AUTOINCREMENT, "value" TEXT)'
+    )
+    legacy.execute('INSERT INTO "sequence table"("value") VALUES ("kept")')
+    legacy.execute("PRAGMA user_version=7")
+    legacy.execute("PRAGMA application_id=314159")
+    legacy.close()
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+
+    WorkflowLedger(
+        paths,
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    ).initialize()
+
+    backups = list(paths.root.glob("runs.sqlite3.backup-*"))
+    assert len(backups) == 1
+    backup = _raw(backups[0])
+    try:
+        assert tuple(
+            backup.execute(
+                'SELECT rowid, "select", "blob data", "real data" '
+                'FROM "rowid table"'
+            ).fetchone()
+        ) == (9, "line\nprefix\x00suffix'\"", b"\x00\xff", 0.0)
+        assert [
+            tuple(row)
+            for row in backup.execute(
+                'SELECT "key part", "number", "value" FROM "without rowid" '
+                'ORDER BY "key part", "number"'
+            ).fetchall()
+        ] == [
+            ("Alpha", 1, b"\x01"),
+            ("beta", 2, b"\x02"),
+        ]
+        assert [
+            tuple(row)
+            for row in backup.execute(
+                "SELECT name, seq FROM sqlite_sequence"
+            ).fetchall()
+        ] == [("sequence table", 1)]
+        assert backup.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert backup.execute("PRAGMA application_id").fetchone()[0] == 314159
+    finally:
+        backup.close()
+
+
+def test_backup_fingerprint_is_order_stable_and_binds_types_and_identity(
+    tmp_path: Path,
+) -> None:
+    ledger = WorkflowLedger(
+        _uncreated_paths(tmp_path),
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    first = _raw(tmp_path / "first.sqlite3")
+    second = _raw(tmp_path / "second.sqlite3")
+    try:
+        for connection in (first, second):
+            connection.execute('CREATE TABLE "rowid values"("value" BLOB)')
+            connection.execute(
+                'CREATE TABLE "without rowid"('
+                '"key" TEXT PRIMARY KEY, "value" INTEGER) WITHOUT ROWID'
+            )
+            connection.execute(
+                'CREATE TABLE "sequence values"('
+                '"id" INTEGER PRIMARY KEY AUTOINCREMENT, "value" TEXT)'
+            )
+            connection.execute('CREATE TABLE "typed values"("value")')
+            connection.execute(
+                'INSERT INTO "sequence values"("value") VALUES ("kept")'
+            )
+            connection.execute('INSERT INTO "typed values" VALUES (?)', (1,))
+        first.executemany(
+            'INSERT INTO "rowid values"(rowid, "value") VALUES (?, ?)',
+            ((9, sqlite3.Binary(b"\x09")), (2, sqlite3.Binary(b"\x02"))),
+        )
+        second.executemany(
+            'INSERT INTO "rowid values"(rowid, "value") VALUES (?, ?)',
+            ((2, sqlite3.Binary(b"\x02")), (9, sqlite3.Binary(b"\x09"))),
+        )
+        first.executemany(
+            'INSERT INTO "without rowid" VALUES (?, ?)',
+            (("beta", 2), ("alpha", 1)),
+        )
+        second.executemany(
+            'INSERT INTO "without rowid" VALUES (?, ?)',
+            (("alpha", 1), ("beta", 2)),
+        )
+
+        baseline = ledger._backup_content_sha256(first)
+        assert ledger._backup_content_sha256(second) == baseline
+
+        second.execute(
+            'UPDATE "rowid values" SET rowid = 10 WHERE rowid = 9'
+        )
+        assert ledger._backup_content_sha256(second) != baseline
+        second.execute(
+            'UPDATE "rowid values" SET rowid = 9 WHERE rowid = 10'
+        )
+        assert ledger._backup_content_sha256(second) == baseline
+
+        second.execute(
+            "UPDATE sqlite_sequence SET seq = 99 "
+            'WHERE name = "sequence values"'
+        )
+        assert ledger._backup_content_sha256(second) != baseline
+        second.execute(
+            "UPDATE sqlite_sequence SET seq = 1 "
+            'WHERE name = "sequence values"'
+        )
+        assert ledger._backup_content_sha256(second) == baseline
+
+        second.execute('UPDATE "typed values" SET "value" = ?', ("1",))
+        assert ledger._backup_content_sha256(second) != baseline
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("failure_stage", ("validation_reopen", "fingerprint"))
+def test_backup_fingerprint_failures_are_sanitized_and_cleaned_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute("CREATE TABLE legacy(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO legacy VALUES ('source')")
+    legacy.close()
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    if failure_stage == "validation_reopen":
+        original_connect = ledger._connect_lease
+
+        def fail_validation_reopen(
+            lease: ledger_module._DatabaseLease,
+            *,
+            read_only: bool,
+        ) -> sqlite3.Connection:
+            if (
+                lease.name.endswith(".tmp")
+                and read_only
+                and lease.bootstrap_token is None
+            ):
+                raise sqlite3.OperationalError(
+                    "/private/sensitive/validation-reopen"
+                )
+            return original_connect(lease, read_only=read_only)
+
+        monkeypatch.setattr(ledger, "_connect_lease", fail_validation_reopen)
+    else:
+        original_fingerprint = ledger._backup_content_sha256
+        calls = 0
+
+        def fail_destination_fingerprint(
+            connection: sqlite3.Connection,
+        ) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise sqlite3.DatabaseError(
+                    "/private/sensitive/fingerprint"
+                )
+            return original_fingerprint(connection)
+
+        monkeypatch.setattr(
+            ledger,
+            "_backup_content_sha256",
+            fail_destination_fingerprint,
+        )
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert "/private/sensitive" not in str(error.value)
+    assert paths.database.exists()
     assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
     assert list(paths.root.glob(".runs.sqlite3.backup-*.tmp")) == []
 
