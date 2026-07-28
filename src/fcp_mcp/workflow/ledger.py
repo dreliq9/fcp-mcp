@@ -10,9 +10,11 @@ import re
 import secrets
 import sqlite3
 import stat
+import sys
+import threading
 import zlib
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,8 +30,6 @@ from fcp_mcp.workflow.artifacts import (
     ArtifactKind,
     ArtifactMetadataV1,
     StatePaths,
-    _fallback_open_file,
-    _windows_directory_guard,
 )
 from fcp_mcp.workflow.models import (
     ApprovalDecision,
@@ -62,6 +62,8 @@ _BOOTSTRAP_SCHEMA_SQL = (
 _BOOTSTRAP_PLACEHOLDER = b"0" * 64
 _BOOTSTRAP_TOKEN_OFFSET = 8128
 _BOOTSTRAP_TEMP_PREFIX = ".runs.sqlite3.bootstrap-"
+_BOOTSTRAP_LOCK_NAME = ".runs.sqlite3.bootstrap.lock"
+_BOOTSTRAP_THREAD_LOCK = threading.Lock()
 # Generated with SQLite 3.53.0 using a 4096-byte page size, the exact
 # _BOOTSTRAP_SCHEMA_SQL above, and one 64-character zero-token row. SQLite's
 # version-3 file format is backwards compatible across the supported runtime
@@ -150,28 +152,15 @@ class Migration:
 @dataclass
 class _RootAnchor:
     path: Path
-    descriptor: int | None
+    descriptor: int
     identity: tuple[int, int, int]
-    guard: ExitStack | None = None
+    _closed: bool = False
 
     def close(self) -> None:
-        failures: list[BaseException] = []
-        descriptor, self.descriptor = self.descriptor, None
-        guard, self.guard = self.guard, None
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError as error:
-                failures.append(error)
-        if guard is not None:
-            try:
-                guard.close()
-            except (OSError, RuntimeError) as error:
-                failures.append(error)
-        if failures:
-            primary = failures[0]
-            _attach_cleanup_failures(primary, failures[1:])
-            raise primary
+        if self._closed:
+            return
+        self._closed = True
+        os.close(self.descriptor)
 
 
 @dataclass
@@ -655,6 +644,9 @@ _TERMINAL_STATES = frozenset(
         WorkflowState.RECOVERY_REQUIRED,
     }
 )
+_TERMINAL_AUDIT_EVENTS = frozenset(
+    {"artifact_prune_intent", "artifacts_pruned"}
+)
 _PRUNE_ELIGIBLE_STATES = frozenset(
     {
         WorkflowState.COMMITTED,
@@ -690,8 +682,6 @@ _PREPARE_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
     "prior_destination_state": frozenset({"source_inspected"}),
     "prior_destination_sha256": frozenset({"source_inspected"}),
     "plan_sha256": frozenset({"plan_built", "plan_normalized"}),
-    "receipt_sha256": frozenset({"dry_run_completed"}),
-    "receipt_size_bytes": frozenset({"dry_run_completed"}),
     "expires_at": frozenset(
         {
             "awaiting_approval",
@@ -708,18 +698,50 @@ _COMMIT_INTENT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
 }
 _COMMIT_RESULT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
     "destination_sha256": frozenset({"commit_completed", "committed"}),
+    "receipt_sha256": frozenset({"commit_completed", "committed"}),
+    "receipt_size_bytes": frozenset({"commit_completed", "committed"}),
     "committed_at": frozenset({"commit_completed", "committed"}),
 }
+_COMMIT_INTENT_FIELDS = frozenset(_COMMIT_INTENT_PROJECTION_EVENTS)
+_COMMIT_RESULT_FIELDS = frozenset(_COMMIT_RESULT_PROJECTION_EVENTS)
 _TERMINAL_ERROR_FIELDS = frozenset(
     {"terminal_error_code", "terminal_error_summary"}
 )
 _APPROVAL_PROJECTION_FIELDS = frozenset({"approval_summary"})
-
-
-def _is_reparse_stat(result: os.stat_result) -> bool:
-    attributes = getattr(result, "st_file_attributes", 0)
-    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-    return bool(attributes & reparse_flag)
+_ERROR_ALLOWED_STATES = frozenset(
+    {
+        WorkflowState.FAILED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+        WorkflowState.RECOVERY_REQUIRED,
+    }
+)
+_ERROR_REQUIRED_STATES = frozenset(
+    {WorkflowState.FAILED, WorkflowState.RECOVERY_REQUIRED}
+)
+_PREPARED_STATES = frozenset(
+    {
+        WorkflowState.AWAITING_APPROVAL,
+        WorkflowState.APPROVED,
+        WorkflowState.COMMITTING,
+        WorkflowState.COMMITTED,
+        WorkflowState.REJECTED,
+        WorkflowState.EXPIRED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+        WorkflowState.RECOVERY_REQUIRED,
+    }
+)
+_APPROVED_STATES = frozenset(
+    {
+        WorkflowState.APPROVED,
+        WorkflowState.COMMITTING,
+        WorkflowState.COMMITTED,
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+        WorkflowState.RECOVERY_REQUIRED,
+    }
+)
 
 
 def _stat_identity(result: os.stat_result) -> tuple[int, int, int]:
@@ -737,19 +759,44 @@ def _attach_cleanup_failures(
     if not failures:
         return
     bounded = tuple(
-        _MigrationError(
-            (
-                f"{type(failure).__name__}: {failure}"
-                if str(failure)
-                else type(failure).__name__
-            )[:255]
-        )
+        failure
+        if isinstance(failure, _MigrationError)
+        else _MigrationError(type(failure).__name__[:255])
         for failure in failures
     )
     try:
-        primary.__dict__["cleanup_failures"] = bounded
+        existing = primary.__dict__.get("cleanup_failures", ())
+        if not isinstance(existing, tuple):
+            existing = ()
+        primary.__dict__["cleanup_failures"] = existing + bounded
     except (AttributeError, TypeError):
         pass
+
+
+def _close_preserving_primary(
+    resource: object,
+    primary: BaseException | None,
+) -> None:
+    try:
+        resource.close()  # type: ignore[attr-defined]
+    except _LEDGER_FAILURES as error:
+        if primary is None:
+            raise
+        _attach_cleanup_failures(primary, [error])
+
+
+def _close_public_connection(
+    connection: sqlite3.Connection,
+    primary: BaseException | None,
+) -> None:
+    try:
+        connection.close()
+    except _LEDGER_FAILURES as error:
+        if primary is None:
+            raise _ledger_unavailable(error) from error
+        bounded = _MigrationError("connection close failed")
+        bounded.__cause__ = error
+        _attach_cleanup_failures(primary, [bounded])
 
 
 def _rollback(
@@ -774,11 +821,7 @@ def _fsync_file(path: Path) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    if os.name != "posix":
-        return
-    flags = os.O_RDONLY
-    if hasattr(os, "O_DIRECTORY"):
-        flags |= os.O_DIRECTORY
+    flags = os.O_RDONLY | os.O_DIRECTORY
     descriptor = os.open(path, flags)
     try:
         os.fsync(descriptor)
@@ -794,6 +837,13 @@ def _validate_projection_policy(
     patch: Mapping[str, object],
 ) -> None:
     if source in _TERMINAL_STATES:
+        if (
+            source is target
+            and source in _PRUNE_ELIGIBLE_STATES
+            and event_type in _TERMINAL_AUDIT_EVENTS
+            and not patch
+        ):
+            return
         raise _state_conflict("terminal workflow runs are immutable")
     if target in {WorkflowState.APPROVED, WorkflowState.REJECTED}:
         raise _state_conflict("approval transitions require record_decision")
@@ -806,28 +856,41 @@ def _validate_projection_policy(
         for field, event_types in _PREPARE_PROJECTION_EVENTS.items():
             if event_type in event_types:
                 allowed.add(field)
-    if (
-        source is WorkflowState.APPROVED
-        and target is WorkflowState.COMMITTING
-    ) or (
-        source is WorkflowState.COMMITTING
-        and target is WorkflowState.COMMITTING
-    ):
+    if source is WorkflowState.APPROVED and target is WorkflowState.COMMITTING:
+        if event_type != "commit_started" or fields != _COMMIT_INTENT_FIELDS:
+            raise _state_conflict(
+                "commit_started requires complete commit intent evidence"
+            )
         for field, event_types in _COMMIT_INTENT_PROJECTION_EVENTS.items():
             if event_type in event_types:
                 allowed.add(field)
     if source is WorkflowState.COMMITTING and target is WorkflowState.COMMITTED:
+        if (
+            event_type not in {"commit_completed", "committed"}
+            or fields != _COMMIT_RESULT_FIELDS
+        ):
+            raise _state_conflict(
+                "committed transitions require complete receipt evidence"
+            )
         for field, event_types in _COMMIT_RESULT_PROJECTION_EVENTS.items():
             if event_type in event_types:
                 allowed.add(field)
-        if event_type in {"commit_completed", "committed"}:
-            allowed.add("backup_sha256")
-        if patch.get("committed_at") is None:
+        if any(patch.get(field) is None for field in _COMMIT_RESULT_FIELDS):
             raise _state_conflict(
-                "committed transitions require a committed_at timestamp"
+                "committed transitions require non-null receipt evidence"
             )
-    if target in _TERMINAL_STATES - {WorkflowState.COMMITTED}:
+    supplied_error_fields = fields & _TERMINAL_ERROR_FIELDS
+    if supplied_error_fields and supplied_error_fields != _TERMINAL_ERROR_FIELDS:
+        raise _state_conflict("terminal error code and summary are an atomic pair")
+    if target in _ERROR_ALLOWED_STATES:
         allowed.update(_TERMINAL_ERROR_FIELDS)
+        if target in _ERROR_REQUIRED_STATES and (
+            supplied_error_fields != _TERMINAL_ERROR_FIELDS
+            or any(patch.get(field) is None for field in _TERMINAL_ERROR_FIELDS)
+        ):
+            raise _state_conflict(
+                "failed and recovery-required states require a terminal error"
+            )
     if fields - allowed:
         raise _state_conflict(
             "projection fields are not allowed for this workflow event"
@@ -874,32 +937,11 @@ class WorkflowLedger:
         root = self.paths.root
         if not root.is_absolute():
             raise _MigrationError("workflow state root is not absolute")
-        if os.name != "posix":
-            guard = ExitStack()
-            try:
-                guard.enter_context(_windows_directory_guard(root))
-                result = root.lstat()
-                if (
-                    stat.S_ISLNK(result.st_mode)
-                    or _is_reparse_stat(result)
-                    or not stat.S_ISDIR(result.st_mode)
-                ):
-                    raise _MigrationError("unsafe state root")
-                return _RootAnchor(
-                    path=root,
-                    descriptor=None,
-                    identity=_stat_identity(result),
-                    guard=guard,
-                )
-            except BaseException:
-                guard.close()
-                raise
-
         flags = (
             os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
+            | os.O_CLOEXEC
+            | os.O_DIRECTORY
+            | os.O_NOFOLLOW
         )
         parts = root.parts
         if not parts:
@@ -914,7 +956,6 @@ class WorkflowLedger:
             current_path = root.lstat()
             if (
                 not stat.S_ISDIR(opened.st_mode)
-                or _is_reparse_stat(opened)
                 or stat.S_IMODE(opened.st_mode) != _ROOT_MODE
                 or _stat_identity(current_path) != _stat_identity(opened)
             ):
@@ -932,24 +973,19 @@ class WorkflowLedger:
         current = anchor.path.lstat()
         if (
             stat.S_ISLNK(current.st_mode)
-            or _is_reparse_stat(current)
             or _stat_identity(current) != anchor.identity
         ):
             raise _MigrationError("workflow state root changed during access")
 
     def _root_names(self, anchor: _RootAnchor) -> tuple[str, ...]:
-        if anchor.descriptor is not None:
-            return tuple(os.listdir(anchor.descriptor))
-        return tuple(os.listdir(anchor.path))
+        return tuple(os.listdir(anchor.descriptor))
 
     def _stat_at(
         self,
         anchor: _RootAnchor,
         name: str,
     ) -> os.stat_result:
-        if anchor.descriptor is not None:
-            return os.stat(name, dir_fd=anchor.descriptor, follow_symlinks=False)
-        return (anchor.path / name).lstat()
+        return os.stat(name, dir_fd=anchor.descriptor, follow_symlinks=False)
 
     def _open_at(
         self,
@@ -959,15 +995,8 @@ class WorkflowLedger:
         write: bool,
         exclusive: bool = False,
     ) -> int:
-        if anchor.descriptor is None:
-            return _fallback_open_file(
-                anchor.path / name,
-                write=write,
-                exclusive=exclusive,
-                failure_code=ErrorCode.LEDGER_UNAVAILABLE,
-            )
         flags = os.O_RDWR if write else os.O_RDONLY
-        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        flags |= os.O_CLOEXEC | os.O_NOFOLLOW
         if exclusive:
             flags |= os.O_CREAT | os.O_EXCL
         return os.open(
@@ -978,53 +1007,96 @@ class WorkflowLedger:
         )
 
     def _unlink_at(self, anchor: _RootAnchor, name: str) -> None:
-        if anchor.descriptor is not None:
-            os.unlink(name, dir_fd=anchor.descriptor)
-        else:
-            (anchor.path / name).unlink()
+        os.unlink(name, dir_fd=anchor.descriptor)
 
     def _link_at(self, anchor: _RootAnchor, source: str, target: str) -> None:
-        if anchor.descriptor is not None:
-            os.link(
-                source,
-                target,
-                src_dir_fd=anchor.descriptor,
-                dst_dir_fd=anchor.descriptor,
-                follow_symlinks=False,
-            )
-        else:
-            os.link(anchor.path / source, anchor.path / target)
+        os.link(
+            source,
+            target,
+            src_dir_fd=anchor.descriptor,
+            dst_dir_fd=anchor.descriptor,
+            follow_symlinks=False,
+        )
 
     def _replace_at(self, anchor: _RootAnchor, source: str, target: str) -> None:
-        if anchor.descriptor is not None:
-            os.replace(
-                source,
-                target,
-                src_dir_fd=anchor.descriptor,
-                dst_dir_fd=anchor.descriptor,
-            )
-        else:
-            os.replace(anchor.path / source, anchor.path / target)
+        os.replace(
+            source,
+            target,
+            src_dir_fd=anchor.descriptor,
+            dst_dir_fd=anchor.descriptor,
+        )
 
     def _fsync_anchor(self, anchor: _RootAnchor) -> None:
-        if anchor.descriptor is not None:
-            os.fsync(anchor.descriptor)
+        os.fsync(anchor.descriptor)
 
     def _validate_database_stat(self, result: os.stat_result) -> None:
         if (
             stat.S_ISLNK(result.st_mode)
-            or _is_reparse_stat(result)
             or not stat.S_ISREG(result.st_mode)
         ):
             raise _MigrationError("unsafe workflow database entry")
-        if os.name == "posix" and stat.S_IMODE(result.st_mode) != _DATABASE_MODE:
+        if stat.S_IMODE(result.st_mode) != _DATABASE_MODE:
             raise _MigrationError("unsafe workflow database mode")
 
+    @contextmanager
+    def _bootstrap_cleanup_guard(self, anchor: _RootAnchor):
+        with _BOOTSTRAP_THREAD_LOCK:
+            descriptor: int | None = None
+            primary: BaseException | None = None
+            locked = False
+            try:
+                try:
+                    descriptor = self._open_at(
+                        anchor,
+                        _BOOTSTRAP_LOCK_NAME,
+                        write=True,
+                        exclusive=True,
+                    )
+                except FileExistsError:
+                    descriptor = self._open_at(
+                        anchor,
+                        _BOOTSTRAP_LOCK_NAME,
+                        write=True,
+                    )
+                path_result = self._stat_at(anchor, _BOOTSTRAP_LOCK_NAME)
+                opened_result = os.fstat(descriptor)
+                self._validate_database_stat(path_result)
+                self._validate_database_stat(opened_result)
+                if _stat_identity(path_result) != _stat_identity(opened_result):
+                    raise _MigrationError("bootstrap lock identity changed")
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locked = True
+                yield
+            except BaseException as error:
+                primary = error
+                raise
+            finally:
+                failures: list[BaseException] = []
+                if descriptor is not None and locked:
+                    try:
+                        import fcntl
+
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except (OSError, RuntimeError) as error:
+                        failures.append(error)
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError as error:
+                        failures.append(error)
+                if failures:
+                    if primary is not None:
+                        _attach_cleanup_failures(primary, failures)
+                    else:
+                        error = _MigrationError(
+                            "bootstrap lock cleanup failed"
+                        )
+                        _attach_cleanup_failures(error, failures)
+                        raise error
+
     def _cleanup_stale_bootstrap_entries(self, anchor: _RootAnchor) -> None:
-        try:
-            target = self._stat_at(anchor, _DATABASE_NAME)
-        except FileNotFoundError:
-            target = None
         removed = False
         for name in self._root_names(anchor):
             if not name.startswith(_BOOTSTRAP_TEMP_PREFIX):
@@ -1034,10 +1106,6 @@ class WorkflowLedger:
             except FileNotFoundError:
                 continue
             self._validate_database_stat(candidate)
-            if target is None or _stat_identity(candidate) != _stat_identity(target):
-                # A different inode may be an in-flight concurrent publisher.
-                # It has no authority over the fixed database entry.
-                continue
             try:
                 self._unlink_at(anchor, name)
             except FileNotFoundError:
@@ -1045,6 +1113,18 @@ class WorkflowLedger:
             removed = True
         if removed:
             self._fsync_anchor(anchor)
+
+    def _new_bootstrap_image(self) -> tuple[str, bytes]:
+        token = secrets.token_hex(32)
+        token_bytes = token.encode("ascii")
+        image = (
+            _BOOTSTRAP_IMAGE[:_BOOTSTRAP_TOKEN_OFFSET]
+            + token_bytes
+            + _BOOTSTRAP_IMAGE[
+                _BOOTSTRAP_TOKEN_OFFSET + len(_BOOTSTRAP_PLACEHOLDER) :
+            ]
+        )
+        return token, image
 
     def _write_bootstrap_image(self, descriptor: int, image: bytes) -> None:
         offset = 0
@@ -1055,15 +1135,7 @@ class WorkflowLedger:
             offset += written
 
     def _publish_bootstrap(self, anchor: _RootAnchor) -> None:
-        token = secrets.token_hex(32)
-        token_bytes = token.encode("ascii")
-        image = (
-            _BOOTSTRAP_IMAGE[:_BOOTSTRAP_TOKEN_OFFSET]
-            + token_bytes
-            + _BOOTSTRAP_IMAGE[
-                _BOOTSTRAP_TOKEN_OFFSET + len(_BOOTSTRAP_PLACEHOLDER) :
-            ]
-        )
+        _, image = self._new_bootstrap_image()
         temporary = f"{_BOOTSTRAP_TEMP_PREFIX}{secrets.token_hex(8)}.tmp"
         descriptor = self._open_at(
             anchor,
@@ -1074,8 +1146,7 @@ class WorkflowLedger:
         published = False
         primary: BaseException | None = None
         try:
-            if os.name == "posix":
-                os.fchmod(descriptor, _DATABASE_MODE)
+            os.fchmod(descriptor, _DATABASE_MODE)
             self._write_bootstrap_image(descriptor, image)
             os.fsync(descriptor)
             self._link_at(anchor, temporary, _DATABASE_NAME)
@@ -1156,51 +1227,64 @@ class WorkflowLedger:
         self._database_path()
         anchor = self._open_root_anchor()
         try:
-            self._cleanup_stale_bootstrap_entries(anchor)
-            for attempt in range(_MAX_CREATE_RACE_RETRIES):
-                try:
-                    result = self._stat_at(anchor, _DATABASE_NAME)
-                except FileNotFoundError:
-                    if not create:
-                        raise FileNotFoundError("workflow database is missing")
+            guard = (
+                self._bootstrap_cleanup_guard(anchor)
+                if create or write
+                else nullcontext()
+            )
+            with guard:
+                if create or write:
+                    self._cleanup_stale_bootstrap_entries(anchor)
+                for attempt in range(_MAX_CREATE_RACE_RETRIES):
                     try:
-                        self._publish_bootstrap(anchor)
-                    except FileExistsError:
-                        if attempt + 1 == _MAX_CREATE_RACE_RETRIES:
-                            raise
-                        continue
-                    result = self._stat_at(anchor, _DATABASE_NAME)
+                        result = self._stat_at(anchor, _DATABASE_NAME)
+                    except FileNotFoundError:
+                        if not create:
+                            raise FileNotFoundError("workflow database is missing")
+                        try:
+                            self._publish_bootstrap(anchor)
+                        except FileExistsError:
+                            if attempt + 1 == _MAX_CREATE_RACE_RETRIES:
+                                raise
+                            continue
+                        result = self._stat_at(anchor, _DATABASE_NAME)
+                    break
+                else:
+                    raise _MigrationError("database creation race did not settle")
+            self._validate_database_stat(result)
+            descriptor = self._open_at(
+                anchor,
+                _DATABASE_NAME,
+                write=write,
+            )
+            try:
+                opened = os.fstat(descriptor)
                 self._validate_database_stat(result)
-                descriptor = self._open_at(
-                    anchor,
-                    _DATABASE_NAME,
-                    write=write,
+                self._validate_database_stat(opened)
+                if _stat_identity(opened) != _stat_identity(result):
+                    raise _MigrationError(
+                        "database entry changed while it was opened"
+                    )
+                token = self._bootstrap_token_from_descriptor(
+                    descriptor,
+                    opened,
                 )
+                self._validate_anchor_path(anchor)
+                return _DatabaseLease(
+                    anchor=anchor,
+                    name=_DATABASE_NAME,
+                    descriptor=descriptor,
+                    identity=_stat_identity(opened),
+                    bootstrap_token=token,
+                )
+            except BaseException as error:
                 try:
-                    opened = os.fstat(descriptor)
-                    self._validate_database_stat(opened)
-                    if _stat_identity(opened) != _stat_identity(result):
-                        raise _MigrationError(
-                            "database entry changed while it was opened"
-                        )
-                    token = self._bootstrap_token_from_descriptor(
-                        descriptor,
-                        opened,
-                    )
-                    self._validate_anchor_path(anchor)
-                    return _DatabaseLease(
-                        anchor=anchor,
-                        name=_DATABASE_NAME,
-                        descriptor=descriptor,
-                        identity=_stat_identity(opened),
-                        bootstrap_token=token,
-                    )
-                except BaseException:
                     os.close(descriptor)
-                    raise
-            raise _MigrationError("database creation race did not settle")
-        except BaseException:
-            anchor.close()
+                except OSError as cleanup_error:
+                    _attach_cleanup_failures(error, [cleanup_error])
+                raise
+        except BaseException as error:
+            _close_preserving_primary(anchor, error)
             raise
 
     def _validate_internal_database_entry(self, path: Path) -> os.stat_result:
@@ -1335,7 +1419,7 @@ class WorkflowLedger:
     ) -> sqlite3.Connection:
         connection: sqlite3.Connection | None = None
         try:
-            if read_only and lease.anchor.descriptor is not None:
+            if read_only:
                 descriptor_path = (
                     Path(f"/proc/self/fd/{lease.descriptor}")
                     if Path("/proc/self/fd").is_dir()
@@ -1356,9 +1440,7 @@ class WorkflowLedger:
             database_row = connection.execute("PRAGMA database_list").fetchone()
             if database_row is None or not database_row["file"]:
                 raise _MigrationError("SQLite did not identify the opened database")
-            opened_path = None if read_only and lease.anchor.descriptor is not None else Path(
-                database_row["file"]
-            )
+            opened_path = None if read_only else Path(database_row["file"])
             self._validate_connection_identity(lease, opened_path)
             bootstrap = False
             if lease.bootstrap_token is not None:
@@ -1382,9 +1464,9 @@ class WorkflowLedger:
                     self._validate_connection_identity(lease, opened_path)
                 self._configure_write_connection(connection)
             return connection
-        except BaseException:
+        except BaseException as error:
             if connection is not None:
-                connection.close()
+                _close_preserving_primary(connection, error)
             raise
 
     def _connect(self) -> sqlite3.Connection:
@@ -1403,7 +1485,11 @@ class WorkflowLedger:
             raise _ledger_unavailable(error)
         finally:
             if lease is not None:
-                lease.close()
+                primary = sys.exc_info()[1]
+                try:
+                    _close_preserving_primary(lease, primary)
+                except _LEDGER_FAILURES as error:
+                    raise _ledger_unavailable(error)
 
     def _connect_existing(self) -> sqlite3.Connection:
         lease: _DatabaseLease | None = None
@@ -1421,7 +1507,11 @@ class WorkflowLedger:
             raise _ledger_unavailable(error)
         finally:
             if lease is not None:
-                lease.close()
+                primary = sys.exc_info()[1]
+                try:
+                    _close_preserving_primary(lease, primary)
+                except _LEDGER_FAILURES as error:
+                    raise _ledger_unavailable(error)
 
     def _connect_write_existing(self) -> sqlite3.Connection:
         lease: _DatabaseLease | None = None
@@ -1439,7 +1529,11 @@ class WorkflowLedger:
             raise _ledger_unavailable(error)
         finally:
             if lease is not None:
-                lease.close()
+                primary = sys.exc_info()[1]
+                try:
+                    _close_preserving_primary(lease, primary)
+                except _LEDGER_FAILURES as error:
+                    raise _ledger_unavailable(error)
 
     def _retained_lease(
         self,
@@ -1463,7 +1557,6 @@ class WorkflowLedger:
             None
             if isinstance(connection, _LedgerConnection)
             and connection._ledger_read_only
-            and lease.anchor.descriptor is not None
             else lease.anchor.path / lease.name
         )
         self._validate_connection_identity(lease, opened_path)
@@ -1568,8 +1661,12 @@ class WorkflowLedger:
                 write=True,
                 exclusive=True,
             )
-            if os.name == "posix":
-                os.fchmod(destination_descriptor, _DATABASE_MODE)
+            os.fchmod(destination_descriptor, _DATABASE_MODE)
+            destination_token, bootstrap_image = self._new_bootstrap_image()
+            self._write_bootstrap_image(
+                destination_descriptor,
+                bootstrap_image,
+            )
             os.fsync(destination_descriptor)
             destination_result = os.fstat(destination_descriptor)
             self._validate_database_stat(destination_result)
@@ -1578,7 +1675,7 @@ class WorkflowLedger:
                 name=temporary_name,
                 descriptor=destination_descriptor,
                 identity=_stat_identity(destination_result),
-                bootstrap_token=None,
+                bootstrap_token=destination_token,
                 owns_anchor=False,
             )
             source_result = self._stat_at(anchor, _DATABASE_NAME)
@@ -1606,12 +1703,27 @@ class WorkflowLedger:
             )
             source = self._connect_lease(source_lease, read_only=True)
             destination = self._connect_lease(destination_lease, read_only=False)
+            self._validate_connection_identity(source_lease, None)
+            self._validate_connection_identity(
+                destination_lease,
+                anchor.path / temporary_name,
+            )
             source.backup(destination)
+            self._validate_connection_identity(
+                destination_lease,
+                anchor.path / temporary_name,
+            )
             destination.close()
             destination = None
             source.close()
             source = None
             os.fsync(destination_descriptor)
+            current_destination = self._stat_at(anchor, temporary_name)
+            self._validate_database_stat(current_destination)
+            if _stat_identity(current_destination) != _stat_identity(
+                destination_result
+            ):
+                raise _MigrationError("backup destination changed before publish")
             self._replace_at(anchor, temporary_name, stem)
             replaced = True
             self._fsync_anchor(anchor)
@@ -1629,7 +1741,7 @@ class WorkflowLedger:
                     continue
                 try:
                     opened_connection.close()
-                except (OSError, RuntimeError) as cleanup_error:
+                except _LEDGER_FAILURES as cleanup_error:
                     cleanup_failures.append(cleanup_error)
             for candidate in (temporary_name, stem if replaced else None):
                 if candidate is None:
@@ -1647,16 +1759,21 @@ class WorkflowLedger:
             _attach_cleanup_failures(error, cleanup_failures)
             raise
         finally:
+            close_failures: list[BaseException] = []
             for descriptor in (destination_descriptor, source_descriptor):
                 if descriptor is None:
                     continue
                 try:
                     os.close(descriptor)
                 except OSError as cleanup_error:
-                    if primary is not None:
-                        _attach_cleanup_failures(primary, [cleanup_error])
-                    else:
-                        raise
+                    close_failures.append(cleanup_error)
+            if close_failures:
+                if primary is not None:
+                    _attach_cleanup_failures(primary, close_failures)
+                else:
+                    error = close_failures[0]
+                    _attach_cleanup_failures(error, close_failures[1:])
+                    raise error
 
     def _execute_migration_statement(
         self,
@@ -1761,6 +1878,7 @@ class WorkflowLedger:
         connection = self._connect()
         begun = False
         published_backup: Path | None = None
+        primary: BaseException | None = None
         try:
             retained_lease = self._retained_lease(connection)
             self._validate_retained_connection(connection)
@@ -1800,6 +1918,7 @@ class WorkflowLedger:
             begun = False
             self._validate_retained_connection(connection)
         except FCPMCPError as error:
+            primary = error
             rollback_error = _rollback(connection, begun)
             if rollback_error is not None:
                 _attach_cleanup_failures(error, [rollback_error])
@@ -1824,13 +1943,15 @@ class WorkflowLedger:
                     )
                 except _LEDGER_FAILURES as cleanup_error:
                     _attach_cleanup_failures(error, [cleanup_error])
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def _write(self, operation: Callable[[sqlite3.Connection], Any]) -> Any:
         connection = self._connect_write_existing()
         begun = False
+        primary: BaseException | None = None
         try:
             self._validate_retained_connection(connection)
             connection.execute("BEGIN IMMEDIATE")
@@ -1842,6 +1963,7 @@ class WorkflowLedger:
             self._validate_retained_connection(connection)
             return result
         except FCPMCPError as error:
+            primary = error
             rollback_error = _rollback(connection, begun)
             if rollback_error is not None:
                 _attach_cleanup_failures(error, [rollback_error])
@@ -1850,9 +1972,10 @@ class WorkflowLedger:
             rollback_error = _rollback(connection, begun)
             if rollback_error is not None:
                 _attach_cleanup_failures(error, [rollback_error])
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def create_run(
         self,
@@ -2071,6 +2194,167 @@ class WorkflowLedger:
             raise _state_conflict("workflow state or revision is stale")
         return run
 
+    def _projected_value(
+        self,
+        run: LedgerRunRecord,
+        patch: Mapping[str, object],
+        field: str,
+    ) -> object:
+        return patch[field] if field in patch else getattr(run, field)
+
+    def _require_complete_prepare(
+        self,
+        connection: sqlite3.Connection,
+        run: LedgerRunRecord,
+        patch: Mapping[str, object],
+        *,
+        require_expiry: bool,
+    ) -> None:
+        values = {
+            field: self._projected_value(run, patch, field)
+            for field in (
+                "source_sha256",
+                "prior_destination_state",
+                "prior_destination_sha256",
+                "plan_sha256",
+                "candidate_sha256",
+                "candidate_size_bytes",
+                "diff_sha256",
+                "diff_size_bytes",
+                "expires_at",
+            )
+        }
+        if any(
+            values[field] is None
+            for field in (
+                "source_sha256",
+                "prior_destination_state",
+                "plan_sha256",
+                "candidate_sha256",
+                "candidate_size_bytes",
+                "diff_sha256",
+                "diff_size_bytes",
+            )
+        ):
+            raise _state_conflict(
+                "workflow state requires complete successful-prepare evidence"
+            )
+        prior_state = values["prior_destination_state"]
+        if isinstance(prior_state, PriorDestinationState):
+            prior_state = prior_state.value
+        prior_sha256 = values["prior_destination_sha256"]
+        if (
+            prior_state == PriorDestinationState.ABSENT.value
+            and prior_sha256 is not None
+        ) or (
+            prior_state == PriorDestinationState.PRESENT.value
+            and prior_sha256 is None
+        ) or prior_state not in {
+            PriorDestinationState.ABSENT.value,
+            PriorDestinationState.PRESENT.value,
+        }:
+            raise _state_conflict("prior destination evidence is inconsistent")
+        if require_expiry and values["expires_at"] is None:
+            raise _state_conflict("approval-bearing state requires expires_at")
+
+        rows = tuple(
+            connection.execute(
+                "SELECT kind, sha256, byte_size FROM artifacts "
+                "WHERE run_id = ? ORDER BY kind",
+                (run.run_id,),
+            ).fetchmany(3)
+        )
+        artifacts = {row["kind"]: row for row in rows}
+        for kind in ArtifactKind:
+            artifact = artifacts.get(kind.value)
+            if artifact is None or (
+                artifact["sha256"] != values[f"{kind.value}_sha256"]
+                or artifact["byte_size"] != values[f"{kind.value}_size_bytes"]
+            ):
+                raise _state_conflict(
+                    "prepared projection requires matching artifact evidence"
+                )
+
+    def _validate_commit_intent(
+        self,
+        current: LedgerRunRecord,
+        payload: Mapping[str, object],
+        patch: Mapping[str, object],
+    ) -> None:
+        attempt = patch["commit_attempt_id"]
+        if (
+            not isinstance(attempt, str)
+            or _UUID_RE.fullmatch(attempt) is None
+        ):
+            raise _state_conflict("commit attempt ID must be a canonical UUID")
+        try:
+            parsed_attempt = UUID(attempt)
+        except ValueError as error:
+            raise _state_conflict("commit attempt ID must be a canonical UUID") from error
+        if parsed_attempt.int == 0 or str(parsed_attempt) != attempt:
+            raise _state_conflict("commit attempt ID must be a canonical UUID")
+
+        expected_backup = patch["expected_backup_path"]
+        backup_sha256 = patch["backup_sha256"]
+        if current.prior_destination_state is PriorDestinationState.ABSENT:
+            consistent = expected_backup is None and backup_sha256 is None
+        elif current.prior_destination_state is PriorDestinationState.PRESENT:
+            consistent = (
+                current.prior_destination_sha256 is not None
+                and expected_backup
+                == f"{current.destination_path}.bak.{attempt}"
+                and backup_sha256 == current.prior_destination_sha256
+            )
+        else:
+            consistent = False
+        if not consistent:
+            raise _state_conflict("commit intent contradicts prior destination evidence")
+        if any(payload.get(field) != patch[field] for field in _COMMIT_INTENT_FIELDS):
+            raise _state_conflict(
+                "commit_started payload must match projected commit evidence"
+            )
+
+    def _validate_event_mutation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        current: LedgerRunRecord,
+        target: WorkflowState,
+        event_type: str,
+        payload: Mapping[str, object],
+        patch: Mapping[str, object],
+    ) -> None:
+        if target is WorkflowState.AWAITING_APPROVAL:
+            self._require_complete_prepare(
+                connection,
+                current,
+                patch,
+                require_expiry=True,
+            )
+        if (
+            current.state is WorkflowState.APPROVED
+            and target is WorkflowState.COMMITTING
+            and event_type == "commit_started"
+        ):
+            self._validate_commit_intent(current, payload, patch)
+        if (
+            current.state is WorkflowState.COMMITTING
+            and target is WorkflowState.COMMITTED
+        ):
+            if current.commit_attempt_id is None:
+                raise _state_conflict("committed state requires commit intent evidence")
+            if patch["destination_sha256"] != current.candidate_sha256:
+                raise _state_conflict(
+                    "committed destination hash must equal the candidate hash"
+                )
+            if any(
+                payload.get(field) != patch[field]
+                for field in _COMMIT_RESULT_FIELDS
+            ):
+                raise _state_conflict(
+                    "committed payload must match projected receipt evidence"
+                )
+
     def _append_event_locked(
         self,
         connection: sqlite3.Connection,
@@ -2150,6 +2434,14 @@ class WorkflowLedger:
                 run_id=run_id,
                 expected_state=expected_state,
                 expected_revision=expected_revision,
+            )
+            self._validate_event_mutation(
+                connection,
+                current=current,
+                target=target_state,
+                event_type=event_type,
+                payload=payload,
+                patch=projection_patch,
             )
             timestamp = _canonical_clock_timestamp(self._clock())
             values = dict(projection_patch)
@@ -2426,6 +2718,17 @@ class WorkflowLedger:
                 expected_state=state,
                 expected_revision=revision,
             )
+            expected_source = ApprovalSource(current.approval_mode.value)
+            if closed_source is not expected_source:
+                raise _state_conflict(
+                    "approval source contradicts the configured approval mode"
+                )
+            self._require_complete_prepare(
+                connection,
+                current,
+                {"expires_at": expiry} if expiry is not None else {},
+                require_expiry=True,
+            )
             if (
                 connection.execute(
                     "SELECT 1 FROM approvals WHERE run_id = ?",
@@ -2515,14 +2818,17 @@ class WorkflowLedger:
     def get_run(self, run_id: str) -> LedgerRunRecord | None:
         canonical_run_id = _run_id(run_id)
         connection = self._connect_existing()
+        primary: BaseException | None = None
         try:
             return self._select_run(connection, canonical_run_id)
-        except FCPMCPError:
+        except FCPMCPError as error:
+            primary = error
             raise
         except _LEDGER_FAILURES as error:
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def get_artifact(
         self,
@@ -2532,18 +2838,21 @@ class WorkflowLedger:
         canonical_run_id = _run_id(run_id)
         closed_kind = _artifact_kind_value(kind)
         connection = self._connect_existing()
+        primary: BaseException | None = None
         try:
             row = connection.execute(
                 "SELECT * FROM artifacts WHERE run_id = ? AND kind = ?",
                 (canonical_run_id, closed_kind.value),
             ).fetchone()
             return _row_to_artifact(row) if row is not None else None
-        except FCPMCPError:
+        except FCPMCPError as error:
+            primary = error
             raise
         except _LEDGER_FAILURES as error:
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def list_artifacts(
         self,
@@ -2558,6 +2867,7 @@ class WorkflowLedger:
             _artifact_kind_value(after_kind) if after_kind is not None else None
         )
         connection = self._connect_existing()
+        primary: BaseException | None = None
         try:
             if closed_after is None:
                 cursor = connection.execute(
@@ -2574,28 +2884,33 @@ class WorkflowLedger:
             return tuple(
                 _row_to_artifact(row) for row in cursor.fetchmany(bounded_limit)
             )
-        except FCPMCPError:
+        except FCPMCPError as error:
+            primary = error
             raise
         except _LEDGER_FAILURES as error:
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def get_approval(self, run_id: str) -> ApprovalRecord | None:
         canonical_run_id = _run_id(run_id)
         connection = self._connect_existing()
+        primary: BaseException | None = None
         try:
             row = connection.execute(
                 "SELECT * FROM approvals WHERE run_id = ?",
                 (canonical_run_id,),
             ).fetchone()
             return _row_to_approval(row) if row is not None else None
-        except FCPMCPError:
+        except FCPMCPError as error:
+            primary = error
             raise
         except _LEDGER_FAILURES as error:
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def list_runs(
         self,
@@ -2606,6 +2921,7 @@ class WorkflowLedger:
         bounded_limit = _read_limit(limit)
         closed_state = _workflow_state(state) if state is not None else None
         connection = self._connect_existing()
+        primary: BaseException | None = None
         try:
             if closed_state is None:
                 cursor = connection.execute(
@@ -2619,12 +2935,14 @@ class WorkflowLedger:
                     (closed_state.value, bounded_limit),
                 )
             return tuple(_row_to_run(row) for row in cursor.fetchmany(bounded_limit))
-        except FCPMCPError:
+        except FCPMCPError as error:
+            primary = error
             raise
         except _LEDGER_FAILURES as error:
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def list_terminal_runs_before(
         self,
@@ -2651,6 +2969,7 @@ class WorkflowLedger:
         states = tuple(sorted(state.value for state in _PRUNE_ELIGIBLE_STATES))
         placeholders = ", ".join("?" for _ in states)
         connection = self._connect_existing()
+        primary: BaseException | None = None
         try:
             if cursor_timestamp is None:
                 parameters: tuple[object, ...] = (
@@ -2682,12 +3001,56 @@ class WorkflowLedger:
             return tuple(
                 _row_to_run(row) for row in cursor.fetchmany(bounded_limit)
             )
-        except FCPMCPError:
+        except FCPMCPError as error:
+            primary = error
             raise
         except _LEDGER_FAILURES as error:
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
+
+    def list_pending_prune_runs(
+        self,
+        *,
+        limit: int = 100,
+    ) -> tuple[LedgerRunRecord, ...]:
+        """List terminal runs whose latest prune intent is not completed.
+
+        This traversal is deliberately independent of ``runs.updated_at``:
+        appending the intent advances that timestamp, but must not make an
+        interrupted prune undiscoverable on restart.
+        """
+        bounded_limit = _read_limit(limit)
+        states = tuple(sorted(state.value for state in _PRUNE_ELIGIBLE_STATES))
+        placeholders = ", ".join("?" for _ in states)
+        connection = self._connect_existing()
+        primary: BaseException | None = None
+        try:
+            rows = connection.execute(
+                f"SELECT r.* FROM runs AS r "
+                f"WHERE r.state IN ({placeholders}) "
+                "AND COALESCE(("
+                "SELECT MAX(i.sequence) FROM events AS i "
+                "WHERE i.run_id = r.run_id "
+                "AND i.event_type = 'artifact_prune_intent'"
+                "), 0) > COALESCE(("
+                "SELECT MAX(p.sequence) FROM events AS p "
+                "WHERE p.run_id = r.run_id "
+                "AND p.event_type = 'artifacts_pruned'"
+                "), 0) "
+                "ORDER BY r.run_id ASC LIMIT ?",
+                (*states, bounded_limit),
+            ).fetchmany(bounded_limit)
+            return tuple(_row_to_run(row) for row in rows)
+        except FCPMCPError as error:
+            primary = error
+            raise
+        except _LEDGER_FAILURES as error:
+            primary = _ledger_unavailable(error)
+            raise primary
+        finally:
+            _close_public_connection(connection, primary)
 
     def list_events(
         self,
@@ -2704,6 +3067,7 @@ class WorkflowLedger:
         ):
             raise _invalid("after_sequence must be a nonnegative integer")
         connection = self._connect_existing()
+        primary: BaseException | None = None
         try:
             cursor = connection.execute(
                 "SELECT * FROM events WHERE run_id = ? AND sequence > ? "
@@ -2713,12 +3077,14 @@ class WorkflowLedger:
             return tuple(
                 _row_to_event(row) for row in cursor.fetchmany(bounded_limit)
             )
-        except FCPMCPError:
+        except FCPMCPError as error:
+            primary = error
             raise
         except _LEDGER_FAILURES as error:
-            raise _ledger_unavailable(error)
+            primary = _ledger_unavailable(error)
+            raise primary
         finally:
-            connection.close()
+            _close_public_connection(connection, primary)
 
     def verify_integrity(self, run_id: str | None = None) -> IntegrityResult:
         canonical_run_id = _run_id(run_id) if run_id is not None else None
@@ -2829,7 +3195,7 @@ class WorkflowLedger:
                     expected_sequence = 1
                     expected_previous = _ZERO_HASH
                     run_event_count = 0
-                    event_evidence: dict[str, str] = {}
+                    event_evidence: dict[str, object] = {}
                     approval_bindings: set[str] = set()
                     while True:
                         event_rows = event_cursor.fetchmany(100)
@@ -2953,12 +3319,21 @@ class WorkflowLedger:
                                     and _SHA256_RE.fullmatch(payload_sha)
                                 ):
                                     event_evidence["plan_sha256"] = payload_sha
-                                elif (
-                                    event_name == "dry_run_completed"
-                                    and isinstance(payload_sha, str)
-                                    and _SHA256_RE.fullmatch(payload_sha)
+                                if event_name == "commit_started" and all(
+                                    field in payload_value
+                                    for field in _COMMIT_INTENT_FIELDS
                                 ):
-                                    event_evidence["receipt_sha256"] = payload_sha
+                                    for field in _COMMIT_INTENT_FIELDS:
+                                        event_evidence[field] = payload_value[field]
+                                if event_name in {
+                                    "commit_completed",
+                                    "committed",
+                                } and all(
+                                    field in payload_value
+                                    for field in _COMMIT_RESULT_FIELDS
+                                ):
+                                    for field in _COMMIT_RESULT_FIELDS:
+                                        event_evidence[field] = payload_value[field]
                                 binding = payload_value.get("binding_sha256")
                                 if (
                                     isinstance(binding, str)
@@ -3017,11 +3392,7 @@ class WorkflowLedger:
                                 "event evidence does not match the run projection",
                                 finding_run_id=current_run_id,
                             )
-                    for field in (
-                        "source_sha256",
-                        "plan_sha256",
-                        "receipt_sha256",
-                    ):
+                    for field in ("source_sha256", "plan_sha256"):
                         if run_row[field] is not None and field not in event_evidence:
                             add(
                                 "projection_invariant",
@@ -3074,6 +3445,43 @@ class WorkflowLedger:
                             "run state is invalid",
                             finding_run_id=current_run_id,
                         )
+                    if current_state in _PREPARED_STATES:
+                        required_prepare_fields = (
+                            "source_sha256",
+                            "prior_destination_state",
+                            "plan_sha256",
+                            "candidate_sha256",
+                            "candidate_size_bytes",
+                            "diff_sha256",
+                            "diff_size_bytes",
+                            "expires_at",
+                        )
+                        prior_state = run_row["prior_destination_state"]
+                        prior_sha256 = run_row["prior_destination_sha256"]
+                        prepare_complete = all(
+                            run_row[field] is not None
+                            for field in required_prepare_fields
+                        ) and (
+                            (
+                                prior_state
+                                == PriorDestinationState.ABSENT.value
+                                and prior_sha256 is None
+                            )
+                            or (
+                                prior_state
+                                == PriorDestinationState.PRESENT.value
+                                and prior_sha256 is not None
+                            )
+                        )
+                        if not prepare_complete or any(
+                            kind.value not in artifacts_by_kind
+                            for kind in ArtifactKind
+                        ):
+                            add(
+                                "projection_invariant",
+                                "prepared state lacks complete prepare evidence",
+                                finding_run_id=current_run_id,
+                            )
                     if approval_row is None:
                         approval_projection_present = any(
                             run_row[field] is not None
@@ -3107,6 +3515,14 @@ class WorkflowLedger:
                             and approval_row["binding_sha256"]
                             in approval_bindings
                         )
+                        expected_source = (
+                            ApprovalSource.CLI.value
+                            if run_row["approval_mode"] == ApprovalMode.CLI.value
+                            else ApprovalSource.CLIENT.value
+                        )
+                        approval_matches = approval_matches and (
+                            approval_row["source"] == expected_source
+                        )
                         if approval_row["decision"] == ApprovalDecision.APPROVED.value:
                             approval_matches = approval_matches and (
                                 run_row["approved_at"]
@@ -3126,6 +3542,25 @@ class WorkflowLedger:
                             add(
                                 "projection_invariant",
                                 "approval evidence does not match the run projection",
+                                finding_run_id=current_run_id,
+                            )
+                        if current_state in _APPROVED_STATES and (
+                            approval_row["decision"]
+                            != ApprovalDecision.APPROVED.value
+                        ):
+                            add(
+                                "projection_invariant",
+                                "approved state lacks an approved decision",
+                                finding_run_id=current_run_id,
+                            )
+                        if (
+                            current_state is WorkflowState.REJECTED
+                            and approval_row["decision"]
+                            != ApprovalDecision.REJECTED.value
+                        ):
+                            add(
+                                "projection_invariant",
+                                "rejected state lacks a rejected decision",
                                 finding_run_id=current_run_id,
                             )
 
@@ -3150,15 +3585,82 @@ class WorkflowLedger:
                             "backup_sha256",
                         )
                     )
-                    if commit_evidence_present and current_state not in {
+                    commit_states = {
                         WorkflowState.COMMITTING,
                         WorkflowState.COMMITTED,
                         WorkflowState.ROLLED_BACK,
                         WorkflowState.RECOVERY_REQUIRED,
-                    }:
+                    }
+                    if commit_evidence_present and current_state not in commit_states:
                         add(
                             "projection_invariant",
                             "commit evidence contradicts workflow state",
+                            finding_run_id=current_run_id,
+                        )
+                    if current_state in commit_states:
+                        attempt = run_row["commit_attempt_id"]
+                        try:
+                            parsed_attempt = (
+                                UUID(attempt)
+                                if isinstance(attempt, str)
+                                else None
+                            )
+                        except ValueError:
+                            parsed_attempt = None
+                        canonical_attempt = (
+                            parsed_attempt is not None
+                            and parsed_attempt.int != 0
+                            and str(parsed_attempt) == attempt
+                        )
+                        if (
+                            run_row["prior_destination_state"]
+                            == PriorDestinationState.ABSENT.value
+                        ):
+                            backup_consistent = (
+                                run_row["expected_backup_path"] is None
+                                and run_row["backup_sha256"] is None
+                            )
+                        elif (
+                            run_row["prior_destination_state"]
+                            == PriorDestinationState.PRESENT.value
+                            and canonical_attempt
+                        ):
+                            backup_consistent = (
+                                run_row["expected_backup_path"]
+                                == (
+                                    f"{run_row['destination_path']}.bak."
+                                    f"{attempt}"
+                                )
+                                and run_row["backup_sha256"]
+                                == run_row["prior_destination_sha256"]
+                            )
+                        else:
+                            backup_consistent = False
+                        if not canonical_attempt or not backup_consistent:
+                            add(
+                                "projection_invariant",
+                                "commit state lacks consistent intent evidence",
+                                finding_run_id=current_run_id,
+                            )
+                    result_fields_present = tuple(
+                        run_row[field] is not None
+                        for field in _COMMIT_RESULT_FIELDS
+                    )
+                    if current_state is WorkflowState.COMMITTED:
+                        if (
+                            not all(result_fields_present)
+                            or run_row["destination_sha256"]
+                            != run_row["candidate_sha256"]
+                        ):
+                            add(
+                                "projection_invariant",
+                                "committed state lacks complete result evidence",
+                                finding_run_id=current_run_id,
+                            )
+                    elif any(result_fields_present):
+                        add(
+                            "projection_invariant",
+                            "commit result evidence exists before final commit",
                             finding_run_id=current_run_id,
                         )
                     terminal_error_present = (
@@ -3168,11 +3670,10 @@ class WorkflowLedger:
                     if terminal_error_present[0] != terminal_error_present[1] or (
                         any(terminal_error_present)
                         and current_state
-                        not in {
-                            WorkflowState.FAILED,
-                            WorkflowState.ROLLED_BACK,
-                            WorkflowState.RECOVERY_REQUIRED,
-                        }
+                        not in _ERROR_ALLOWED_STATES
+                    ) or (
+                        current_state in _ERROR_REQUIRED_STATES
+                        and not all(terminal_error_present)
                     ):
                         add(
                             "projection_invariant",
@@ -3200,8 +3701,16 @@ class WorkflowLedger:
         except _LEDGER_FAILURES as error:
             raise _ledger_unavailable(error)
         finally:
-            _rollback(connection, begun)
-            connection.close()
+            primary = sys.exc_info()[1]
+            rollback_error = _rollback(connection, begun)
+            if rollback_error is not None:
+                if primary is not None:
+                    _attach_cleanup_failures(primary, [rollback_error])
+                else:
+                    primary = _ledger_unavailable(rollback_error)
+            _close_public_connection(connection, primary)
+            if rollback_error is not None and sys.exc_info()[1] is None:
+                raise primary
 
 
 def _row_to_run(row: sqlite3.Row) -> LedgerRunRecord:

@@ -47,6 +47,7 @@ from fcp_mcp.workflow.models import (
 RUN_ID = "123e4567-e89b-42d3-a456-426614174000"
 RUN_ID_2 = "123e4567-e89b-42d3-a456-426614174001"
 RUN_ID_3 = "123e4567-e89b-42d3-a456-426614174002"
+ATTEMPT_ID = "223e4567-e89b-42d3-a456-426614174000"
 HASH_A = "a" * 64
 HASH_B = "b" * 64
 HASH_C = "c" * 64
@@ -110,19 +111,120 @@ def _create(
     run_id: str = RUN_ID,
     key: str | None = None,
     request_sha256: str | None = None,
+    approval_mode: ApprovalMode = ApprovalMode.CLI,
 ) -> IdempotencyResult:
     return ledger.create_run(
         run_id=run_id,
         graph_version="1",
         run_version="1",
         profile=Profile.WORKFLOW,
-        approval_mode=ApprovalMode.CLI,
+        approval_mode=approval_mode,
         source_path="/private/input.fcpxml",
         destination_path="/private/output.fcpxml",
         idempotency_key=key,
         request_sha256=request_sha256,
         event_type="run_created",
         event_payload={"node": "create", "attempt": 1},
+    )
+
+
+def _record_prepare_evidence(
+    ledger: WorkflowLedger,
+    *,
+    run_id: str = RUN_ID,
+    revision: int = 1,
+    prior_state: PriorDestinationState = PriorDestinationState.ABSENT,
+    prior_sha256: str | None = None,
+) -> ArtifactMutationResult:
+    inspected = ledger.append_event(
+        run_id,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=revision,
+        event_type="source_inspected",
+        payload={"sha256": HASH_A},
+        projection_patch={
+            "source_sha256": HASH_A,
+            "prior_destination_state": prior_state,
+            "prior_destination_sha256": prior_sha256,
+        },
+    )
+    planned = ledger.append_event(
+        run_id,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=inspected.run.revision,
+        event_type="plan_built",
+        payload={"sha256": HASH_B},
+        projection_patch={"plan_sha256": HASH_B},
+    )
+    candidate = ledger.record_artifact(
+        _metadata(run_id=run_id),
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=planned.run.revision,
+        event_type="candidate_stored",
+        event_payload={"sha256": HASH_C},
+    )
+    diff = ledger.record_artifact(
+        _metadata(
+            run_id=run_id,
+            kind=ArtifactKind.DIFF,
+            digest=HASH_D,
+            size=17,
+        ),
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=candidate.run.revision,
+        event_type="diff_created",
+        event_payload={"sha256": HASH_D},
+    )
+    return diff
+
+
+def _complete_prepare(
+    ledger: WorkflowLedger,
+    *,
+    run_id: str = RUN_ID,
+    revision: int = 1,
+    prior_state: PriorDestinationState = PriorDestinationState.ABSENT,
+    prior_sha256: str | None = None,
+) -> EventMutationResult:
+    prepared = _record_prepare_evidence(
+        ledger,
+        run_id=run_id,
+        revision=revision,
+        prior_state=prior_state,
+        prior_sha256=prior_sha256,
+    )
+    return ledger.transition(
+        run_id,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=prepared.run.revision,
+        target_state=WorkflowState.AWAITING_APPROVAL,
+        event_type="awaiting_approval",
+        payload={"expires_at": "2026-07-28T01:02:03Z"},
+        projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
+    )
+
+
+def _approve(
+    ledger: WorkflowLedger,
+    awaiting: EventMutationResult,
+    *,
+    run_id: str = RUN_ID,
+    source: ApprovalSource = ApprovalSource.CLI,
+) -> DecisionMutationResult:
+    return ledger.record_decision(
+        run_id,
+        expected_state=WorkflowState.AWAITING_APPROVAL,
+        expected_revision=awaiting.run.revision,
+        decision=ApprovalDecision.APPROVED,
+        source=source,
+        operator="editor" if source is ApprovalSource.CLI else None,
+        host="workstation" if source is ApprovalSource.CLI else None,
+        terminal_present=source is ApprovalSource.CLI,
+        binding_sha256=HASH_E,
+        expires_at="2026-07-28T01:02:03Z",
+        approval_summary="Approved",
+        event_type="approval_recorded",
+        event_payload={"binding_sha256": HASH_E},
     )
 
 
@@ -1396,19 +1498,11 @@ def test_transition_validates_legal_edge_and_compare_and_set(tmp_path: Path) -> 
     ledger = _ledger(tmp_path)
     _create(ledger)
 
-    mutation = ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=1,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepare_completed",
-        payload={"state": "awaiting_approval"},
-        projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
-    )
+    mutation = _complete_prepare(ledger)
 
     assert isinstance(mutation, EventMutationResult)
     assert mutation.run.state is WorkflowState.AWAITING_APPROVAL
-    assert mutation.run.revision == 2
+    assert mutation.run.revision == 6
     with pytest.raises(FCPMCPError) as stale_revision:
         ledger.transition(
             RUN_ID,
@@ -1423,7 +1517,7 @@ def test_transition_validates_legal_edge_and_compare_and_set(tmp_path: Path) -> 
         ledger.append_event(
             RUN_ID,
             expected_state=WorkflowState.PREPARING,
-            expected_revision=2,
+            expected_revision=mutation.run.revision,
             event_type="wrong",
             payload={},
         )
@@ -1432,7 +1526,7 @@ def test_transition_validates_legal_edge_and_compare_and_set(tmp_path: Path) -> 
         ledger.transition(
             RUN_ID,
             expected_state=WorkflowState.AWAITING_APPROVAL,
-            expected_revision=2,
+            expected_revision=mutation.run.revision,
             target_state=WorkflowState.COMMITTED,
             event_type="wrong",
             payload={},
@@ -1506,20 +1600,12 @@ def test_record_decision_is_one_approval_transition_event_transaction(
 ) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger)
-    ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=1,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepared",
-        payload={},
-        projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
-    )
+    awaiting = _complete_prepare(ledger)
 
     result = ledger.record_decision(
         RUN_ID,
         expected_state=WorkflowState.AWAITING_APPROVAL,
-        expected_revision=2,
+        expected_revision=awaiting.run.revision,
         decision=ApprovalDecision.APPROVED,
         source=ApprovalSource.CLI,
         operator="editor",
@@ -1534,16 +1620,16 @@ def test_record_decision_is_one_approval_transition_event_transaction(
 
     assert isinstance(result, DecisionMutationResult)
     assert result.run.state is WorkflowState.APPROVED
-    assert result.run.revision == 3
+    assert result.run.revision == awaiting.run.revision + 1
     assert result.run.approval_decision is ApprovalDecision.APPROVED
     assert result.approval.operator == "editor"
     assert result.approval.terminal_present is True
-    assert result.event.sequence == 3
+    assert result.event.sequence == 7
     with pytest.raises(FCPMCPError) as duplicate:
         ledger.record_decision(
             RUN_ID,
             expected_state=WorkflowState.APPROVED,
-            expected_revision=3,
+            expected_revision=result.run.revision,
             decision=ApprovalDecision.REJECTED,
             source=ApprovalSource.CLI,
             operator=None,
@@ -1563,37 +1649,7 @@ def test_approved_and_terminal_runs_cannot_mutate_prepare_evidence(
 ) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger)
-    prepared = ledger.append_event(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=1,
-        event_type="plan_built",
-        payload={"sha256": HASH_A},
-        projection_patch={"plan_sha256": HASH_A},
-    )
-    awaiting = ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=prepared.run.revision,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepare_completed",
-        payload={},
-    )
-    approved = ledger.record_decision(
-        RUN_ID,
-        expected_state=WorkflowState.AWAITING_APPROVAL,
-        expected_revision=awaiting.run.revision,
-        decision=ApprovalDecision.APPROVED,
-        source=ApprovalSource.CLI,
-        operator="editor",
-        host="workstation",
-        terminal_present=True,
-        binding_sha256=HASH_D,
-        expires_at="2026-07-28T01:02:03Z",
-        approval_summary="Approved",
-        event_type="approval_recorded",
-        event_payload={"binding_sha256": HASH_D},
-    )
+    approved = _approve(ledger, _complete_prepare(ledger))
 
     with pytest.raises(FCPMCPError) as prepare_patch:
         ledger.append_event(
@@ -1601,9 +1657,9 @@ def test_approved_and_terminal_runs_cannot_mutate_prepare_evidence(
             expected_state=WorkflowState.APPROVED,
             expected_revision=approved.run.revision,
             event_type="plan_built",
-            payload={"sha256": HASH_B},
+            payload={"sha256": HASH_A},
             projection_patch={
-                "plan_sha256": HASH_B,
+                "plan_sha256": HASH_A,
                 "committed_at": "2026-07-27T02:02:03Z",
             },
         )
@@ -1629,7 +1685,7 @@ def test_approved_and_terminal_runs_cannot_mutate_prepare_evidence(
 
     stored = ledger.get_run(RUN_ID)
     assert stored is not None
-    assert stored.plan_sha256 == HASH_A
+    assert stored.plan_sha256 == HASH_B
     assert stored.committed_at is None
     assert stored.revision == cancelled.run.revision
 
@@ -1644,31 +1700,10 @@ def test_artifacts_cannot_be_recorded_after_prepare(
 ) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger)
-    awaiting = ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=1,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepare_completed",
-        payload={},
-    )
+    awaiting = _complete_prepare(ledger)
     revision = awaiting.run.revision
     if state is WorkflowState.APPROVED:
-        decision = ledger.record_decision(
-            RUN_ID,
-            expected_state=WorkflowState.AWAITING_APPROVAL,
-            expected_revision=revision,
-            decision=ApprovalDecision.APPROVED,
-            source=ApprovalSource.CLI,
-            operator=None,
-            host=None,
-            terminal_present=True,
-            binding_sha256=HASH_D,
-            expires_at=None,
-            approval_summary="Approved",
-            event_type="approval_recorded",
-            event_payload={"binding_sha256": HASH_D},
-        )
+        decision = _approve(ledger, awaiting)
         revision = decision.run.revision
 
     with pytest.raises(FCPMCPError) as error:
@@ -1688,42 +1723,12 @@ def test_integrity_detects_projection_and_approval_phase_inconsistency(
 ) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger)
-    prepared = ledger.append_event(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=1,
-        event_type="plan_built",
-        payload={"sha256": HASH_A},
-        projection_patch={"plan_sha256": HASH_A},
-    )
-    awaiting = ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=prepared.run.revision,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepare_completed",
-        payload={},
-    )
-    ledger.record_decision(
-        RUN_ID,
-        expected_state=WorkflowState.AWAITING_APPROVAL,
-        expected_revision=awaiting.run.revision,
-        decision=ApprovalDecision.APPROVED,
-        source=ApprovalSource.CLI,
-        operator=None,
-        host=None,
-        terminal_present=True,
-        binding_sha256=HASH_D,
-        expires_at=None,
-        approval_summary="Approved",
-        event_type="approval_recorded",
-        event_payload={"binding_sha256": HASH_D},
-    )
+    _approve(ledger, _complete_prepare(ledger))
     connection = _raw(ledger.paths.database)
     try:
         connection.execute(
             "UPDATE runs SET plan_sha256 = ?, committed_at = ? WHERE run_id = ?",
-            (HASH_B, "2026-07-27T02:02:03Z", RUN_ID),
+            (HASH_A, "2026-07-27T02:02:03Z", RUN_ID),
         )
     finally:
         connection.close()
@@ -1741,27 +1746,13 @@ def test_append_only_triggers_reject_update_and_delete(
 ) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger, key="key-1", request_sha256=HASH_A)
-    ledger.record_artifact(
-        _metadata(),
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=1,
-        event_type="candidate_stored",
-        event_payload={},
-    )
-    ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=2,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepared",
-        payload={},
-    )
+    awaiting = _complete_prepare(ledger)
     ledger.record_decision(
         RUN_ID,
         expected_state=WorkflowState.AWAITING_APPROVAL,
-        expected_revision=3,
+        expected_revision=awaiting.run.revision,
         decision=ApprovalDecision.REJECTED,
-        source=ApprovalSource.CLIENT,
+        source=ApprovalSource.CLI,
         operator=None,
         host=None,
         terminal_present=False,
@@ -1942,14 +1933,7 @@ def test_reserve_idempotency_key_is_audited_cas_and_prepare_only(
         )
     _assert_code(too_long, ErrorCode.INVALID_ARGUMENTS)
 
-    awaiting = ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=2,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepare_completed",
-        payload={},
-    )
+    awaiting = _complete_prepare(ledger, revision=2)
     with pytest.raises(FCPMCPError) as wrong_phase:
         ledger.reserve_idempotency_key(
             "late-key",
@@ -2553,28 +2537,7 @@ def test_restart_read_surface_returns_typed_artifacts_and_approval(
 ) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger)
-    candidate = ledger.record_artifact(
-        _metadata(),
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=1,
-        event_type="candidate_stored",
-        event_payload={},
-    )
-    diff = ledger.record_artifact(
-        _metadata(kind=ArtifactKind.DIFF, digest=HASH_D, size=17),
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=candidate.run.revision,
-        event_type="diff_created",
-        event_payload={},
-    )
-    awaiting = ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.PREPARING,
-        expected_revision=diff.run.revision,
-        target_state=WorkflowState.AWAITING_APPROVAL,
-        event_type="prepare_completed",
-        payload={},
-    )
+    awaiting = _complete_prepare(ledger)
     decision = ledger.record_decision(
         RUN_ID,
         expected_state=WorkflowState.AWAITING_APPROVAL,
@@ -2867,3 +2830,633 @@ import fcp_mcp.workflow.ledger
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def test_awaiting_approval_requires_complete_prepare_artifacts_and_expiry(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+
+    with pytest.raises(FCPMCPError) as incomplete:
+        ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=1,
+            target_state=WorkflowState.AWAITING_APPROVAL,
+            event_type="awaiting_approval",
+            payload={},
+            projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
+        )
+    _assert_code(incomplete, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    prepared = _record_prepare_evidence(ledger)
+    with pytest.raises(FCPMCPError) as missing_expiry:
+        ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=prepared.run.revision,
+            target_state=WorkflowState.AWAITING_APPROVAL,
+            event_type="awaiting_approval",
+            payload={},
+        )
+    _assert_code(missing_expiry, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+
+@pytest.mark.parametrize(
+    ("mode", "source"),
+    (
+        (ApprovalMode.CLI, ApprovalSource.CLIENT),
+        (ApprovalMode.CLIENT, ApprovalSource.CLI),
+    ),
+)
+def test_decision_source_must_match_run_approval_mode(
+    tmp_path: Path,
+    mode: ApprovalMode,
+    source: ApprovalSource,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger, approval_mode=mode)
+    awaiting = _complete_prepare(ledger)
+
+    with pytest.raises(FCPMCPError) as error:
+        _approve(ledger, awaiting, source=source)
+
+    _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+    assert ledger.get_approval(RUN_ID) is None
+
+
+def test_commit_started_requires_exact_complete_consistent_evidence(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    approved = _approve(ledger, _complete_prepare(ledger))
+    complete_patch = {
+        "commit_attempt_id": ATTEMPT_ID,
+        "expected_backup_path": None,
+        "backup_sha256": None,
+    }
+
+    with pytest.raises(FCPMCPError) as missing:
+        ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.APPROVED,
+            expected_revision=approved.run.revision,
+            target_state=WorkflowState.COMMITTING,
+            event_type="commit_started",
+            payload=complete_patch,
+            projection_patch={"commit_attempt_id": ATTEMPT_ID},
+        )
+    _assert_code(missing, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    with pytest.raises(FCPMCPError) as mismatched:
+        ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.APPROVED,
+            expected_revision=approved.run.revision,
+            target_state=WorkflowState.COMMITTING,
+            event_type="commit_started",
+            payload={**complete_patch, "commit_attempt_id": RUN_ID_2},
+            projection_patch=complete_patch,
+        )
+    _assert_code(mismatched, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    result = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.APPROVED,
+        expected_revision=approved.run.revision,
+        target_state=WorkflowState.COMMITTING,
+        event_type="commit_started",
+        payload=complete_patch,
+        projection_patch=complete_patch,
+    )
+    assert result.run.commit_attempt_id == ATTEMPT_ID
+    assert result.run.expected_backup_path is None
+    assert result.run.backup_sha256 is None
+
+
+def test_present_destination_commit_intent_binds_deterministic_backup(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    approved = _approve(
+        ledger,
+        _complete_prepare(
+            ledger,
+            prior_state=PriorDestinationState.PRESENT,
+            prior_sha256=HASH_A,
+        ),
+    )
+    expected_backup = (
+        f"{approved.run.destination_path}.bak.{ATTEMPT_ID}"
+    )
+
+    with pytest.raises(FCPMCPError) as wrong_path:
+        ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.APPROVED,
+            expected_revision=approved.run.revision,
+            target_state=WorkflowState.COMMITTING,
+            event_type="commit_started",
+            payload={
+                "commit_attempt_id": ATTEMPT_ID,
+                "expected_backup_path": "/private/wrong.bak",
+                "backup_sha256": HASH_A,
+            },
+            projection_patch={
+                "commit_attempt_id": ATTEMPT_ID,
+                "expected_backup_path": "/private/wrong.bak",
+                "backup_sha256": HASH_A,
+            },
+        )
+    _assert_code(wrong_path, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    result = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.APPROVED,
+        expected_revision=approved.run.revision,
+        target_state=WorkflowState.COMMITTING,
+        event_type="commit_started",
+        payload={
+            "commit_attempt_id": ATTEMPT_ID,
+            "expected_backup_path": expected_backup,
+            "backup_sha256": HASH_A,
+        },
+        projection_patch={
+            "commit_attempt_id": ATTEMPT_ID,
+            "expected_backup_path": expected_backup,
+            "backup_sha256": HASH_A,
+        },
+    )
+    assert result.run.expected_backup_path == expected_backup
+    assert result.run.backup_sha256 == HASH_A
+
+
+def test_receipt_evidence_is_forbidden_during_prepare_and_required_on_commit(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+
+    with pytest.raises(FCPMCPError) as prepare_receipt:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=1,
+            event_type="dry_run_completed",
+            payload={"sha256": HASH_E},
+            projection_patch={
+                "receipt_sha256": HASH_E,
+                "receipt_size_bytes": 42,
+            },
+        )
+    _assert_code(prepare_receipt, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    approved = _approve(ledger, _complete_prepare(ledger))
+    committing = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.APPROVED,
+        expected_revision=approved.run.revision,
+        target_state=WorkflowState.COMMITTING,
+        event_type="commit_started",
+        payload={
+            "commit_attempt_id": ATTEMPT_ID,
+            "expected_backup_path": None,
+            "backup_sha256": None,
+        },
+        projection_patch={
+            "commit_attempt_id": ATTEMPT_ID,
+            "expected_backup_path": None,
+            "backup_sha256": None,
+        },
+    )
+    with pytest.raises(FCPMCPError) as incomplete:
+        ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.COMMITTING,
+            expected_revision=committing.run.revision,
+            target_state=WorkflowState.COMMITTED,
+            event_type="committed",
+            payload={"sha256": HASH_C},
+            projection_patch={
+                "destination_sha256": HASH_C,
+                "committed_at": "2026-07-27T02:02:03Z",
+            },
+        )
+    _assert_code(incomplete, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    committed = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.COMMITTING,
+        expected_revision=committing.run.revision,
+        target_state=WorkflowState.COMMITTED,
+        event_type="committed",
+        payload={
+            "destination_sha256": HASH_C,
+            "receipt_sha256": HASH_E,
+            "receipt_size_bytes": 42,
+            "committed_at": "2026-07-27T02:02:03Z",
+        },
+        projection_patch={
+            "destination_sha256": HASH_C,
+            "receipt_sha256": HASH_E,
+            "receipt_size_bytes": 42,
+            "committed_at": "2026-07-27T02:02:03Z",
+        },
+    )
+    assert committed.run.receipt_sha256 == HASH_E
+    assert committed.run.receipt_size_bytes == 42
+
+
+@pytest.mark.parametrize(
+    ("target", "patch", "allowed"),
+    (
+        (WorkflowState.FAILED, {}, False),
+        (
+            WorkflowState.FAILED,
+            {
+                "terminal_error_code": ErrorCode.OPERATION_FAILED,
+                "terminal_error_summary": "prepare failed",
+            },
+            True,
+        ),
+        (
+            WorkflowState.STALE,
+            {
+                "terminal_error_code": ErrorCode.WORKFLOW_STALE,
+                "terminal_error_summary": "destination changed",
+            },
+            True,
+        ),
+        (WorkflowState.ROLLED_BACK, {}, True),
+        (WorkflowState.RECOVERY_REQUIRED, {}, False),
+        (
+            WorkflowState.CANCELLED,
+            {
+                "terminal_error_code": ErrorCode.OPERATION_FAILED,
+                "terminal_error_summary": "not allowed",
+            },
+            False,
+        ),
+    ),
+)
+def test_terminal_error_policy_matches_public_status_contract(
+    tmp_path: Path,
+    target: WorkflowState,
+    patch: dict[str, object],
+    allowed: bool,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    source = WorkflowState.PREPARING
+    revision = 1
+    if target in {
+        WorkflowState.STALE,
+        WorkflowState.ROLLED_BACK,
+        WorkflowState.RECOVERY_REQUIRED,
+    }:
+        approved = _approve(ledger, _complete_prepare(ledger))
+        source = WorkflowState.APPROVED
+        revision = approved.run.revision
+        if target in {
+            WorkflowState.ROLLED_BACK,
+            WorkflowState.RECOVERY_REQUIRED,
+        }:
+            committing = ledger.transition(
+                RUN_ID,
+                expected_state=WorkflowState.APPROVED,
+                expected_revision=revision,
+                target_state=WorkflowState.COMMITTING,
+                event_type="commit_started",
+                payload={
+                    "commit_attempt_id": ATTEMPT_ID,
+                    "expected_backup_path": None,
+                    "backup_sha256": None,
+                },
+                projection_patch={
+                    "commit_attempt_id": ATTEMPT_ID,
+                    "expected_backup_path": None,
+                    "backup_sha256": None,
+                },
+            )
+            source = WorkflowState.COMMITTING
+            revision = committing.run.revision
+
+    mutation = lambda: ledger.transition(
+        RUN_ID,
+        expected_state=source,
+        expected_revision=revision,
+        target_state=target,
+        event_type=f"became_{target.value}",
+        payload={},
+        projection_patch=patch,
+    )
+    if allowed:
+        result = mutation()
+        assert result.run.state is target
+    else:
+        with pytest.raises(FCPMCPError) as error:
+            mutation()
+        _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+
+def test_terminal_prune_audits_are_closed_and_interrupted_intents_are_resumable(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    failed = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        target_state=WorkflowState.FAILED,
+        event_type="prepare_failed",
+        payload={},
+        projection_patch={
+            "terminal_error_code": ErrorCode.OPERATION_FAILED,
+            "terminal_error_summary": "prepare failed",
+        },
+    )
+    intent = ledger.append_event(
+        RUN_ID,
+        expected_state=WorkflowState.FAILED,
+        expected_revision=failed.run.revision,
+        event_type="artifact_prune_intent",
+        payload={"artifacts": []},
+    )
+
+    pending = ledger.list_pending_prune_runs(limit=10)
+    assert [run.run_id for run in pending] == [RUN_ID]
+    with pytest.raises(FCPMCPError) as arbitrary:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.FAILED,
+            expected_revision=intent.run.revision,
+            event_type="late_mutation",
+            payload={},
+        )
+    _assert_code(arbitrary, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    ledger.append_event(
+        RUN_ID,
+        expected_state=WorkflowState.FAILED,
+        expected_revision=intent.run.revision,
+        event_type="artifacts_pruned",
+        payload={"artifacts": []},
+    )
+    assert ledger.list_pending_prune_runs(limit=10) == ()
+
+
+def test_integrity_enforces_prepare_approval_commit_and_terminal_invariants(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger, approval_mode=ApprovalMode.CLIENT)
+    approved = _approve(
+        ledger,
+        _complete_prepare(ledger),
+        source=ApprovalSource.CLIENT,
+    )
+    connection = _raw(ledger.paths.database)
+    try:
+        connection.execute(
+            "UPDATE runs SET approval_source = ?, "
+            "receipt_sha256 = ?, receipt_size_bytes = ?, "
+            "terminal_error_code = ?, terminal_error_summary = ? "
+            "WHERE run_id = ?",
+            (
+                ApprovalSource.CLI.value,
+                HASH_A,
+                10,
+                ErrorCode.OPERATION_FAILED.value,
+                "not terminal",
+                RUN_ID,
+            ),
+        )
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity(RUN_ID)
+
+    assert approved.run.state is WorkflowState.APPROVED
+    assert result.valid is False
+    assert {finding.code for finding in result.findings} == {
+        "projection_invariant"
+    }
+
+
+def test_read_paths_never_run_stale_bootstrap_cleanup_but_write_paths_do(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    stale = ledger.paths.root / ".runs.sqlite3.bootstrap-stale.tmp"
+    stale.write_bytes(ledger_module._BOOTSTRAP_IMAGE)
+    if os.name == "posix":
+        os.chmod(stale, 0o600)
+
+    with monkeypatch.context() as read_patch:
+        def reject_cleanup(anchor: object) -> None:
+            del anchor
+            raise AssertionError("read path invoked mutating cleanup")
+
+        read_patch.setattr(
+            ledger,
+            "_cleanup_stale_bootstrap_entries",
+            reject_cleanup,
+        )
+        assert ledger.get_run(RUN_ID) is not None
+    assert stale.exists()
+
+    ledger.append_event(
+        RUN_ID,
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="write_boundary",
+        payload={},
+    )
+    assert not stale.exists()
+
+
+def test_backup_destination_is_token_authenticated_before_sqlite_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute("CREATE TABLE legacy(value TEXT NOT NULL)")
+    legacy.close()
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original = ledger._connect_lease
+    authenticated: list[str] = []
+
+    def require_authenticated_destination(
+        lease: ledger_module._DatabaseLease,
+        *,
+        read_only: bool,
+    ) -> sqlite3.Connection:
+        if lease.name.endswith(".tmp"):
+            assert read_only is False
+            assert lease.bootstrap_token is not None
+            observed = ledger._bootstrap_token_from_descriptor(
+                lease.descriptor,
+                os.fstat(lease.descriptor),
+            )
+            assert observed == lease.bootstrap_token
+            authenticated.append(lease.name)
+        return original(lease, read_only=read_only)
+
+    monkeypatch.setattr(ledger, "_connect_lease", require_authenticated_destination)
+
+    ledger.initialize()
+
+    assert len(authenticated) == 1
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires open-inode displacement")
+def test_backup_destination_displacement_is_rejected_before_backup_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute("CREATE TABLE legacy(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO legacy VALUES ('source')")
+    legacy.close()
+    os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original = ledger._connect_lease
+    attacker_path = paths.root / "attacker.sqlite3"
+    displaced = False
+
+    def displace_destination(
+        lease: ledger_module._DatabaseLease,
+        *,
+        read_only: bool,
+    ) -> sqlite3.Connection:
+        nonlocal displaced
+        if lease.name.endswith(".tmp") and not displaced:
+            displaced = True
+            temporary = paths.root / lease.name
+            os.replace(temporary, paths.root / "displaced.sqlite3")
+            attacker = _raw(temporary)
+            attacker.execute("CREATE TABLE sentinel(value TEXT)")
+            attacker.close()
+            os.chmod(temporary, 0o600)
+            attacker_path.write_bytes(temporary.read_bytes())
+        return original(lease, read_only=read_only)
+
+    monkeypatch.setattr(ledger, "_connect_lease", displace_destination)
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    attacker = _raw(attacker_path)
+    try:
+        assert attacker.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'sentinel'"
+        ).fetchone()[0] == 1
+        assert attacker.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'legacy'"
+        ).fetchone()[0] == 0
+    finally:
+        attacker.close()
+    assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
+
+
+def test_ledger_has_no_windows_or_pathname_fallback_implementation() -> None:
+    source = Path(ledger_module.__file__).read_text(encoding="utf-8")
+    for marker in (
+        "WinDLL",
+        "msvcrt",
+        "_windows_",
+        "FILE_SHARE_",
+        "reparse",
+        "_fallback_open_file",
+        'os.name == "nt"',
+    ):
+        assert marker not in source
+
+
+def test_sqlite_second_open_retains_authenticated_main_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = _ledger(tmp_path)
+    lease = ledger._secure_database_entry(create=False, write=True)
+    descriptor = lease.descriptor
+    original_connect = sqlite3.connect
+    observed = False
+
+    def observe_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        nonlocal observed
+        assert descriptor is not None
+        os.fstat(descriptor)
+        observed = True
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", observe_connect)
+    connection = ledger._connect_lease(lease, read_only=False)
+    try:
+        assert observed
+        assert lease.descriptor == descriptor
+        os.fstat(descriptor)
+    finally:
+        connection.close()
+        lease.close()
+
+
+@pytest.mark.parametrize("primary_failure", (False, True))
+def test_public_close_failures_are_sanitized_without_masking_primary_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary_failure: bool,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    original_connect = sqlite3.connect
+
+    class CloseFailureConnection(ledger_module._LedgerConnection):
+        def close(self) -> None:
+            super().close()
+            raise OSError("/private/sensitive/close-path")
+
+    def close_failing_connect(
+        *args: object,
+        **kwargs: object,
+    ) -> sqlite3.Connection:
+        kwargs["factory"] = CloseFailureConnection
+        return original_connect(*args, **kwargs)
+
+    monkeypatch.setattr(ledger_module.sqlite3, "connect", close_failing_connect)
+
+    with pytest.raises(FCPMCPError) as error:
+        if primary_failure:
+            ledger.append_event(
+                RUN_ID,
+                expected_state=WorkflowState.PREPARING,
+                expected_revision=2,
+                event_type="source_inspected",
+                payload={"sha256": HASH_A},
+                projection_patch={"source_sha256": HASH_A},
+            )
+        else:
+            ledger.get_run(RUN_ID)
+
+    expected = (
+        ErrorCode.WORKFLOW_STATE_CONFLICT
+        if primary_failure
+        else ErrorCode.LEDGER_UNAVAILABLE
+    )
+    _assert_code(error, expected)
+    assert "/private/sensitive" not in str(error.value)
+    cleanup_failures = getattr(error.value, "cleanup_failures", ())
+    if primary_failure:
+        assert cleanup_failures
+        assert all("/private/sensitive" not in str(item) for item in cleanup_failures)
