@@ -32,12 +32,31 @@ def _write_valid_repository(root: Path) -> None:
     workflows.mkdir(parents=True)
     (workflows / "ci.yml").write_text(
         """
+permissions:
+  contents: read
 jobs:
   quality:
+    name: Static and documentation contracts
     runs-on: macos-latest
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install quality dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check src tests scripts
       - name: Enforce macOS-only architecture
         run: python scripts/check_macos_only.py
+      - name: Validate documented calls
+        run: FCP_MCP_PROFILE=full python scripts/check_contracts.py
 """.lstrip(),
         encoding="utf-8",
     )
@@ -305,6 +324,391 @@ def test_checker_requires_exact_tag_only_publish_trigger(tmp_path, trigger):
         ".github/workflows/publish.yml: release trigger is not exact tag-only v*"
         in check(tmp_path)
     )
+
+
+@pytest.mark.parametrize("workflow_name", ["ci.yml", "publish.yml"])
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "",
+        "permissions: read-all\n",
+        "permissions: write-all\n",
+        "permissions: {}\n",
+        "permissions:\n  id-token: write\n",
+        "permissions:\n  contents: read\n  actions: read\n",
+        'permissions:\n  contents: "${{ github.token }}"\n',
+        (
+            "x-permissions: &extra-permissions\n"
+            "  actions: write\n"
+            "permissions:\n"
+            "  <<: *extra-permissions\n"
+            "  contents: read\n"
+        ),
+    ],
+)
+def test_checker_requires_exact_workflow_permissions(
+    tmp_path, workflow_name, replacement
+):
+    _write_valid_repository(tmp_path)
+    workflow = tmp_path / ".github" / "workflows" / workflow_name
+    text = workflow.read_text(encoding="utf-8")
+    workflow.write_text(
+        text.replace("permissions:\n  contents: read\n", replacement, 1),
+        encoding="utf-8",
+    )
+
+    assert any(
+        "workflow permissions are not exactly contents read" in item
+        for item in check(tmp_path)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "overwrite_before_gate",
+        "overwrite_after_gate",
+        "checkout_repository",
+        "checkout_ref",
+        "checkout_path",
+        "checkout_credentials",
+        "checkout_sha",
+        "duplicate_checkout",
+        "setup_sha",
+        "setup_extra_input",
+        "extra_action",
+        "extra_run",
+        "reordered_steps",
+        "install_command",
+        "ruff_command",
+        "gate_command",
+        "contracts_command",
+        "step_env",
+        "job_env",
+        "job_defaults",
+        "yaml_merge_job",
+    ],
+)
+def test_checker_requires_exact_ordered_ci_quality_trajectory(tmp_path, mutation):
+    _write_valid_repository(tmp_path)
+    ci = tmp_path / ".github" / "workflows" / "ci.yml"
+    text = ci.read_text(encoding="utf-8")
+    checkout = (
+        "      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd\n"
+        "        with:\n"
+        "          persist-credentials: false\n"
+    )
+    setup = (
+        "      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405\n"
+        "        with:\n"
+        '          python-version: "3.12"\n'
+        "          cache: pip\n"
+        "          cache-dependency-path: pyproject.toml\n"
+    )
+    install = (
+        "      - name: Install quality dependencies\n"
+        "        run: |\n"
+        "          python -m pip install --upgrade pip\n"
+        '          python -m pip install -e ".[dev]"\n'
+    )
+    ruff = (
+        "      - name: Ruff\n"
+        "        run: ruff check src tests scripts\n"
+    )
+    gate = (
+        "      - name: Enforce macOS-only architecture\n"
+        "        run: python scripts/check_macos_only.py\n"
+    )
+
+    if mutation == "overwrite_before_gate":
+        text = text.replace(
+            gate,
+            "      - name: Replace architecture checker\n"
+            "        run: printf pass > scripts/check_macos_only.py\n"
+            + gate,
+        )
+    elif mutation == "overwrite_after_gate":
+        text = text.replace(
+            gate,
+            gate
+            + "      - name: Replace architecture checker after validation\n"
+            "        run: printf pass > scripts/check_macos_only.py\n",
+        )
+    elif mutation == "checkout_repository":
+        text = text.replace(
+            "          persist-credentials: false\n",
+            "          persist-credentials: false\n"
+            "          repository: attacker/repository\n",
+            1,
+        )
+    elif mutation == "checkout_ref":
+        text = text.replace(
+            "          persist-credentials: false\n",
+            "          persist-credentials: false\n"
+            "          ref: attacker-ref\n",
+            1,
+        )
+    elif mutation == "checkout_path":
+        text = text.replace(
+            "          persist-credentials: false\n",
+            "          persist-credentials: false\n"
+            "          path: alternate\n",
+            1,
+        )
+    elif mutation == "checkout_credentials":
+        text = text.replace(
+            "persist-credentials: false",
+            "persist-credentials: true",
+            1,
+        )
+    elif mutation == "checkout_sha":
+        text = text.replace(
+            "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "actions/checkout@0123456789012345678901234567890123456789",
+            1,
+        )
+    elif mutation == "duplicate_checkout":
+        text = text.replace(setup, checkout + setup, 1)
+    elif mutation == "setup_sha":
+        text = text.replace(
+            "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405",
+            "actions/setup-python@0123456789012345678901234567890123456789",
+            1,
+        )
+    elif mutation == "setup_extra_input":
+        text = text.replace(
+            "          cache-dependency-path: pyproject.toml\n",
+            "          cache-dependency-path: pyproject.toml\n"
+            "          check-latest: true\n",
+            1,
+        )
+    elif mutation == "extra_action":
+        text = text.replace(
+            install,
+            "      - uses: attacker/action@0123456789012345678901234567890123456789\n"
+            + install,
+        )
+    elif mutation == "extra_run":
+        text = text.replace(
+            gate,
+            "      - name: Extra command\n"
+            "        run: echo extra\n"
+            + gate,
+        )
+    elif mutation == "reordered_steps":
+        text = text.replace(ruff + gate, gate + ruff)
+    elif mutation == "install_command":
+        text = text.replace(
+            'python -m pip install -e ".[dev]"',
+            "python -m pip install attacker-package",
+            1,
+        )
+    elif mutation == "ruff_command":
+        text = text.replace(
+            "ruff check src tests scripts",
+            "ruff check src",
+            1,
+        )
+    elif mutation == "gate_command":
+        text = text.replace(
+            "python scripts/check_macos_only.py",
+            "python -O scripts/check_macos_only.py",
+            1,
+        )
+    elif mutation == "contracts_command":
+        text = text.replace(
+            "FCP_MCP_PROFILE=full python scripts/check_contracts.py",
+            "python scripts/check_contracts.py",
+            1,
+        )
+    elif mutation == "step_env":
+        text = text.replace(
+            "        run: ruff check src tests scripts\n",
+            "        env:\n"
+            "          BASH_ENV: /tmp/poison\n"
+            "        run: ruff check src tests scripts\n",
+            1,
+        )
+    elif mutation == "job_env":
+        text = text.replace(
+            "  quality:\n",
+            "  quality:\n"
+            "    env:\n"
+            "      BASH_ENV: /tmp/poison\n",
+            1,
+        )
+    elif mutation == "job_defaults":
+        text = text.replace(
+            "  quality:\n",
+            "  quality:\n"
+            "    defaults:\n"
+            "      run:\n"
+            "        shell: true {0}\n",
+            1,
+        )
+    elif mutation == "yaml_merge_job":
+        text = text.replace(
+            "jobs:\n",
+            "x-quality-poison: &quality-poison\n"
+            "  env:\n"
+            "    BASH_ENV: /tmp/poison\n"
+            "jobs:\n",
+            1,
+        )
+        text = text.replace(
+            "  quality:\n",
+            "  quality:\n"
+            "    <<: *quality-poison\n",
+            1,
+        )
+
+    ci.write_text(text, encoding="utf-8")
+
+    assert (
+        ".github/workflows/ci.yml: quality job differs from reviewed CI trajectory"
+        in check(tmp_path)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "checkout_missing_inputs",
+        "setup_cache_dependency",
+        "run_shell",
+        "run_continue_on_error",
+        "quality_permissions",
+        "yaml_merge_step",
+    ],
+)
+def test_checker_rejects_equivalent_ci_quality_execution_mutations(
+    tmp_path, mutation
+):
+    _write_valid_repository(tmp_path)
+    ci = tmp_path / ".github" / "workflows" / "ci.yml"
+    text = ci.read_text(encoding="utf-8")
+
+    if mutation == "checkout_missing_inputs":
+        text = text.replace(
+            "        with:\n"
+            "          persist-credentials: false\n",
+            "",
+            1,
+        )
+    elif mutation == "setup_cache_dependency":
+        text = text.replace(
+            "cache-dependency-path: pyproject.toml",
+            "cache-dependency-path: requirements.txt",
+            1,
+        )
+    elif mutation == "run_shell":
+        text = text.replace(
+            "      - name: Ruff\n",
+            "      - name: Ruff\n"
+            "        shell: bash -c 'exit 0; # {0}'\n",
+            1,
+        )
+    elif mutation == "run_continue_on_error":
+        text = text.replace(
+            "      - name: Ruff\n",
+            "      - name: Ruff\n"
+            "        continue-on-error: true\n",
+            1,
+        )
+    elif mutation == "quality_permissions":
+        text = text.replace(
+            "  quality:\n",
+            "  quality:\n"
+            "    permissions:\n"
+            "      contents: write\n",
+            1,
+        )
+    elif mutation == "yaml_merge_step":
+        text = text.replace(
+            "permissions:\n",
+            "x-step-poison: &step-poison\n"
+            "  env:\n"
+            "    BASH_ENV: /tmp/poison\n"
+            "permissions:\n",
+            1,
+        )
+        text = text.replace(
+            "      - name: Ruff\n",
+            "      - name: Ruff\n"
+            "        <<: *step-poison\n",
+            1,
+        )
+
+    ci.write_text(text, encoding="utf-8")
+
+    assert (
+        ".github/workflows/ci.yml: quality job differs from reviewed CI trajectory"
+        in check(tmp_path)
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation,expected_marker",
+    [
+        (
+            "verify_contents_write",
+            "verify job differs from reviewed release trajectory",
+        ),
+        (
+            "publisher_contents_read",
+            "publisher permissions are not isolated",
+        ),
+        (
+            "publisher_oidc_expression",
+            "publisher permissions are not isolated",
+        ),
+        (
+            "publisher_read_all",
+            "publisher permissions are not isolated",
+        ),
+    ],
+)
+def test_checker_preserves_exact_job_permission_isolation(
+    tmp_path, mutation, expected_marker
+):
+    _write_valid_repository(tmp_path)
+    publish = tmp_path / ".github" / "workflows" / "publish.yml"
+    text = publish.read_text(encoding="utf-8")
+
+    if mutation == "verify_contents_write":
+        text = text.replace(
+            "  verify:\n",
+            "  verify:\n"
+            "    permissions:\n"
+            "      contents: write\n",
+            1,
+        )
+    elif mutation == "publisher_contents_read":
+        text = text.replace(
+            "    permissions:\n"
+            "      id-token: write\n",
+            "    permissions:\n"
+            "      id-token: write\n"
+            "      contents: read\n",
+            1,
+        )
+    elif mutation == "publisher_oidc_expression":
+        text = text.replace(
+            "      id-token: write\n",
+            '      id-token: "${{ inputs.oidc }}"\n',
+            1,
+        )
+    elif mutation == "publisher_read_all":
+        text = text.replace(
+            "    permissions:\n"
+            "      id-token: write\n",
+            "    permissions: read-all\n",
+            1,
+        )
+
+    publish.write_text(text, encoding="utf-8")
+
+    assert any(expected_marker in item for item in check(tmp_path))
 
 
 @pytest.mark.parametrize(

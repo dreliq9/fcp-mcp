@@ -46,6 +46,7 @@ PUBLISH_ACTION = (
 )
 RELEASE_ARTIFACT = "fcp-mcp-v0.2.1-release-dist"
 MACOS_CLASSIFIER = "Operating System :: MacOS :: MacOS X"
+WORKFLOW_PERMISSIONS = {"contents": "read"}
 
 
 def _relative(path: Path, root: Path) -> str:
@@ -190,6 +191,10 @@ def _check_ci(root: Path, findings: list[str]) -> None:
         findings.append(
             ".github/workflows/ci.yml: workflow environment can alter architecture gate"
         )
+    if workflow.get("permissions") != WORKFLOW_PERMISSIONS:
+        findings.append(
+            ".github/workflows/ci.yml: workflow permissions are not exactly contents read"
+        )
     jobs = _jobs(workflow, ".github/workflows/ci.yml", findings)
     if jobs is None:
         return
@@ -207,6 +212,50 @@ def _check_ci(root: Path, findings: list[str]) -> None:
             "quality",
             findings,
         )
+        if jobs["quality"] != _expected_quality_job():
+            findings.append(
+                ".github/workflows/ci.yml: quality job differs from reviewed CI trajectory"
+            )
+
+
+def _expected_quality_job() -> dict[str, Any]:
+    return {
+        "name": "Static and documentation contracts",
+        "runs-on": MACOS_RUNNER,
+        "steps": [
+            {
+                "uses": CHECKOUT_ACTION,
+                "with": {"persist-credentials": False},
+            },
+            {
+                "uses": SETUP_PYTHON_ACTION,
+                "with": {
+                    "python-version": "3.12",
+                    "cache": "pip",
+                    "cache-dependency-path": "pyproject.toml",
+                },
+            },
+            {
+                "name": "Install quality dependencies",
+                "run": (
+                    "python -m pip install --upgrade pip\n"
+                    'python -m pip install -e ".[dev]"\n'
+                ),
+            },
+            {
+                "name": "Ruff",
+                "run": "ruff check src tests scripts",
+            },
+            {
+                "name": "Enforce macOS-only architecture",
+                "run": ARCHITECTURE_GATE,
+            },
+            {
+                "name": "Validate documented calls",
+                "run": "FCP_MCP_PROFILE=full python scripts/check_contracts.py",
+            },
+        ],
+    }
 
 
 def _check_publish_job(job: Any, findings: list[str]) -> None:
@@ -407,10 +456,9 @@ def _check_publish(root: Path, findings: list[str]) -> None:
         findings.append(
             ".github/workflows/publish.yml: release trigger is not exact tag-only v*"
         )
-    permissions = workflow.get("permissions")
-    if isinstance(permissions, dict) and permissions.get("id-token") == "write":
+    if workflow.get("permissions") != WORKFLOW_PERMISSIONS:
         findings.append(
-            ".github/workflows/publish.yml: publisher permissions are not isolated"
+            ".github/workflows/publish.yml: workflow permissions are not exactly contents read"
         )
     jobs = _jobs(workflow, ".github/workflows/publish.yml", findings)
     if jobs is None:
