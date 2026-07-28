@@ -28,7 +28,10 @@ PROFILE_COUNTS = {
 SOURCE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <fcpxml version="1.11"><resources>
 <format id="r1" frameDuration="1/30s"/>
-<asset id="r2" name="Clip" duration="3s"/>
+<asset id="r2" name="Clip" duration="3s" hasVideo="1" hasAudio="1"
+       audioSources="1" audioChannels="2">
+<media-rep kind="original-media" src="file:///tmp/fcp-mcp-wheel-smoke-placeholder.mov"/>
+</asset>
 </resources><event name="Event"><project name="Project">
 <sequence format="r1" duration="3s"><spine>
 <asset-clip ref="r2" name="Clip" offset="0s" start="0s" duration="3s"/>

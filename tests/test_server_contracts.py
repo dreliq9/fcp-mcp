@@ -21,6 +21,13 @@ from fcp_mcp.version import distribution_version, package_version
 HOSTILE = 'x" & do shell script "touch /tmp/pwned" & "'
 
 
+def test_project_query_serializes_apple_time_record_as_fcpxml_rational():
+    source = automation.FCP_PROJECTS.source
+
+    assert "sequence.duration().toString()" not in source
+    assert 'duration.value + "/" + duration.timescale + "s"' in source
+
+
 def test_direct_server_startup_rejects_before_runtime_construction():
     completed = subprocess.run(
         [

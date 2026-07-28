@@ -247,7 +247,10 @@ def _transition_attributes(root: ET.Element, duration: str) -> list[dict[str, st
             ),
             1,
             ("Interview_A",),
-            lambda root: _first_named(root, "Interview_A").get("role") == "Voice",
+            lambda root: (
+                _first_named(root, "Interview_A").get("audioRole") == "Voice"
+                and "role" not in _first_named(root, "Interview_A").attrib
+            ),
         ),
         (
             BatchAssignRolesOperation(
@@ -266,8 +269,10 @@ def _transition_attributes(root: ET.Element, duration: str) -> list[dict[str, st
                 "Interview_A_Outro",
             ),
             lambda root: (
-                _first_named(root, "Interview_A").get("role") == "Voice"
-                and _first_named(root, "Broll_Beach").get("role") == "B-Roll"
+                _first_named(root, "Interview_A").get("audioRole") == "Voice"
+                and _first_named(root, "Broll_Beach").get("audioRole") == "B-Roll"
+                and "role" not in _first_named(root, "Interview_A").attrib
+                and "role" not in _first_named(root, "Broll_Beach").attrib
             ),
         ),
         (
@@ -583,7 +588,7 @@ def test_ordered_split_result_can_be_targeted_by_later_operation(
         "op-001",
         "op-002",
     ]
-    assert _first_named(root, "Interview_A_split").get("role") == "Split"
+    assert _first_named(root, "Interview_A_split").get("audioRole") == "Split"
 
 
 def test_ordered_rename_result_can_be_targeted_by_later_operation(
@@ -608,7 +613,7 @@ def test_ordered_rename_result_can_be_targeted_by_later_operation(
     )
 
     root = _candidate_root(execution)
-    assert _first_named(root, "B-Roll_City").get("role") == "Renamed"
+    assert _first_named(root, "B-Roll_City").get("audioRole") == "Renamed"
 
 
 def test_ordered_delete_makes_later_target_not_found(sample_fcpxml_path):
@@ -1067,7 +1072,10 @@ def test_duplicate_names_use_deterministic_first_match_without_unique_claim(
         for element in root.iter()
         if element.tag == "asset-clip" and element.get("name") == "Interview_A"
     ]
-    assert [element.get("role") for element in matches] == ["Chosen", "Video"]
+    assert [
+        element.get("audioRole") or element.get("videoRole") or element.get("role")
+        for element in matches
+    ] == ["Chosen", "Video"]
     assert execution.receipts[0].affected_entities == ("Interview_A",)
 
 

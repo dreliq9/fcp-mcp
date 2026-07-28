@@ -7,10 +7,12 @@ import json
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from scripts.wheel_smoke import (
     PROFILE_COUNTS,
+    SOURCE_XML,
     check_version,
     inspect_server,
     smoke_workflow,
@@ -92,6 +94,16 @@ def test_profile_contract_includes_workflow_default():
         "edit": (74, 5, 3),
         "full": (93, 5, 3),
     }
+
+
+def test_release_smoke_source_has_required_asset_media_representation():
+    root = ET.fromstring(SOURCE_XML)
+    asset = root.find("./resources/asset")
+
+    assert asset is not None
+    media_rep = asset.find("media-rep")
+    assert media_rep is not None
+    assert media_rep.get("src", "").startswith("file://")
 
 
 def test_real_stdio_hash_bound_workflow_and_cli_reconcile(tmp_path: Path):

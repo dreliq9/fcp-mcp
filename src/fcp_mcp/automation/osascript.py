@@ -99,12 +99,15 @@ function run(argv) {
             const projects = events[eventIndex].projects();
             for (let projectIndex = 0; projectIndex < projects.length; projectIndex++) {
                 const sequence = projects[projectIndex].sequence();
+                const duration = sequence ? sequence.duration() : null;
                 result.push({
                     library: libraries[libraryIndex].name(),
                     event: events[eventIndex].name(),
                     name: projects[projectIndex].name(),
                     id: projects[projectIndex].id(),
-                    duration: sequence ? sequence.duration().toString() : "unknown"
+                    duration: duration
+                        ? duration.value + "/" + duration.timescale + "s"
+                        : "unknown"
                 });
             }
         }

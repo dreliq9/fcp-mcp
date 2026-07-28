@@ -14,7 +14,7 @@ from typing import Literal, cast
 
 from fcp_mcp.contracts import ErrorCode
 from fcp_mcp.fcpxml.time_utils import RationalTime
-from fcp_mcp.fcpxml.writer import FCPXMLModifier
+from fcp_mcp.fcpxml.writer import FCPXMLModifier, assigned_role
 from fcp_mcp.workflow.models import (
     AddKeywordOperation,
     AddMarkerOperation,
@@ -54,7 +54,7 @@ _CLIP_TAGS = frozenset(
         "ref-clip",
     }
 )
-_BATCH_ROLE_TAGS = frozenset({"asset-clip", "clip", "title", "audio", "video"})
+_BATCH_ROLE_TAGS = frozenset({"asset-clip", "title", "audio", "video"})
 _TIME_PATTERN = re.compile(r"^(-?\d+)(?:/(\d+))?s$")
 _MAX_TIME_NUMERATOR = (1 << 63) - 1
 _MIN_TIME_NUMERATOR = -(1 << 63)
@@ -1401,9 +1401,9 @@ def _execute_assign_role(
     target = _named_element(modifier, operation.clip_name)
     if target is None:
         raise _ExecutionError(ErrorCode.OPERATION_FAILED, "preflight target disappeared")
-    before = target.get("role")
+    before = assigned_role(target)
     result = modifier.assign_role(operation.clip_name, operation.role)
-    if result is not True or target.get("role") != operation.role:
+    if result is not True or assigned_role(target) != operation.role:
         raise _ExecutionError(
             ErrorCode.OPERATION_FAILED,
             "role operation did not produce the requested effect",
@@ -1424,14 +1424,16 @@ def _execute_batch_assign_roles(
     operation = cast(BatchAssignRolesOperation, item.operation)
     editable_before = _editable_elements(modifier)
     before_roles = {
-        id(element): element.get("role") for element in editable_before
+        id(element): assigned_role(element) for element in editable_before
     }
     matches: list[tuple[ET.Element, str, str | None, str]] = []
     for index, element in enumerate(editable_before, start=1):
         name = element.get("name", "")
         for rule in operation.rules:
             if rule.match.lower() in name.lower():
-                matches.append((element, _entity_name(element, index), element.get("role"), rule.role))
+                matches.append(
+                    (element, _entity_name(element, index), assigned_role(element), rule.role)
+                )
                 break
     result = modifier.batch_assign_roles(
         [{"match": rule.match, "role": rule.role} for rule in operation.rules]
@@ -1445,7 +1447,7 @@ def _execute_batch_assign_roles(
         or [id(element) for element in editable_after]
         != [id(element) for element in editable_before]
         or any(
-            element.get("role") != expected_roles[id(element)]
+            assigned_role(element) != expected_roles[id(element)]
             for element in editable_after
         )
     ):

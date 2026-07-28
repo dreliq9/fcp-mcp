@@ -15,6 +15,27 @@ from .time_utils import RationalTime
 from .transaction import FCPXMLTransactionReceipt, commit_fcpxml_bytes
 
 
+def role_attribute_for_element(element: ET.Element) -> str | None:
+    """Return the DTD-valid role attribute for a role-capable clip element."""
+    if element.tag == "asset-clip":
+        return "audioRole"
+    if element.tag in {"audio", "video", "title"}:
+        return "role"
+    return None
+
+
+def assigned_role(element: ET.Element) -> str | None:
+    """Read the role value written by :func:`role_attribute_for_element`."""
+    if element.tag == "asset-clip":
+        return (
+            element.get("audioRole")
+            or element.get("videoRole")
+            or element.get("role")
+        )
+    attribute = role_attribute_for_element(element)
+    return element.get(attribute) if attribute is not None else None
+
+
 class FCPXMLModifier:
     """Load and modify FCPXML files."""
 
@@ -303,11 +324,16 @@ class FCPXMLModifier:
     # --- Roles ---
 
     def assign_role(self, clip_name: str, role: str) -> bool:
-        """Set role on a clip."""
+        """Set an audio role using the DTD-valid attribute for the clip type."""
         clip_el = self._find_clip_by_name(clip_name)
         if clip_el is None:
             return False
-        clip_el.set("role", role)
+        attribute = role_attribute_for_element(clip_el)
+        if attribute is None:
+            return False
+        if clip_el.tag == "asset-clip":
+            clip_el.attrib.pop("role", None)
+        clip_el.set(attribute, role)
         return True
 
     # --- Batch Operations ---
@@ -318,12 +344,15 @@ class FCPXMLModifier:
         """
         count = 0
         for clip_el in self.root.iter():
-            if clip_el.tag not in ("asset-clip", "clip", "title", "audio", "video"):
+            attribute = role_attribute_for_element(clip_el)
+            if attribute is None:
                 continue
             name = clip_el.get("name", "")
             for rule in rules:
                 if rule["match"].lower() in name.lower():
-                    clip_el.set("role", rule["role"])
+                    if clip_el.tag == "asset-clip":
+                        clip_el.attrib.pop("role", None)
+                    clip_el.set(attribute, rule["role"])
                     count += 1
                     break
         return count

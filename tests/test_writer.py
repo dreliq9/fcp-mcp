@@ -70,6 +70,13 @@ class TestClipOperations:
     def test_assign_role(self, modifier):
         result = modifier.assign_role("Interview_A", "Narration")
         assert result is True
+        clip = next(
+            element
+            for element in modifier.root.iter("asset-clip")
+            if element.get("name") == "Interview_A"
+        )
+        assert clip.get("audioRole") == "Narration"
+        assert "role" not in clip.attrib
 
 
 class TestTransitions:
@@ -100,6 +107,15 @@ class TestBatchOps:
         ]
         count = modifier.batch_assign_roles(rules)
         assert count >= 3
+        matched = [
+            element
+            for element in modifier.root.iter("asset-clip")
+            if "interview" in element.get("name", "").lower()
+            or "broll" in element.get("name", "").lower()
+        ]
+        assert matched
+        assert all(element.get("audioRole") for element in matched)
+        assert all("role" not in element.attrib for element in matched)
 
     def test_fill_gaps(self, modifier):
         count = modifier.fill_gaps("r3", "Fill Clip")

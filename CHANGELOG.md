@@ -15,6 +15,8 @@ All notable changes to fcp-mcp are documented here. Format based on
   hashes, receipts, destination locks, idempotency, and bounded diagnostics.
 - Installed-wheel evidence covering all four profiles and a real
   two-operation prepare/commit/reconcile trajectory.
+- A macOS release gate that validates candidates against the matching DTD
+  bundled with the locally installed Final Cut Pro.
 
 ### Changed
 
@@ -27,6 +29,11 @@ All notable changes to fcp-mcp are documented here. Format based on
 - Python 3.10 compatibility is preserved through `typing_extensions.Self`.
 - Commit timestamps retain subsecond precision so restart validation preserves
   event ordering.
+- Audio-role assignment now emits Apple-valid `audioRole` on `asset-clip`
+  elements, while legacy `role` input remains readable.
+- The installed-wheel smoke source now includes the required asset
+  `media-rep`, and live project durations serialize as FCPXML rational times
+  instead of JavaScript object strings.
 
 ### Boundaries
 

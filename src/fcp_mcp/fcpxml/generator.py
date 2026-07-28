@@ -183,7 +183,7 @@ class FCPXMLGenerator:
         clip.set("start", start)
         clip.set("duration", duration)
         if role:
-            clip.set("role", role)
+            clip.set("audioRole", role)
         return clip
 
     def add_gap_to_spine(
@@ -252,7 +252,7 @@ class FCPXMLGenerator:
         clip.set("duration", duration)
         clip.set("lane", str(lane))
         if role:
-            clip.set("role", role)
+            clip.set("audioRole", role)
         return clip
 
     def add_transition(

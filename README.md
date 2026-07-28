@@ -268,6 +268,22 @@ an existing destination, atomically committed, and validated again.
 The built-in validator checks the invariants it implements; it is not a
 complete Apple schema validator. Import into a disposable Final Cut Pro
 project is the authoritative compatibility gate for important outputs.
+On a release workstation with Final Cut Pro installed, preflight a candidate
+against the DTD matching its declared FCPXML version:
+
+```bash
+python scripts/apple_dtd_gate.py path/to/candidate.fcpxml
+```
+
+This gate reads the DTD from the installed Final Cut Pro application bundle;
+the project does not copy or redistribute Apple's schema. A passing DTD check
+does not replace the disposable-project import because Final Cut Pro also
+checks media and application-level semantics.
+
+`fcpxml_assign_role`, `fcpxml_batch_assign_roles`, and their workflow
+operations assign audio roles. For an `asset-clip`, fcp-mcp writes Apple's
+`audioRole` attribute and continues to read legacy `role` values for
+compatibility.
 
 ### Reviewable transactional edits
 
@@ -446,8 +462,10 @@ reliable path; some JXA queries are gated behind Accessibility permissions
 
 **`fcpxml_*` tools report structural validation failures** — run
 `fcpxml_validate` for the implemented checks. Passing this validator is
-not proof of complete Apple/FCP compatibility; import an important
-result into a disposable Final Cut Pro project before relying on it.
+not proof of complete Apple/FCP compatibility. Run
+`python scripts/apple_dtd_gate.py path/to/result.fcpxml` on a Mac with
+Final Cut Pro installed, then import an important result into a disposable
+Final Cut Pro project before relying on it.
 
 **`path_outside_scope`** — add the media location to
 `FCP_MCP_ALLOWED_ROOTS`. External volumes are not implicitly trusted.

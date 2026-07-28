@@ -226,7 +226,7 @@ class FCPXMLParser:
             offset=RationalTime.from_fcpxml(el.get("offset", "0s")),
             start=RationalTime.from_fcpxml(el.get("start", "0s")),
             duration=RationalTime.from_fcpxml(el.get("duration", "0s")),
-            role=el.get("role", ""),
+            role=el.get("audioRole") or el.get("videoRole") or el.get("role", ""),
             lane=int(el.get("lane", "0")),
             enabled=el.get("enabled", "1") != "0",
             _raw_attribs=dict(el.attrib),

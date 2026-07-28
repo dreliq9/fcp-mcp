@@ -100,10 +100,14 @@ command-construction and error paths covered everywhere.
 2. Ruff, documentation contracts, the complete test suite, coverage
    gates, dependency audit, build checks, and installed-wheel smoke must
    pass
-3. Open a PR referencing the issue you're addressing; include the
+3. On the release Mac, validate the installed-wheel workflow candidate with
+   `python scripts/apple_dtd_gate.py path/to/candidate.fcpxml`, then import a
+   real-media candidate into a disposable Final Cut Pro library. The DTD gate
+   is a preflight, not a substitute for the import.
+4. Open a PR referencing the issue you're addressing; include the
    before/after output of at least one tool invocation in the
    description
-4. Keep PRs focused — one tool or one bug per PR where possible
+5. Keep PRs focused — one tool or one bug per PR where possible
 
 ## Release prerequisites
 
@@ -119,6 +123,8 @@ maintainers must:
 The unprivileged workflow job repeats every release gate and uploads the
 verified distributions. Only the separate two-step publish job receives
 `id-token: write`. Do not add a long-lived PyPI token to the workflow.
+Apple-DTD and live-import checks remain local macOS release gates because CI
+runners do not contain the licensed Final Cut Pro application bundle.
 
 ## What not to contribute
 

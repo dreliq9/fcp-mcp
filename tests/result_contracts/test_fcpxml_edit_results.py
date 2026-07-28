@@ -553,7 +553,8 @@ def _assert_committed_entity(
         ]
     elif tool_name == "fcpxml_assign_role":
         clip = _find_named(root, "asset-clip", "Interview_A")
-        assert clip.get("role") == "Narration"
+        assert clip.get("audioRole") == "Narration"
+        assert "role" not in clip.attrib
     elif tool_name == "fcpxml_add_title":
         title = _find_named(root, "title", "Act Two")
         assert title.get("offset") == "121121/10000s"

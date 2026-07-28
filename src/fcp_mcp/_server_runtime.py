@@ -57,7 +57,7 @@ from .fcpxml.transaction import (
     commit_fcpxml_bytes,
 )
 from .fcpxml.validator import FCPXMLValidator
-from .fcpxml.writer import FCPXMLModifier
+from .fcpxml.writer import FCPXMLModifier, assigned_role
 from .mcp_boundary import FCPFastMCP, build_mcp_server  # noqa: F401
 from .profiles import Profile, ToolClass
 from .registry import PromptRegistry, ResourceRegistry, ToolRegistry
@@ -797,7 +797,7 @@ def _clip_mutation_record(element: ET.Element) -> ClipMutationRecord:
         offset=element.get("offset", ""),
         start=element.get("start", ""),
         duration=element.get("duration", ""),
-        role=element.get("role", ""),
+        role=assigned_role(element) or "",
         ref=element.get("ref", ""),
     )
 
@@ -2597,12 +2597,12 @@ def fcpxml_change_speed(
 def fcpxml_assign_role(
     path: str, clip_name: str, role: str, output_path: str = "",
 ) -> ToolOutcome[RoleMutationResult]:
-    """Set the role on a clip (e.g., "Dialogue", "Video", "Music", "Effects").
+    """Set the audio role on a clip (e.g., "Dialogue", "Music", "Effects").
 
     Args:
         path: Path to .fcpxml file
         clip_name: Name of the clip
-        role: Role name
+        role: Audio role name
         output_path: Output file path
     """
     mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
@@ -2618,7 +2618,7 @@ def fcpxml_assign_role(
         name=clip_name,
         tags={"asset-clip", "clip", "title", "audio", "video"},
     )
-    if committed.get("role") != role:
+    if assigned_role(committed) != role:
         raise RuntimeError(
             "Committed FCPXML is missing the assigned role"
         )
@@ -2630,7 +2630,7 @@ def fcpxml_assign_role(
             receipt=_receipt_result(receipt),
             assignment=RoleMutationRecord(
                 clip_name=clip_name,
-                role=committed.get("role", ""),
+                role=assigned_role(committed) or "",
             ),
         ),
     )
@@ -3802,13 +3802,12 @@ def fcpxml_batch_assign_roles(
         )
     role_tags = {
         "asset-clip",
-        "clip",
         "title",
         "audio",
         "video",
     }
     expected_roles = [
-        (element.tag, element.get("name"), element.get("role"))
+        (element.tag, element.get("name"), assigned_role(element))
         for element in mod.root.iter()
         if element.tag in role_tags
     ]
@@ -3820,7 +3819,7 @@ def fcpxml_batch_assign_roles(
             if element.tag in role_tags
         ]
         candidate_roles = [
-            (element.tag, element.get("name"), element.get("role"))
+            (element.tag, element.get("name"), assigned_role(element))
             for element in candidate_elements
         ]
         if candidate_roles != expected_roles:
@@ -3831,7 +3830,6 @@ def fcpxml_batch_assign_roles(
         for element in candidate_elements:
             if element.tag not in {
             "asset-clip",
-            "clip",
             "title",
             "audio",
             "video",
@@ -3847,7 +3845,7 @@ def fcpxml_batch_assign_roles(
                 None,
             )
             if matching_rule is not None:
-                if element.get("role") != matching_rule["role"]:
+                if assigned_role(element) != matching_rule["role"]:
                     _raise_validation_failure(
                         "Role-assignment candidate contains a wrong role"
                     )
