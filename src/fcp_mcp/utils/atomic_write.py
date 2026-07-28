@@ -8,7 +8,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
@@ -48,7 +48,7 @@ def _sync_directory(path: Path) -> None:
 
 
 def _backup_name(destination: Path, transaction_id: str) -> Path:
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return destination.with_name(f"{destination.name}.bak.{timestamp}.{transaction_id}")
 
 

@@ -54,7 +54,7 @@ def _assert_workflow_parser_contract(
     assert "ruamel.yaml>=0.18.6,<0.20" in dev_dependencies
     assert "tomli>=2.0.1,<3; python_version < '3.11'" in dev_dependencies
     assert all(
-        _normalize_requirement_name(requirement) != "ruamel-yaml"
+        _normalize_requirement_name(requirement) not in {"ruamel-yaml", "tomli"}
         for requirement in project["project"]["dependencies"]
     )
 
@@ -78,22 +78,30 @@ def test_workflow_parser_is_declared_dev_only_and_does_not_shell_out():
     _assert_workflow_parser_contract(project, module)
 
 
-def test_workflow_parser_contract_rejects_production_promotion():
+@pytest.mark.parametrize("dependency", ("ruamel.yaml>=0.18.6,<0.20", "tomli>=2.0.1,<3"))
+def test_workflow_parser_contract_rejects_production_promotion(dependency: str):
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    project["project"]["dependencies"].append("ruamel.yaml>=0.18.6,<0.20")
+    project["project"]["dependencies"].append(dependency)
 
     with pytest.raises(AssertionError):
         _assert_workflow_parser_contract(project, ast.parse(""))
 
 
-def test_workflow_parser_contract_rejects_from_subprocess_import():
+@pytest.mark.parametrize("import_statement", ("import subprocess", "from subprocess import run"))
+def test_workflow_parser_contract_rejects_subprocess_import(import_statement: str):
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
 
     with pytest.raises(AssertionError):
         _assert_workflow_parser_contract(
             project,
-            ast.parse("from subprocess import run"),
+            ast.parse(import_statement),
         )
+
+
+def test_runtime_self_compatibility_dependency_is_direct_and_bounded():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+
+    assert "typing_extensions>=4.5,<5" in project["project"]["dependencies"]
 
 
 def _load_workflow(relative: str) -> dict[str, object]:

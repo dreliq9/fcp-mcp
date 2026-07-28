@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sys
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, TextIO
 
 from fcp_mcp.version import package_version
@@ -21,7 +21,7 @@ def emit_event(
 ) -> None:
     target = stream if stream is not None else sys.stderr
     record = {
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "package_version": package_version(),
         **event,
     }

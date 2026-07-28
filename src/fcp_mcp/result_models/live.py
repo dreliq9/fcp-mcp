@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import re
 from enum import Enum
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from typing_extensions import Self
 
 WarningText = Annotated[
     str,

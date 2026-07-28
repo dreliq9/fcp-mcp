@@ -16,8 +16,10 @@ from dataclasses import asdict, dataclass
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 from urllib.parse import unquote as url_unquote
+
+from typing_extensions import Self
 
 from .automation import osascript as automation
 from .config import RuntimeConfig
