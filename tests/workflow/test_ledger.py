@@ -22,6 +22,7 @@ from fcp_mcp.profiles import ApprovalMode, Profile
 from fcp_mcp.workflow.artifacts import (
     ArtifactKind,
     ArtifactMetadataV1,
+    ArtifactStore,
     StatePaths,
 )
 from fcp_mcp.workflow.ledger import (
@@ -453,19 +454,23 @@ def test_migration_checksum_has_stable_unambiguous_serialization() -> None:
         migration_checksum(1, "initial", ("SELECT 1", "SELECT 2"))
         == "28c57fce233ef9c2cef4dd505c80ade109d1c27278f155b32fcf85668b8f57b5"
     )
-    assert MIGRATIONS == (
-        Migration(
-            version=1,
-            name=MIGRATIONS[0].name,
-            statements=MIGRATIONS[0].statements,
-            checksum=MIGRATIONS[0].checksum,
-        ),
-    )
-    assert MIGRATIONS[0].checksum == migration_checksum(
-        MIGRATIONS[0].version,
-        MIGRATIONS[0].name,
-        MIGRATIONS[0].statements,
-    )
+    assert [migration.version for migration in MIGRATIONS] == [1, 2]
+    assert [migration.name for migration in MIGRATIONS] == [
+        "initial_workflow_ledger",
+        "add_prepare_failure_evidence",
+    ]
+    for migration in MIGRATIONS:
+        assert migration == Migration(
+            version=migration.version,
+            name=migration.name,
+            statements=migration.statements,
+            checksum=migration.checksum,
+        )
+        assert migration.checksum == migration_checksum(
+            migration.version,
+            migration.name,
+            migration.statements,
+        )
 
 
 def test_initialize_is_idempotent_and_records_package_and_canonical_time(
@@ -481,12 +486,16 @@ def test_initialize_is_idempotent_and_records_package_and_canonical_time(
         rows = connection.execute("SELECT * FROM schema_migrations").fetchall()
     finally:
         connection.close()
-    assert len(rows) == 1
-    assert rows[0]["version"] == 1
-    assert rows[0]["name"] == MIGRATIONS[0].name
-    assert rows[0]["checksum"] == MIGRATIONS[0].checksum
-    assert rows[0]["package_version"] == "0.3.0-test"
-    assert rows[0]["applied_at"] == "2026-07-27T01:02:03Z"
+    assert len(rows) == 2
+    assert [row["version"] for row in rows] == [1, 2]
+    assert [row["name"] for row in rows] == [
+        migration.name for migration in MIGRATIONS
+    ]
+    assert [row["checksum"] for row in rows] == [
+        migration.checksum for migration in MIGRATIONS
+    ]
+    assert {row["package_version"] for row in rows} == {"0.3.0-test"}
+    assert {row["applied_at"] for row in rows} == {"2026-07-27T01:02:03Z"}
 
 
 def test_concurrent_initializers_apply_migration_once(tmp_path: Path) -> None:
@@ -515,7 +524,93 @@ def test_concurrent_initializers_apply_migration_once(tmp_path: Path) -> None:
     assert all(not thread.is_alive() for thread in threads)
     connection = _raw(paths.database)
     try:
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 2
+    finally:
+        connection.close()
+
+
+def test_v1_to_v2_migration_preserves_artifacts_and_recreates_append_only_triggers(
+    tmp_path: Path,
+) -> None:
+    paths = _paths(tmp_path)
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    original = ledger.record_artifact(
+        _metadata(),
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="candidate_stored",
+        event_payload={"sha256": HASH_C},
+    ).artifact
+    connection = _raw(paths.database)
+    try:
+        connection.execute("DROP TRIGGER artifacts_no_update")
+        connection.execute("DROP TRIGGER artifacts_no_delete")
+        connection.execute("ALTER TABLE artifacts RENAME TO artifacts_v2")
+        v1_table = next(
+            statement
+            for statement in ledger_module._MIGRATION_1_STATEMENTS
+            if statement.startswith("CREATE TABLE artifacts")
+        )
+        connection.execute(v1_table)
+        connection.execute(
+            "INSERT INTO artifacts "
+            "SELECT run_id, kind, relative_path, sha256, byte_size, created_at "
+            "FROM artifacts_v2"
+        )
+        connection.execute("DROP TABLE artifacts_v2")
+        for statement in ledger_module._MIGRATION_1_STATEMENTS:
+            if statement.startswith("CREATE TRIGGER artifacts_"):
+                connection.execute(statement)
+        connection.execute("DROP TRIGGER schema_migrations_no_delete")
+        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
+        connection.execute(
+            next(
+                statement
+                for statement in ledger_module._MIGRATION_1_STATEMENTS
+                if statement.startswith(
+                    "CREATE TRIGGER schema_migrations_no_delete"
+                )
+            )
+        )
+    finally:
+        connection.close()
+
+    WorkflowLedger(
+        paths,
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    ).initialize()
+
+    restarted = WorkflowLedger(
+        paths,
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    assert restarted.get_artifact(RUN_ID, ArtifactKind.CANDIDATE) == original
+    assert len(list(paths.root.glob("runs.sqlite3.backup-v1-to-v2-*"))) == 1
+    connection = _raw(paths.database)
+    try:
+        assert [
+            row["version"]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ] == [1, 2]
+        connection.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute(
+                "UPDATE artifacts SET byte_size = byte_size WHERE run_id = ?",
+                (RUN_ID,),
+            )
+        connection.execute("ROLLBACK")
+        connection.execute("BEGIN")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute(
+                "DELETE FROM artifacts WHERE run_id = ?",
+                (RUN_ID,),
+            )
+        connection.execute("ROLLBACK")
     finally:
         connection.close()
 
@@ -534,7 +629,7 @@ def test_existing_meaningful_database_is_backed_up_before_migration(
     ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
     ledger.initialize()
 
-    backups = list(paths.root.glob("runs.sqlite3.backup-v0-to-v1-*"))
+    backups = list(paths.root.glob("runs.sqlite3.backup-v0-to-v2-*"))
     assert len(backups) == 1
     if os.name == "posix":
         assert _mode(backups[0]) == 0o600
@@ -553,7 +648,7 @@ def test_existing_meaningful_database_is_backed_up_before_migration(
     current = _raw(paths.database)
     try:
         assert current.execute("SELECT value FROM legacy").fetchone()[0] == "snapshot"
-        assert current.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+        assert current.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 2
     finally:
         current.close()
 
@@ -736,7 +831,7 @@ def test_migration_failure_attaches_residual_backup_cleanup_failure(
     cleanup_failures = getattr(cause, "cleanup_failures", ())
     assert cleanup_failures
     assert all(len(str(failure)) <= 255 for failure in cleanup_failures)
-    assert len(list(paths.root.glob("runs.sqlite3.backup-v0-to-v1-*"))) == 1
+    assert len(list(paths.root.glob("runs.sqlite3.backup-v0-to-v2-*"))) == 1
     current = _raw(paths.database)
     try:
         assert (
@@ -1837,6 +1932,210 @@ def test_create_run_idempotency_different_request_conflicts(tmp_path: Path) -> N
     assert ledger.get_run(RUN_ID_2) is None
 
 
+def test_prepare_failure_evidence_is_atomic_restart_readable_and_verifier_aware(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    created = _create(ledger)
+    store = ArtifactStore(_paths(tmp_path), max_artifact_bytes=1024)
+    body = b'{"receipts":[],"schema_version":"1"}'
+    metadata = store.write(RUN_ID, ArtifactKind.FAILURE_EVIDENCE, body)
+
+    result = ledger.record_prepare_failure(
+        metadata,
+        expected_revision=created.run.revision,
+        error_code=ErrorCode.TARGET_NOT_FOUND,
+        error_summary="workflow prepare failed",
+        event_type="failed",
+        event_payload={"error_code": ErrorCode.TARGET_NOT_FOUND.value},
+    )
+
+    assert result.run.state is WorkflowState.FAILED
+    assert result.run.revision == 2
+    assert result.run.candidate_sha256 is None
+    assert result.run.diff_sha256 is None
+    assert result.artifact.kind is ArtifactKind.FAILURE_EVIDENCE
+    assert result.event.sequence == 2
+    assert result.event.payload == {"error_code": ErrorCode.TARGET_NOT_FOUND.value}
+    assert [event.event_type for event in ledger.list_events(RUN_ID)] == [
+        "run_created",
+        "failed",
+    ]
+    restarted = WorkflowLedger(
+        _paths(tmp_path),
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    stored = restarted.get_artifact(RUN_ID, ArtifactKind.FAILURE_EVIDENCE)
+    assert stored is not None and stored.sha256 == metadata.sha256
+    assert restarted.list_artifacts(RUN_ID) == (stored,)
+    assert restarted.verify_integrity(RUN_ID).valid is True
+
+
+def test_prepare_failure_evidence_requires_exact_kind_event_state_and_revision(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    created = _create(ledger)
+    store = ArtifactStore(_paths(tmp_path), max_artifact_bytes=1024)
+    failure = store.write(RUN_ID, ArtifactKind.FAILURE_EVIDENCE, b"failure")
+
+    for metadata, revision, event_type, payload in (
+        (_metadata(), created.run.revision, "failed", {"error_code": "operation_failed"}),
+        (failure, created.run.revision + 1, "failed", {"error_code": "operation_failed"}),
+        (failure, created.run.revision, "prepare_failed", {"error_code": "operation_failed"}),
+        (failure, created.run.revision, "failed", {"error_code": "operation_failed", "detail": "x"}),
+    ):
+        with pytest.raises(FCPMCPError) as error:
+            ledger.record_prepare_failure(
+                metadata,
+                expected_revision=revision,
+                error_code=ErrorCode.OPERATION_FAILED,
+                error_summary="workflow prepare failed",
+                event_type=event_type,
+                event_payload=payload,
+            )
+        _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    assert ledger.get_run(RUN_ID) == created.run
+    assert ledger.list_artifacts(RUN_ID) == ()
+    assert [event.event_type for event in ledger.list_events(RUN_ID)] == [
+        "run_created"
+    ]
+
+
+def test_prepare_failure_evidence_is_single_shot_and_generic_failed_is_rejected(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    created = _create(ledger)
+    store = ArtifactStore(_paths(tmp_path), max_artifact_bytes=1024)
+    metadata = store.write(RUN_ID, ArtifactKind.FAILURE_EVIDENCE, b"failure")
+
+    with pytest.raises(FCPMCPError) as generic:
+        ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=created.run.revision,
+            target_state=WorkflowState.FAILED,
+            event_type="failed",
+            payload={"error_code": ErrorCode.OPERATION_FAILED.value},
+            projection_patch={
+                "terminal_error_code": ErrorCode.OPERATION_FAILED,
+                "terminal_error_summary": "workflow prepare failed",
+            },
+        )
+    _assert_code(generic, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    recorded = ledger.record_prepare_failure(
+        metadata,
+        expected_revision=created.run.revision,
+        error_code=ErrorCode.OPERATION_FAILED,
+        error_summary="workflow prepare failed",
+        event_type="failed",
+        event_payload={"error_code": ErrorCode.OPERATION_FAILED.value},
+    )
+    with pytest.raises(FCPMCPError) as duplicate:
+        ledger.record_prepare_failure(
+            metadata,
+            expected_revision=recorded.run.revision,
+            error_code=ErrorCode.OPERATION_FAILED,
+            error_summary="workflow prepare failed",
+            event_type="failed",
+            event_payload={"error_code": ErrorCode.OPERATION_FAILED.value},
+        )
+    _assert_code(duplicate, ErrorCode.WORKFLOW_STATE_CONFLICT)
+    assert [event.event_type for event in ledger.list_events(RUN_ID)] == [
+        "run_created",
+        "failed",
+    ]
+
+
+def test_integrity_detects_missing_prepare_failure_evidence(tmp_path: Path) -> None:
+    ledger = _ledger(tmp_path)
+    created = _create(ledger)
+    store = ArtifactStore(_paths(tmp_path), max_artifact_bytes=1024)
+    metadata = store.write(RUN_ID, ArtifactKind.FAILURE_EVIDENCE, b"failure")
+    ledger.record_prepare_failure(
+        metadata,
+        expected_revision=created.run.revision,
+        error_code=ErrorCode.OPERATION_FAILED,
+        error_summary="workflow prepare failed",
+        event_type="failed",
+        event_payload={"error_code": ErrorCode.OPERATION_FAILED.value},
+    )
+    connection = _raw(ledger.paths.database)
+    try:
+        _drop_triggers(connection, table="artifacts", operation="delete")
+        connection.execute(
+            "DELETE FROM artifacts WHERE run_id = ? AND kind = ?",
+            (RUN_ID, ArtifactKind.FAILURE_EVIDENCE.value),
+        )
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity(RUN_ID)
+
+    assert result.valid is False
+    assert {finding.code for finding in result.findings} >= {
+        "failure_evidence_invariant"
+    }
+
+
+def test_prepare_failure_evidence_rolls_back_artifact_state_and_event_together(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = _ledger(tmp_path)
+    created = _create(ledger)
+    store = ArtifactStore(_paths(tmp_path), max_artifact_bytes=1024)
+    metadata = store.write(RUN_ID, ArtifactKind.FAILURE_EVIDENCE, b"failure")
+
+    def fail_event(*args, **kwargs):
+        raise RuntimeError("injected event failure")
+
+    monkeypatch.setattr(ledger, "_append_event_locked", fail_event)
+    with pytest.raises(FCPMCPError) as error:
+        ledger.record_prepare_failure(
+            metadata,
+            expected_revision=created.run.revision,
+            error_code=ErrorCode.OPERATION_FAILED,
+            error_summary="workflow prepare failed",
+            event_type="failed",
+            event_payload={"error_code": ErrorCode.OPERATION_FAILED.value},
+        )
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    restarted = WorkflowLedger(
+        _paths(tmp_path),
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    assert restarted.get_artifact(RUN_ID, ArtifactKind.FAILURE_EVIDENCE) is None
+    assert restarted.get_run(RUN_ID).state is WorkflowState.PREPARING
+    assert [event.event_type for event in restarted.list_events(RUN_ID)] == [
+        "run_created"
+    ]
+
+
+def test_generic_artifact_recording_cannot_project_failure_evidence(tmp_path: Path):
+    ledger = _ledger(tmp_path)
+    created = _create(ledger)
+    store = ArtifactStore(_paths(tmp_path), max_artifact_bytes=1024)
+    metadata = store.write(RUN_ID, ArtifactKind.FAILURE_EVIDENCE, b"failure")
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.record_artifact(
+            metadata,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=created.run.revision,
+            event_type="failure_evidence",
+            event_payload={},
+        )
+
+    _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+    assert ledger.get_artifact(RUN_ID, ArtifactKind.FAILURE_EVIDENCE) is None
+
+
 def test_create_run_and_idempotency_reservation_roll_back_together(
     tmp_path: Path,
 ) -> None:
@@ -2054,7 +2353,7 @@ def test_integrity_verifier_accepts_valid_chains_and_is_read_only(tmp_path: Path
     )
     assert isinstance(result, IntegrityResult)
     assert result.valid is True
-    assert result.checked_migrations == 1
+    assert result.checked_migrations == 2
     assert result.checked_runs == 1
     assert result.checked_events == 2
     assert result.findings == ()

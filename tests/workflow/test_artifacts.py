@@ -1201,6 +1201,19 @@ def test_complete_diff_artifact_is_not_limited_by_rendered_summary_limit(tmp_pat
     assert len(summary.encode()) <= 5
 
 
+def test_failure_evidence_has_fixed_private_path_and_aggregate_protection(tmp_path: Path):
+    store = _store(tmp_path, limit=9)
+
+    evidence = store.write(RUN_ID, ArtifactKind.FAILURE_EVIDENCE, b"failure")
+
+    assert evidence.relative_path == f"artifacts/{RUN_ID}/failure.json"
+    assert store.read(evidence) == b"failure"
+    with pytest.raises(FCPMCPError) as error:
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"xxx")
+    _assert_code(error, ErrorCode.INVALID_ARGUMENTS)
+    assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
+
+
 @pytest.mark.parametrize(("size", "limit"), [(4, 3), (1, 0), (-1, 3)])
 def test_source_limit_rejects_out_of_bounds_counts(size: int, limit: int):
     with pytest.raises(FCPMCPError) as error:

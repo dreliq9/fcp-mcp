@@ -59,11 +59,13 @@ class ArtifactKind(str, Enum):
 
     CANDIDATE = "candidate"
     DIFF = "diff"
+    FAILURE_EVIDENCE = "failure_evidence"
 
 
 _ARTIFACT_NAMES = {
     ArtifactKind.CANDIDATE: "candidate.fcpxml",
     ArtifactKind.DIFF: "diff.json",
+    ArtifactKind.FAILURE_EVIDENCE: "failure.json",
 }
 
 
@@ -102,7 +104,7 @@ def _artifact_kind(value: object) -> ArtifactKind:
             pass
     raise _coded(
         ErrorCode.INVALID_ARGUMENTS,
-        "artifact kind must be candidate or diff",
+        "artifact kind must be candidate, diff, or failure_evidence",
     )
 
 

@@ -119,6 +119,10 @@ _UUID_RE = re.compile(
 _UTC_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{6})?Z$"
 )
+_PROJECTED_ARTIFACT_KINDS = (
+    ArtifactKind.CANDIDATE,
+    ArtifactKind.DIFF,
+)
 
 
 def _coded(
@@ -616,6 +620,47 @@ _MIGRATION_1_STATEMENTS = (
     """.strip(),
 )
 
+_FAILURE_EVIDENCE_ARTIFACTS_TABLE = """
+    CREATE TABLE artifacts (
+        run_id TEXT NOT NULL REFERENCES runs(run_id) CHECK (length(run_id) = 36),
+        kind TEXT NOT NULL CHECK (kind IN ('candidate', 'diff', 'failure_evidence')),
+        relative_path TEXT NOT NULL UNIQUE CHECK (length(relative_path) BETWEEN 1 AND 255),
+        sha256 TEXT NOT NULL CHECK (
+            length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
+        ),
+        byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+        created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 20 AND 27),
+        PRIMARY KEY (run_id, kind)
+    )
+    """.strip()
+
+_ARTIFACTS_NO_UPDATE_TRIGGER = """
+    CREATE TRIGGER artifacts_no_update
+    BEFORE UPDATE ON artifacts
+    BEGIN SELECT RAISE(ABORT, 'artifacts is append-only'); END
+    """.strip()
+
+_ARTIFACTS_NO_DELETE_TRIGGER = """
+    CREATE TRIGGER artifacts_no_delete
+    BEFORE DELETE ON artifacts
+    BEGIN SELECT RAISE(ABORT, 'artifacts is append-only'); END
+    """.strip()
+
+_MIGRATION_2_STATEMENTS = (
+    "DROP TRIGGER artifacts_no_update",
+    "DROP TRIGGER artifacts_no_delete",
+    "ALTER TABLE artifacts RENAME TO artifacts_v1",
+    _FAILURE_EVIDENCE_ARTIFACTS_TABLE,
+    """
+    INSERT INTO artifacts(run_id, kind, relative_path, sha256, byte_size, created_at)
+    SELECT run_id, kind, relative_path, sha256, byte_size, created_at
+    FROM artifacts_v1
+    """.strip(),
+    "DROP TABLE artifacts_v1",
+    _ARTIFACTS_NO_UPDATE_TRIGGER,
+    _ARTIFACTS_NO_DELETE_TRIGGER,
+)
+
 MIGRATIONS = (
     Migration(
         version=1,
@@ -627,16 +672,27 @@ MIGRATIONS = (
             _MIGRATION_1_STATEMENTS,
         ),
     ),
+    Migration(
+        version=2,
+        name="add_prepare_failure_evidence",
+        statements=_MIGRATION_2_STATEMENTS,
+        checksum=migration_checksum(
+            2,
+            "add_prepare_failure_evidence",
+            _MIGRATION_2_STATEMENTS,
+        ),
+    ),
 )
 
+_ALL_MIGRATION_STATEMENTS = _MIGRATION_1_STATEMENTS + _MIGRATION_2_STATEMENTS
 _EXPECTED_TABLE_SQL = {
     statement.split()[2]: statement
-    for statement in _MIGRATION_1_STATEMENTS
+    for statement in _ALL_MIGRATION_STATEMENTS
     if statement.startswith("CREATE TABLE ")
 }
 _EXPECTED_TRIGGER_SQL = {
     statement.split()[2]: statement
-    for statement in _MIGRATION_1_STATEMENTS
+    for statement in _ALL_MIGRATION_STATEMENTS
     if statement.startswith("CREATE TRIGGER ")
 }
 _EXPECTED_TRIGGER_TABLES = {
@@ -645,7 +701,7 @@ _EXPECTED_TRIGGER_TABLES = {
 }
 _EXPECTED_INDEX_SQL = {
     statement.split()[2]: statement
-    for statement in _MIGRATION_1_STATEMENTS
+    for statement in _ALL_MIGRATION_STATEMENTS
     if statement.startswith("CREATE INDEX ")
 }
 _EXPECTED_INDEX_TABLES = {
@@ -2650,10 +2706,14 @@ class WorkflowLedger:
                     from_version=len(rows),
                     to_version=pending[-1].version,
                 )
+            applied_at = (
+                _canonical_clock_timestamp(self._clock())
+                if pending
+                else None
+            )
             for migration in pending:
                 for statement in migration.statements:
                     self._execute_migration_statement(connection, statement)
-                applied_at = _canonical_clock_timestamp(self._clock())
                 connection.execute(
                     "INSERT INTO schema_migrations("
                     "version, name, checksum, package_version, applied_at"
@@ -3019,7 +3079,7 @@ class WorkflowLedger:
             ).fetchmany(3)
         )
         artifacts = {row["kind"]: row for row in rows}
-        for kind in ArtifactKind:
+        for kind in _PROJECTED_ARTIFACT_KINDS:
             artifact = artifacts.get(kind.value)
             if artifact is None or (
                 artifact["sha256"] != values[f"{kind.value}_sha256"]
@@ -3320,6 +3380,14 @@ class WorkflowLedger:
             raise _state_conflict("workflow transition is not allowed")
         revision = _positive_revision(expected_revision)
         name = _event_type(event_type)
+        if (
+            source is WorkflowState.PREPARING
+            and target is WorkflowState.FAILED
+            and name == "failed"
+        ):
+            raise _state_conflict(
+                "failed prepare events require record_prepare_failure"
+            )
         copied_payload, payload_text = _event_payload(payload)
         elapsed = _elapsed_ms(elapsed_ms)
         patch = _projection_patch(projection_patch)
@@ -3352,6 +3420,10 @@ class WorkflowLedger:
         elapsed_ms: int | None = None,
     ) -> ArtifactMutationResult:
         canonical_metadata = _artifact_metadata(metadata)
+        if canonical_metadata.kind is ArtifactKind.FAILURE_EVIDENCE:
+            raise _state_conflict(
+                "failure evidence requires record_prepare_failure"
+            )
         state = _workflow_state(expected_state)
         if state is not WorkflowState.PREPARING:
             raise _state_conflict(
@@ -3434,6 +3506,128 @@ class WorkflowLedger:
                 created_at=created_at,
             )
             return ArtifactMutationResult(run=updated, artifact=artifact, event=event)
+
+        return self._write(record)
+
+    def record_prepare_failure(
+        self,
+        metadata: ArtifactMetadataV1,
+        *,
+        expected_revision: int,
+        error_code: ErrorCode | str,
+        error_summary: str,
+        event_type: str,
+        event_payload: Mapping[str, object],
+        elapsed_ms: int | None = None,
+    ) -> ArtifactMutationResult:
+        """Atomically record private prepare failure evidence and fail the run."""
+        canonical_metadata = _artifact_metadata(metadata)
+        if canonical_metadata.kind is not ArtifactKind.FAILURE_EVIDENCE:
+            raise _state_conflict(
+                "prepare failure requires failure evidence metadata"
+            )
+        revision = _positive_revision(expected_revision)
+        name = _event_type(event_type)
+        if name != "failed":
+            raise _state_conflict("prepare failure event type must be failed")
+        payload, payload_text = _event_payload(event_payload)
+        patch = _projection_patch(
+            {
+                "terminal_error_code": error_code,
+                "terminal_error_summary": error_summary,
+            }
+        )
+        if payload != {"error_code": patch["terminal_error_code"]}:
+            raise _state_conflict(
+                "prepare failure event payload must contain only error_code"
+            )
+        elapsed = _elapsed_ms(elapsed_ms)
+        created_at = _canonical_datetime(canonical_metadata.created_at)
+        _validate_projection_policy(
+            source=WorkflowState.PREPARING,
+            target=WorkflowState.FAILED,
+            event_type=name,
+            patch=patch,
+        )
+
+        def record(connection: sqlite3.Connection) -> ArtifactMutationResult:
+            current = self._run_for_cas(
+                connection,
+                run_id=canonical_metadata.run_id,
+                expected_state=WorkflowState.PREPARING,
+                expected_revision=revision,
+            )
+            duplicate = connection.execute(
+                "SELECT 1 FROM artifacts WHERE run_id = ? AND kind = ?",
+                (
+                    canonical_metadata.run_id,
+                    ArtifactKind.FAILURE_EVIDENCE.value,
+                ),
+            ).fetchone()
+            path_duplicate = connection.execute(
+                "SELECT 1 FROM artifacts WHERE relative_path = ?",
+                (canonical_metadata.relative_path,),
+            ).fetchone()
+            if duplicate is not None or path_duplicate is not None:
+                raise _state_conflict("artifact is already recorded")
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    run_id, kind, relative_path, sha256, byte_size, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    canonical_metadata.run_id,
+                    canonical_metadata.kind.value,
+                    canonical_metadata.relative_path,
+                    canonical_metadata.sha256,
+                    canonical_metadata.byte_size,
+                    created_at,
+                ),
+            )
+            timestamp = _canonical_clock_timestamp(self._clock())
+            cursor = connection.execute(
+                "UPDATE runs SET state = ?, revision = ?, updated_at = ?, "
+                "terminal_error_code = ?, terminal_error_summary = ? "
+                "WHERE run_id = ? AND state = ? AND revision = ?",
+                (
+                    WorkflowState.FAILED.value,
+                    current.revision + 1,
+                    timestamp,
+                    patch["terminal_error_code"],
+                    patch["terminal_error_summary"],
+                    canonical_metadata.run_id,
+                    WorkflowState.PREPARING.value,
+                    revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise _state_conflict("workflow state or revision is stale")
+            event = self._append_event_locked(
+                connection,
+                run_id=canonical_metadata.run_id,
+                event_type=name,
+                payload=payload,
+                payload_text=payload_text,
+                timestamp=timestamp,
+                elapsed_ms=elapsed,
+            )
+            updated = self._select_run(connection, canonical_metadata.run_id)
+            if updated is None:
+                raise _MigrationError("updated run disappeared")
+            artifact = ArtifactRecord(
+                run_id=canonical_metadata.run_id,
+                kind=canonical_metadata.kind,
+                relative_path=canonical_metadata.relative_path,
+                sha256=canonical_metadata.sha256,
+                byte_size=canonical_metadata.byte_size,
+                created_at=created_at,
+            )
+            return ArtifactMutationResult(
+                run=updated,
+                artifact=artifact,
+                event=event,
+            )
 
         return self._write(record)
 
@@ -3986,6 +4180,7 @@ class WorkflowLedger:
                     prepare_event_evidence: dict[str, object] = {}
                     commit_intent_event_evidence: dict[str, object] = {}
                     commit_result_event_evidence: dict[str, object] = {}
+                    failure_event_payloads: list[Mapping[str, object]] = []
                     approval_bindings: set[str] = set()
                     while True:
                         event_rows = event_cursor.fetchmany(100)
@@ -4125,6 +4320,8 @@ class WorkflowLedger:
                                         commit_result_event_evidence[field] = (
                                             payload_value[field]
                                         )
+                                if event_name == "failed":
+                                    failure_event_payloads.append(payload_value)
                                 binding = payload_value.get("binding_sha256")
                                 if (
                                     isinstance(binding, str)
@@ -4209,7 +4406,7 @@ class WorkflowLedger:
                     artifacts_by_kind = {
                         row["kind"]: row for row in artifact_rows
                     }
-                    for kind in ArtifactKind:
+                    for kind in _PROJECTED_ARTIFACT_KINDS:
                         artifact = artifacts_by_kind.get(kind.value)
                         projected_hash = run_row[f"{kind.value}_sha256"]
                         projected_size = run_row[f"{kind.value}_size_bytes"]
@@ -4244,6 +4441,35 @@ class WorkflowLedger:
                             "run state is invalid",
                             finding_run_id=current_run_id,
                         )
+                    failure_artifact = artifacts_by_kind.get(
+                        ArtifactKind.FAILURE_EVIDENCE.value
+                    )
+                    if failure_event_payloads:
+                        failure_payload_valid = (
+                            len(failure_event_payloads) == 1
+                            and set(failure_event_payloads[0]) == {"error_code"}
+                            and failure_event_payloads[0]["error_code"]
+                            == run_row["terminal_error_code"]
+                        )
+                        if (
+                            current_state is not WorkflowState.FAILED
+                            or failure_artifact is None
+                            or not failure_payload_valid
+                        ):
+                            add(
+                                "failure_evidence_invariant",
+                                "failed prepare event lacks matching private evidence",
+                                finding_run_id=current_run_id,
+                            )
+                    if failure_artifact is not None and (
+                        current_state is not WorkflowState.FAILED
+                        or not failure_event_payloads
+                    ):
+                        add(
+                            "failure_evidence_invariant",
+                            "private failure evidence contradicts workflow history",
+                            finding_run_id=current_run_id,
+                        )
                     if current_state in _PREPARED_STATES:
                         required_prepare_fields = (
                             "source_sha256",
@@ -4274,7 +4500,7 @@ class WorkflowLedger:
                         )
                         if not prepare_complete or any(
                             kind.value not in artifacts_by_kind
-                            for kind in ArtifactKind
+                            for kind in _PROJECTED_ARTIFACT_KINDS
                         ) or any(
                             field not in prepare_event_evidence
                             for field in _PREPARE_PROJECTION_EVENTS
@@ -4686,7 +4912,7 @@ def _artifact_kind_value(value: object) -> ArtifactKind:
             return ArtifactKind(value)
         except ValueError:
             pass
-    raise _invalid("artifact kind must be candidate or diff")
+    raise _invalid("artifact kind is invalid")
 
 
 def _bounded_text(value: object, *, field: str, maximum: int) -> str:
