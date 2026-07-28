@@ -292,6 +292,51 @@ class LedgerRunRecord:
     terminal_error_summary: str | None
 
 
+def approval_binding_for_run(
+    run: LedgerRunRecord,
+    *,
+    plan_schema_version: str,
+) -> str:
+    """Return the closed approval binding for one authoritative run row."""
+    if not isinstance(run, LedgerRunRecord):
+        raise _invalid("workflow run is invalid")
+    version = _bounded_text(
+        plan_schema_version,
+        field="plan_schema_version",
+        maximum=64,
+    )
+    required = (
+        run.source_sha256,
+        run.prior_destination_state,
+        run.plan_sha256,
+        run.candidate_sha256,
+        run.diff_sha256,
+        run.expires_at,
+    )
+    if any(value is None for value in required):
+        raise _state_conflict("workflow approval evidence is incomplete")
+    payload = {
+        "run_id": run.run_id,
+        "graph_version": run.graph_version,
+        "plan_schema_version": version,
+        "source_path_sha256": hashlib.sha256(
+            run.source_path.encode("utf-8")
+        ).hexdigest(),
+        "destination_path_sha256": hashlib.sha256(
+            run.destination_path.encode("utf-8")
+        ).hexdigest(),
+        "source_sha256": run.source_sha256,
+        "prior_destination_state": run.prior_destination_state.value,
+        "prior_destination_sha256": run.prior_destination_sha256,
+        "plan_sha256": run.plan_sha256,
+        "candidate_sha256": run.candidate_sha256,
+        "diff_sha256": run.diff_sha256,
+        "approval_mode": run.approval_mode.value,
+        "expires_at": run.expires_at,
+    }
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
 @dataclass(frozen=True)
 class EventRecord:
     run_id: str
@@ -358,6 +403,14 @@ class DecisionMutationResult:
     run: LedgerRunRecord
     approval: ApprovalRecord
     event: EventRecord
+
+
+@dataclass(frozen=True)
+class ApprovalOrExpireResult:
+    run: LedgerRunRecord
+    approval: ApprovalRecord | None
+    event: EventRecord
+    expired: bool
 
 
 @dataclass(frozen=True)
@@ -3797,6 +3850,202 @@ class WorkflowLedger:
 
         return self._write(record)
 
+    def approval_binding(
+        self,
+        run_id: str,
+        *,
+        plan_schema_version: str,
+    ) -> str:
+        """Compute a binding from an authoritative durable read."""
+        run = self.get_run(run_id)
+        if run is None:
+            raise _state_conflict("run does not exist")
+        return approval_binding_for_run(
+            run,
+            plan_schema_version=plan_schema_version,
+        )
+
+    def record_approval_or_expire(
+        self,
+        run_id: str,
+        *,
+        expected_revision: int,
+        operator: str | None,
+        host: str | None,
+        terminal_present: bool,
+        plan_schema_version: str,
+    ) -> ApprovalOrExpireResult:
+        """Atomically approve exact durable evidence or persist its expiry."""
+        canonical_run_id = _run_id(run_id)
+        revision = _positive_revision(expected_revision)
+        operator_text = _optional_text(
+            operator,
+            field="operator",
+            maximum=_MAX_METADATA_CHARS,
+        )
+        host_text = _optional_text(
+            host,
+            field="host",
+            maximum=_MAX_METADATA_CHARS,
+        )
+        if type(terminal_present) is not bool:
+            raise _invalid("terminal_present must be a boolean")
+        version = _bounded_text(
+            plan_schema_version,
+            field="plan_schema_version",
+            maximum=64,
+        )
+
+        def record(connection: sqlite3.Connection) -> ApprovalOrExpireResult:
+            current = self._run_for_cas(
+                connection,
+                run_id=canonical_run_id,
+                expected_state=WorkflowState.AWAITING_APPROVAL,
+                expected_revision=revision,
+            )
+            if current.approval_mode is not ApprovalMode.CLI:
+                raise _state_conflict(
+                    "approval source contradicts the configured approval mode"
+                )
+            self._require_complete_prepare(
+                connection,
+                current,
+                {},
+                require_expiry=True,
+            )
+            duplicate = connection.execute(
+                "SELECT 1 FROM approvals WHERE run_id = ?",
+                (canonical_run_id,),
+            ).fetchone()
+            if duplicate is not None:
+                raise _state_conflict("workflow decision is immutable")
+            timestamp = _canonical_clock_timestamp(self._clock())
+            if current.expires_at is None:
+                raise _state_conflict("approval-bearing state requires expires_at")
+            instant = datetime.fromisoformat(timestamp.removesuffix("Z") + "+00:00")
+            expiry = datetime.fromisoformat(
+                current.expires_at.removesuffix("Z") + "+00:00"
+            )
+            if instant >= expiry:
+                cursor = connection.execute(
+                    "UPDATE runs SET state = ?, revision = ?, updated_at = ? "
+                    "WHERE run_id = ? AND state = ? AND revision = ?",
+                    (
+                        WorkflowState.EXPIRED.value,
+                        current.revision + 1,
+                        timestamp,
+                        canonical_run_id,
+                        WorkflowState.AWAITING_APPROVAL.value,
+                        revision,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise _state_conflict("workflow state or revision is stale")
+                payload = {"expires_at": current.expires_at}
+                payload_text = canonical_json(payload).decode("utf-8")
+                event = self._append_event_locked(
+                    connection,
+                    run_id=canonical_run_id,
+                    event_type="approval_expired",
+                    payload=payload,
+                    payload_text=payload_text,
+                    timestamp=timestamp,
+                    elapsed_ms=None,
+                )
+                updated = self._select_run(connection, canonical_run_id)
+                if updated is None:
+                    raise _MigrationError("updated run disappeared")
+                return ApprovalOrExpireResult(
+                    run=updated,
+                    approval=None,
+                    event=event,
+                    expired=True,
+                )
+
+            binding = approval_binding_for_run(
+                current,
+                plan_schema_version=version,
+            )
+            connection.execute(
+                """
+                INSERT INTO approvals(
+                    run_id, decision, source, operator, host, terminal_present,
+                    binding_sha256, created_at, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    canonical_run_id,
+                    ApprovalDecision.APPROVED.value,
+                    ApprovalSource.CLI.value,
+                    operator_text,
+                    host_text,
+                    int(terminal_present),
+                    binding,
+                    timestamp,
+                    current.expires_at,
+                ),
+            )
+            cursor = connection.execute(
+                """
+                UPDATE runs SET
+                    state = ?, revision = ?, updated_at = ?, approved_at = ?,
+                    approval_decision = ?, approval_source = ?,
+                    approval_summary = ?
+                WHERE run_id = ? AND state = ? AND revision = ?
+                """,
+                (
+                    WorkflowState.APPROVED.value,
+                    current.revision + 1,
+                    timestamp,
+                    timestamp,
+                    ApprovalDecision.APPROVED.value,
+                    ApprovalSource.CLI.value,
+                    "Exact workflow evidence approved",
+                    canonical_run_id,
+                    WorkflowState.AWAITING_APPROVAL.value,
+                    revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise _state_conflict("workflow state or revision is stale")
+            payload = {
+                "binding_sha256": binding,
+                "decision": ApprovalDecision.APPROVED.value,
+                "source": ApprovalSource.CLI.value,
+            }
+            payload_text = canonical_json(payload).decode("utf-8")
+            event = self._append_event_locked(
+                connection,
+                run_id=canonical_run_id,
+                event_type="approval_recorded",
+                payload=payload,
+                payload_text=payload_text,
+                timestamp=timestamp,
+                elapsed_ms=None,
+            )
+            updated = self._select_run(connection, canonical_run_id)
+            if updated is None:
+                raise _MigrationError("updated run disappeared")
+            approval = ApprovalRecord(
+                run_id=canonical_run_id,
+                decision=ApprovalDecision.APPROVED,
+                source=ApprovalSource.CLI,
+                operator=operator_text,
+                host=host_text,
+                terminal_present=terminal_present,
+                binding_sha256=binding,
+                created_at=timestamp,
+                expires_at=current.expires_at,
+            )
+            return ApprovalOrExpireResult(
+                run=updated,
+                approval=approval,
+                event=event,
+                expired=False,
+            )
+
+        return self._write(record)
+
     def get_run(self, run_id: str) -> LedgerRunRecord | None:
         canonical_run_id = _run_id(run_id)
         connection = self._connect_existing()
@@ -5237,6 +5486,7 @@ def _reject_json_constant(value: str) -> object:
 
 __all__ = [
     "MIGRATIONS",
+    "ApprovalOrExpireResult",
     "ApprovalRecord",
     "ArtifactMutationResult",
     "ArtifactRecord",
@@ -5249,5 +5499,6 @@ __all__ = [
     "LedgerRunRecord",
     "Migration",
     "WorkflowLedger",
+    "approval_binding_for_run",
     "migration_checksum",
 ]

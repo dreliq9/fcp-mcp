@@ -1256,19 +1256,11 @@ class WorkflowEngine:
         )
         return result.run
 
-    def _approval_run(self, run_id: str) -> LedgerRunRecord:
-        run = self.ledger.get_run(run_id)
-        if run is None:
-            raise _coded(
-                ErrorCode.WORKFLOW_STATE_CONFLICT,
-                "workflow run does not exist",
-            )
-        return run
-
     def effective_state(self, run_id: str) -> WorkflowState:
         """Return effective approval expiry without changing the ledger."""
         return effective_workflow_state(
-            self._approval_run(run_id),
+            self.ledger,
+            run_id,
             now=self.utc_clock(),
         )
 
@@ -1286,9 +1278,8 @@ class WorkflowEngine:
         """Apply the CLI approval policy to one exact prepared run."""
         return apply_cli_approval(
             self.ledger,
-            self._approval_run(run_id),
+            run_id,
             plan_schema_version=SCHEMA_VERSION,
-            now=self.utc_clock(),
             input_stream=input_stream,
             output_stream=output_stream,
             yes=yes,
@@ -1306,9 +1297,8 @@ class WorkflowEngine:
         """Stage client evidence for Task 17's atomic commit boundary."""
         return stage_client_approval(
             self.ledger,
-            self._approval_run(run_id),
+            run_id,
             plan_schema_version=SCHEMA_VERSION,
-            now=self.utc_clock(),
             expect_candidate_sha256=expect_candidate_sha256,
         )
 
@@ -1319,17 +1309,19 @@ class WorkflowEngine:
         reason: str | None = None,
         operator: str | None = None,
         host: str | None = None,
-        terminal_present: bool = False,
+        input_stream: TextIO | None = None,
+        output_stream: TextIO | None = None,
     ) -> DecisionMutationResult:
         """Persist one immutable approval rejection."""
         return reject_workflow(
             self.ledger,
-            self._approval_run(run_id),
+            run_id,
             plan_schema_version=SCHEMA_VERSION,
             reason=reason,
             operator=operator,
             host=host,
-            terminal_present=terminal_present,
+            input_stream=input_stream,
+            output_stream=output_stream,
         )
 
     def cancel(
@@ -1341,7 +1333,7 @@ class WorkflowEngine:
         """Cancel a legal workflow run while preserving its evidence."""
         return cancel_workflow(
             self.ledger,
-            self._approval_run(run_id),
+            run_id,
             reason=reason,
         )
 

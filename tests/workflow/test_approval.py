@@ -4,7 +4,7 @@ import hashlib
 import io
 import threading
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -18,9 +18,22 @@ from fcp_mcp.workflow.approval import (
     approval_binding,
     effective_state,
 )
+from fcp_mcp.workflow.approval import (
+    approve_cli as approve_cli_policy,
+)
+from fcp_mcp.workflow.approval import (
+    approve_client as approve_client_policy,
+)
+from fcp_mcp.workflow.approval import (
+    reject as reject_policy,
+)
 from fcp_mcp.workflow.artifacts import ArtifactStore, StatePaths
 from fcp_mcp.workflow.engine import SCHEMA_VERSION, WorkflowEngine
-from fcp_mcp.workflow.ledger import LedgerRunRecord, WorkflowLedger
+from fcp_mcp.workflow.ledger import (
+    LedgerRunRecord,
+    WorkflowLedger,
+    approval_binding_for_run,
+)
 from fcp_mcp.workflow.models import (
     AddMarkerOperation,
     ApprovalDecision,
@@ -72,6 +85,34 @@ class _BrokenTTY(_TTY):
 class _UnknownTerminal(io.StringIO):
     def isatty(self) -> bool:
         raise OSError("terminal status unavailable")
+
+
+class _ExplodingStream(_TTY):
+    def __init__(self, boundary: str):
+        super().__init__("approve\n")
+        self.boundary = boundary
+
+    def isatty(self):
+        if self.boundary == "isatty":
+            raise RuntimeError("/private/raw terminal identity")
+        return True
+
+    def write(self, value):
+        if self.boundary == "write":
+            raise RuntimeError("/private/raw terminal write")
+        return super().write(value)
+
+    def flush(self):
+        if self.boundary == "flush":
+            raise RuntimeError("/private/raw terminal flush")
+        return super().flush()
+
+    def readline(self, *args, **kwargs):
+        if self.boundary == "read":
+            raise RuntimeError("/private/raw terminal read")
+        if self.boundary == "type":
+            return object()
+        return super().readline(*args, **kwargs)
 
 
 def _config(tmp_path: Path, mode: ApprovalMode = ApprovalMode.CLI) -> RuntimeConfig:
@@ -145,7 +186,7 @@ def _approve_interactively(engine: WorkflowEngine, run_id: str = RUN_ID):
 
 
 def test_approval_binding_uses_exact_closed_canonical_evidence(tmp_path: Path):
-    _, _, run = _prepared(tmp_path)
+    _, ledger, run = _prepared(tmp_path)
     expected_fields = {
         "run_id": run.run_id,
         "graph_version": run.graph_version,
@@ -163,7 +204,14 @@ def test_approval_binding_uses_exact_closed_canonical_evidence(tmp_path: Path):
     }
     expected = hashlib.sha256(canonical_json(expected_fields)).hexdigest()
 
-    assert approval_binding(run, plan_schema_version=SCHEMA_VERSION) == expected
+    assert (
+        approval_binding(
+            ledger,
+            run.run_id,
+            plan_schema_version=SCHEMA_VERSION,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -189,10 +237,16 @@ def test_approval_binding_changes_when_any_run_field_changes(
     value: object,
 ):
     _, _, run = _prepared(tmp_path)
-    original = approval_binding(run, plan_schema_version=SCHEMA_VERSION)
+    original = approval_binding_for_run(
+        run,
+        plan_schema_version=SCHEMA_VERSION,
+    )
 
     assert (
-        approval_binding(replace(run, **{field: value}), plan_schema_version=SCHEMA_VERSION)
+        approval_binding_for_run(
+            replace(run, **{field: value}),
+            plan_schema_version=SCHEMA_VERSION,
+        )
         != original
     )
 
@@ -200,9 +254,33 @@ def test_approval_binding_changes_when_any_run_field_changes(
 def test_approval_binding_changes_with_plan_schema_version(tmp_path: Path):
     _, _, run = _prepared(tmp_path)
 
-    assert approval_binding(run, plan_schema_version="2") != approval_binding(
-        run, plan_schema_version=SCHEMA_VERSION
+    assert approval_binding_for_run(
+        run,
+        plan_schema_version="2",
+    ) != approval_binding_for_run(
+        run,
+        plan_schema_version=SCHEMA_VERSION,
     )
+
+
+def test_approval_binding_preserves_exact_unicode_path_bytes(tmp_path: Path):
+    _, _, run = _prepared(tmp_path)
+    composed = replace(run, source_path="/private/Caf\u00e9.fcpxml")
+    decomposed = replace(run, source_path="/private/Cafe\u0301.fcpxml")
+
+    composed_binding = approval_binding_for_run(
+        composed,
+        plan_schema_version=SCHEMA_VERSION,
+    )
+    decomposed_binding = approval_binding_for_run(
+        decomposed,
+        plan_schema_version=SCHEMA_VERSION,
+    )
+
+    assert composed_binding != decomposed_binding
+    assert hashlib.sha256(composed.source_path.encode("utf-8")).hexdigest() != hashlib.sha256(
+        decomposed.source_path.encode("utf-8")
+    ).hexdigest()
 
 
 @pytest.mark.parametrize("version", ["", "v" * 65, 1])
@@ -213,7 +291,7 @@ def test_approval_binding_rejects_invalid_plan_schema_version(
     _, _, run = _prepared(tmp_path)
 
     with pytest.raises(FCPMCPError) as error:
-        approval_binding(run, plan_schema_version=version)
+        approval_binding_for_run(run, plan_schema_version=version)
 
     _assert_code(error, ErrorCode.INVALID_ARGUMENTS)
 
@@ -222,11 +300,11 @@ def test_approval_binding_rejects_wrong_type_and_incomplete_evidence(tmp_path: P
     _, _, run = _prepared(tmp_path)
 
     with pytest.raises(FCPMCPError) as wrong_type:
-        approval_binding(object(), plan_schema_version=SCHEMA_VERSION)
+        approval_binding_for_run(object(), plan_schema_version=SCHEMA_VERSION)
     _assert_code(wrong_type, ErrorCode.INVALID_ARGUMENTS)
 
     with pytest.raises(FCPMCPError) as incomplete:
-        approval_binding(
+        approval_binding_for_run(
             replace(run, diff_sha256=None),
             plan_schema_version=SCHEMA_VERSION,
         )
@@ -359,18 +437,20 @@ def test_noninteractive_cli_approval_records_terminal_absent(tmp_path: Path):
     assert result.approval.terminal_present is False
 
 
-def test_unavailable_terminal_detection_fails_closed_to_batch_policy(tmp_path: Path):
-    engine, _, run = _prepared(tmp_path)
+def test_unavailable_terminal_detection_returns_bounded_coded_error(tmp_path: Path):
+    engine, ledger, run = _prepared(tmp_path)
 
-    result = engine.approve_cli(
-        run.run_id,
-        input_stream=_UnknownTerminal(),
-        output_stream=_TTY(),
-        yes=True,
-        expect_candidate_sha256=run.candidate_sha256,
-    )
+    with pytest.raises(FCPMCPError) as error:
+        engine.approve_cli(
+            run.run_id,
+            input_stream=_UnknownTerminal(),
+            output_stream=_TTY(),
+            yes=True,
+            expect_candidate_sha256=run.candidate_sha256,
+        )
 
-    assert result.approval.terminal_present is False
+    _assert_code(error, ErrorCode.APPROVAL_REQUIRED)
+    assert ledger.get_approval(run.run_id) is None
 
 
 def test_client_approval_is_immutable_commit_request_metadata_not_a_decision(
@@ -385,7 +465,11 @@ def test_client_approval_is_immutable_commit_request_metadata_not_a_decision(
 
     assert approval == ClientApproval(
         run_id=run.run_id,
-        binding_sha256=approval_binding(run, plan_schema_version=SCHEMA_VERSION),
+        binding_sha256=approval_binding(
+            ledger,
+            run.run_id,
+            plan_schema_version=SCHEMA_VERSION,
+        ),
         source=ApprovalSource.CLIENT,
         strength=ApprovalStrength.CLIENT_UNVERIFIED_HUMAN,
         expires_at=run.expires_at,
@@ -516,30 +600,26 @@ def test_effective_expiry_is_read_only(tmp_path: Path):
     event_count = len(ledger.list_events(run.run_id))
     now[0] = datetime(2026, 7, 28, 12, 10, 0, tzinfo=timezone.utc)
 
-    assert effective_state(run, now=now[0]) is WorkflowState.EXPIRED
+    assert effective_state(ledger, run.run_id, now=now[0]) is WorkflowState.EXPIRED
     assert engine.effective_state(run.run_id) is WorkflowState.EXPIRED
     assert ledger.get_run(run.run_id).state is WorkflowState.AWAITING_APPROVAL
     assert len(ledger.list_events(run.run_id)) == event_count
 
 
 def test_effective_state_rejects_invalid_run_clock_and_expiry(tmp_path: Path):
-    _, _, run = _prepared(tmp_path)
+    _, ledger, run = _prepared(tmp_path)
 
     with pytest.raises(FCPMCPError) as wrong_run:
-        effective_state(object(), now=NOW)
+        effective_state(ledger, object(), now=NOW)
     _assert_code(wrong_run, ErrorCode.INVALID_ARGUMENTS)
 
     with pytest.raises(FCPMCPError) as wrong_clock:
-        effective_state(run, now="not-a-clock")
+        effective_state(ledger, run.run_id, now="not-a-clock")
     _assert_code(wrong_clock, ErrorCode.INVALID_ARGUMENTS)
 
     with pytest.raises(FCPMCPError) as naive_clock:
-        effective_state(run, now=NOW.replace(tzinfo=None))
+        effective_state(ledger, run.run_id, now=NOW.replace(tzinfo=None))
     _assert_code(naive_clock, ErrorCode.INVALID_ARGUMENTS)
-
-    with pytest.raises(FCPMCPError) as bad_expiry:
-        effective_state(replace(run, expires_at="not-a-time"), now=NOW)
-    _assert_code(bad_expiry, ErrorCode.WORKFLOW_STATE_CONFLICT)
 
 
 def test_expired_approve_atomically_transitions_then_raises(tmp_path: Path):
@@ -568,3 +648,145 @@ def test_approved_record_is_not_consumed_before_committing_cas(tmp_path: Path):
     assert approved.run.state is WorkflowState.APPROVED
     assert ledger.get_approval(run.run_id) == approved.approval
     assert ledger.get_run(run.run_id).state is WorkflowState.APPROVED
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("candidate_sha256", HASH_A),
+        ("diff_sha256", HASH_B),
+        ("source_path", "/private/forged-source.fcpxml"),
+        ("destination_path", "/private/forged-destination.fcpxml"),
+        ("expires_at", "2026-07-28T12:11:00Z"),
+        ("approval_mode", ApprovalMode.CLIENT),
+    ],
+)
+def test_public_cli_policy_ignores_same_revision_forged_snapshots(
+    tmp_path: Path,
+    field: str,
+    value: object,
+):
+    _, ledger, durable = _prepared(tmp_path)
+    forged = replace(durable, **{field: value})
+
+    result = approve_cli_policy(
+        ledger,
+        forged.run_id,
+        plan_schema_version=SCHEMA_VERSION,
+        input_stream=_TTY("approve\n"),
+        output_stream=_TTY(),
+    )
+
+    durable_binding = approval_binding(
+        ledger,
+        durable.run_id,
+        plan_schema_version=SCHEMA_VERSION,
+    )
+    assert result.approval.binding_sha256 == durable_binding
+    assert result.approval.binding_sha256 != hashlib.sha256(
+        canonical_json(
+            {
+                "run_id": forged.run_id,
+                "graph_version": forged.graph_version,
+                "plan_schema_version": SCHEMA_VERSION,
+                "source_path_sha256": hashlib.sha256(
+                    forged.source_path.encode("utf-8")
+                ).hexdigest(),
+                "destination_path_sha256": hashlib.sha256(
+                    forged.destination_path.encode("utf-8")
+                ).hexdigest(),
+                "source_sha256": forged.source_sha256,
+                "prior_destination_state": forged.prior_destination_state.value,
+                "prior_destination_sha256": forged.prior_destination_sha256,
+                "plan_sha256": forged.plan_sha256,
+                "candidate_sha256": forged.candidate_sha256,
+                "diff_sha256": forged.diff_sha256,
+                "approval_mode": forged.approval_mode.value,
+                "expires_at": forged.expires_at,
+            }
+        )
+    ).hexdigest()
+
+
+def test_reject_and_client_staging_reload_authoritative_rows(tmp_path: Path):
+    _, reject_ledger, reject_run = _prepared(tmp_path / "reject")
+    forged_reject = replace(reject_run, diff_sha256=HASH_A)
+    rejected = reject_policy(
+        reject_ledger,
+        forged_reject.run_id,
+        plan_schema_version=SCHEMA_VERSION,
+    )
+    assert rejected.approval.binding_sha256 == approval_binding(
+        reject_ledger,
+        reject_run.run_id,
+        plan_schema_version=SCHEMA_VERSION,
+    )
+
+    _, client_ledger, client_run = _prepared(
+        tmp_path / "client",
+        mode=ApprovalMode.CLIENT,
+    )
+    forged_client = replace(client_run, candidate_sha256=HASH_A)
+    staged = approve_client_policy(
+        client_ledger,
+        forged_client.run_id,
+        plan_schema_version=SCHEMA_VERSION,
+        expect_candidate_sha256=client_run.candidate_sha256,
+    )
+    assert staged.binding_sha256 == approval_binding(
+        client_ledger,
+        client_run.run_id,
+        plan_schema_version=SCHEMA_VERSION,
+    )
+
+
+def test_ledger_clock_is_authoritative_at_expiry_boundary(tmp_path: Path):
+    engine, ledger, run = _prepared(tmp_path)
+    expiry = datetime.fromisoformat(run.expires_at.removesuffix("Z") + "+00:00")
+    engine.utc_clock = lambda: expiry.replace(microsecond=0) - timedelta(microseconds=1)
+    ledger._clock = lambda: expiry
+
+    with pytest.raises(FCPMCPError) as error:
+        _approve_interactively(engine, run.run_id)
+
+    _assert_code(error, ErrorCode.APPROVAL_EXPIRED)
+    assert ledger.get_run(run.run_id).state is WorkflowState.EXPIRED
+    assert ledger.get_approval(run.run_id) is None
+    assert [event.event_type for event in ledger.list_events(run.run_id)].count(
+        "approval_expired"
+    ) == 1
+
+
+@pytest.mark.parametrize("boundary", ["isatty", "write", "flush", "read", "type"])
+def test_terminal_boundary_failures_are_bounded_coded_and_nonmutating(
+    tmp_path: Path,
+    boundary: str,
+):
+    engine, ledger, run = _prepared(tmp_path)
+    stream = _ExplodingStream(boundary)
+    input_stream = stream if boundary in {"isatty", "read", "type"} else _TTY("approve\n")
+    output_stream = stream if boundary in {"write", "flush"} else _TTY()
+
+    with pytest.raises(FCPMCPError) as error:
+        engine.approve_cli(
+            run.run_id,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+
+    _assert_code(error, ErrorCode.APPROVAL_REQUIRED)
+    assert "/private/" not in str(error.value)
+    assert ledger.get_run(run.run_id).state is WorkflowState.AWAITING_APPROVAL
+    assert ledger.get_approval(run.run_id) is None
+
+
+def test_reject_terminal_presence_is_derived_from_streams(tmp_path: Path):
+    engine, _, run = _prepared(tmp_path)
+
+    result = engine.reject(
+        run.run_id,
+        input_stream=_TTY(),
+        output_stream=_TTY(),
+    )
+
+    assert result.approval.terminal_present is True

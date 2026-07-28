@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,13 +13,13 @@ from fcp_mcp.workflow.ledger import (
     DecisionMutationResult,
     LedgerRunRecord,
     WorkflowLedger,
+    approval_binding_for_run,
 )
 from fcp_mcp.workflow.models import (
     ApprovalDecision,
     ApprovalSource,
     ApprovalStrength,
     WorkflowState,
-    canonical_json,
 )
 
 _CONFIRMATION = "approve"
@@ -65,73 +64,37 @@ def _parse_utc(value: str | None) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _path_sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def _complete_binding_fields(
-    run: LedgerRunRecord,
-    *,
-    plan_schema_version: str,
-) -> dict[str, object]:
-    if (
-        not isinstance(plan_schema_version, str)
-        or not plan_schema_version
-        or len(plan_schema_version) > 64
-    ):
-        raise _coded(
-            ErrorCode.INVALID_ARGUMENTS,
-            "plan schema version is invalid",
-        )
-    required = (
-        run.source_sha256,
-        run.prior_destination_state,
-        run.plan_sha256,
-        run.candidate_sha256,
-        run.diff_sha256,
-        run.expires_at,
-    )
-    if any(value is None for value in required):
-        raise _coded(
-            ErrorCode.WORKFLOW_STATE_CONFLICT,
-            "workflow approval evidence is incomplete",
-        )
-    return {
-        "run_id": run.run_id,
-        "graph_version": run.graph_version,
-        "plan_schema_version": plan_schema_version,
-        "source_path_sha256": _path_sha256(run.source_path),
-        "destination_path_sha256": _path_sha256(run.destination_path),
-        "source_sha256": run.source_sha256,
-        "prior_destination_state": run.prior_destination_state.value,
-        "prior_destination_sha256": run.prior_destination_sha256,
-        "plan_sha256": run.plan_sha256,
-        "candidate_sha256": run.candidate_sha256,
-        "diff_sha256": run.diff_sha256,
-        "approval_mode": run.approval_mode.value,
-        "expires_at": run.expires_at,
-    }
-
-
 def approval_binding(
-    run: LedgerRunRecord,
+    ledger: WorkflowLedger,
+    run_id: str,
     *,
     plan_schema_version: str,
 ) -> str:
-    """Hash exactly the durable evidence authorized by the approval design."""
-    if not isinstance(run, LedgerRunRecord):
-        raise _coded(ErrorCode.INVALID_ARGUMENTS, "workflow run is invalid")
-    payload = _complete_binding_fields(
-        run,
+    """Hash exactly one authoritative durable workflow projection."""
+    return ledger.approval_binding(
+        run_id,
         plan_schema_version=plan_schema_version,
     )
-    return hashlib.sha256(canonical_json(payload)).hexdigest()
 
 
-def effective_state(run: LedgerRunRecord, *, now: datetime) -> WorkflowState:
+def _run(ledger: WorkflowLedger, run_id: str) -> LedgerRunRecord:
+    run = ledger.get_run(run_id)
+    if run is None:
+        raise _coded(
+            ErrorCode.WORKFLOW_STATE_CONFLICT,
+            "workflow run does not exist",
+        )
+    return run
+
+
+def effective_state(
+    ledger: WorkflowLedger,
+    run_id: str,
+    *,
+    now: datetime,
+) -> WorkflowState:
     """Return effective expiry without mutating the durable projection."""
-    if not isinstance(run, LedgerRunRecord):
-        raise _coded(ErrorCode.INVALID_ARGUMENTS, "workflow run is invalid")
+    run = _run(ledger, run_id)
     if run.state in {WorkflowState.AWAITING_APPROVAL, WorkflowState.APPROVED} and _utc(
         now
     ) >= _parse_utc(run.expires_at):
@@ -152,30 +115,20 @@ def _require_awaiting(run: LedgerRunRecord, mode: ApprovalMode) -> None:
         )
 
 
-def _expire_and_raise(
-    ledger: WorkflowLedger,
-    run: LedgerRunRecord,
-    *,
-    now: datetime,
-) -> None:
-    if effective_state(run, now=now) is not WorkflowState.EXPIRED:
-        return
-    ledger.transition(
-        run.run_id,
-        expected_state=run.state,
-        expected_revision=run.revision,
-        target_state=WorkflowState.EXPIRED,
-        event_type="approval_expired",
-        payload={"expires_at": run.expires_at},
-    )
-    raise _coded(ErrorCode.APPROVAL_EXPIRED, "workflow approval expired")
-
-
-def _is_terminal(stream: TextIO) -> bool:
+def _terminal_status(stream: TextIO) -> bool:
     try:
-        return bool(stream.isatty())
-    except (AttributeError, OSError, ValueError):
-        return False
+        value = stream.isatty()
+    except Exception:  # noqa: BLE001 - sanitize terminal implementation failures
+        raise _coded(
+            ErrorCode.APPROVAL_REQUIRED,
+            "terminal approval boundary is unavailable",
+        ) from None
+    if type(value) is not bool:
+        raise _coded(
+            ErrorCode.APPROVAL_REQUIRED,
+            "terminal approval boundary is unavailable",
+        )
+    return value
 
 
 def _candidate_matches(actual: str | None, expected: str | None) -> bool:
@@ -189,10 +142,9 @@ def _candidate_matches(actual: str | None, expected: str | None) -> bool:
 
 def approve_cli(
     ledger: WorkflowLedger,
-    run: LedgerRunRecord,
+    run_id: str,
     *,
     plan_schema_version: str,
-    now: datetime,
     input_stream: TextIO,
     output_stream: TextIO,
     yes: bool = False,
@@ -201,19 +153,29 @@ def approve_cli(
     host: str | None = None,
 ) -> DecisionMutationResult:
     """Approve one exact CLI-mode run using terminal or explicit batch policy."""
+    run = _run(ledger, run_id)
     _require_awaiting(run, ApprovalMode.CLI)
-    _expire_and_raise(ledger, run, now=now)
-    terminal_present = _is_terminal(input_stream) and _is_terminal(output_stream)
+    terminal_present = _terminal_status(input_stream) and _terminal_status(
+        output_stream
+    )
     if terminal_present:
-        output_stream.write(
-            f"Candidate SHA-256: {run.candidate_sha256}\n"
-            f"Type {_CONFIRMATION!r} to approve this exact candidate: "
-        )
-        output_stream.flush()
         try:
+            output_stream.write(
+                f"Candidate SHA-256: {run.candidate_sha256}\n"
+                f"Type {_CONFIRMATION!r} to approve this exact candidate: "
+            )
+            output_stream.flush()
             confirmed = input_stream.readline()
-        except (EOFError, OSError, ValueError):
-            confirmed = ""
+        except Exception:  # noqa: BLE001 - sanitize terminal implementation failures
+            raise _coded(
+                ErrorCode.APPROVAL_REQUIRED,
+                "terminal approval boundary is unavailable",
+            ) from None
+        if not isinstance(confirmed, str):
+            raise _coded(
+                ErrorCode.APPROVAL_REQUIRED,
+                "terminal approval boundary is unavailable",
+            )
         if confirmed.rstrip("\r\n") != _CONFIRMATION:
             raise _coded(
                 ErrorCode.APPROVAL_REQUIRED,
@@ -230,42 +192,38 @@ def approve_cli(
                 ErrorCode.WORKFLOW_STALE,
                 "candidate hash precondition failed",
             )
-    binding = approval_binding(
-        run,
-        plan_schema_version=plan_schema_version,
-    )
-    return ledger.record_decision(
+    result = ledger.record_approval_or_expire(
         run.run_id,
-        expected_state=WorkflowState.AWAITING_APPROVAL,
         expected_revision=run.revision,
-        decision=ApprovalDecision.APPROVED,
-        source=ApprovalSource.CLI,
         operator=operator,
         host=host,
         terminal_present=terminal_present,
-        binding_sha256=binding,
-        expires_at=run.expires_at,
-        approval_summary="Exact workflow evidence approved",
-        event_type="approval_recorded",
-        event_payload={
-            "decision": ApprovalDecision.APPROVED.value,
-            "source": ApprovalSource.CLI.value,
-            "binding_sha256": binding,
-        },
+        plan_schema_version=plan_schema_version,
+    )
+    if result.expired:
+        raise _coded(ErrorCode.APPROVAL_EXPIRED, "workflow approval expired")
+    if result.approval is None:
+        raise _coded(
+            ErrorCode.INTERNAL_ERROR,
+            "workflow approval result is incomplete",
+        )
+    return DecisionMutationResult(
+        run=result.run,
+        approval=result.approval,
+        event=result.event,
     )
 
 
 def approve_client(
     ledger: WorkflowLedger,
-    run: LedgerRunRecord,
+    run_id: str,
     *,
     plan_schema_version: str,
-    now: datetime,
     expect_candidate_sha256: str,
 ) -> ClientApproval:
     """Stage exact client evidence; Task 17 persists it in the commit CAS."""
+    run = _run(ledger, run_id)
     _require_awaiting(run, ApprovalMode.CLIENT)
-    _expire_and_raise(ledger, run, now=now)
     if not _candidate_matches(run.candidate_sha256, expect_candidate_sha256):
         raise _coded(
             ErrorCode.WORKFLOW_STALE,
@@ -273,7 +231,7 @@ def approve_client(
         )
     return ClientApproval(
         run_id=run.run_id,
-        binding_sha256=approval_binding(
+        binding_sha256=approval_binding_for_run(
             run,
             plan_schema_version=plan_schema_version,
         ),
@@ -285,15 +243,17 @@ def approve_client(
 
 def reject(
     ledger: WorkflowLedger,
-    run: LedgerRunRecord,
+    run_id: str,
     *,
     plan_schema_version: str,
     reason: str | None = None,
     operator: str | None = None,
     host: str | None = None,
-    terminal_present: bool = False,
+    input_stream: TextIO | None = None,
+    output_stream: TextIO | None = None,
 ) -> DecisionMutationResult:
     """Persist one immutable rejection without leaking caller text to events."""
+    run = _run(ledger, run_id)
     if run.state is not WorkflowState.AWAITING_APPROVAL:
         raise _coded(
             ErrorCode.WORKFLOW_STATE_CONFLICT,
@@ -301,8 +261,18 @@ def reject(
         )
     if reason is not None and (not isinstance(reason, str) or len(reason) > 4096):
         raise _coded(ErrorCode.INVALID_ARGUMENTS, "rejection reason is invalid")
+    if (input_stream is None) != (output_stream is None):
+        raise _coded(
+            ErrorCode.INVALID_ARGUMENTS,
+            "rejection terminal streams must be provided together",
+        )
+    terminal_present = (
+        False
+        if input_stream is None or output_stream is None
+        else _terminal_status(input_stream) and _terminal_status(output_stream)
+    )
     source = ApprovalSource(run.approval_mode.value)
-    binding = approval_binding(
+    binding = approval_binding_for_run(
         run,
         plan_schema_version=plan_schema_version,
     )
@@ -330,11 +300,12 @@ def reject(
 
 def cancel(
     ledger: WorkflowLedger,
-    run: LedgerRunRecord,
+    run_id: str,
     *,
     reason: str | None = None,
 ) -> LedgerRunRecord:
     """Cancel a legal non-committing run with a bounded path-free event."""
+    run = _run(ledger, run_id)
     if reason is not None and (not isinstance(reason, str) or len(reason) > 4096):
         raise _coded(ErrorCode.INVALID_ARGUMENTS, "cancellation reason is invalid")
     result = ledger.transition(

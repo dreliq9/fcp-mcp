@@ -234,6 +234,110 @@ def _approve(
     )
 
 
+@pytest.mark.parametrize(
+    ("offset", "expired"),
+    [
+        (timedelta(microseconds=-1), False),
+        (timedelta(0), True),
+        (timedelta(microseconds=1), True),
+    ],
+)
+def test_record_approval_or_expire_uses_authoritative_ledger_boundary(
+    tmp_path: Path,
+    offset: timedelta,
+    expired: bool,
+):
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    awaiting = _complete_prepare(ledger)
+    expiry = datetime.fromisoformat(
+        awaiting.run.expires_at.removesuffix("Z") + "+00:00"
+    )
+    ledger._clock = lambda: expiry + offset
+
+    result = ledger.record_approval_or_expire(
+        RUN_ID,
+        expected_revision=awaiting.run.revision,
+        operator="editor",
+        host="mac",
+        terminal_present=True,
+        plan_schema_version="1",
+    )
+
+    assert result.expired is expired
+    if expired:
+        assert result.run.state is WorkflowState.EXPIRED
+        assert result.approval is None
+        assert result.event.event_type == "approval_expired"
+        assert result.event.payload == {"expires_at": awaiting.run.expires_at}
+        assert ledger.get_approval(RUN_ID) is None
+    else:
+        assert result.run.state is WorkflowState.APPROVED
+        assert result.approval is not None
+        assert result.event.event_type == "approval_recorded"
+        assert result.approval.binding_sha256 == ledger.approval_binding(
+            RUN_ID,
+            plan_schema_version="1",
+        )
+    assert ledger.verify_integrity(RUN_ID).valid
+
+
+def test_record_approval_or_expire_race_has_one_cas_winner(tmp_path: Path):
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    awaiting = _complete_prepare(ledger)
+    expiry = datetime.fromisoformat(
+        awaiting.run.expires_at.removesuffix("Z") + "+00:00"
+    )
+    values = iter((expiry - timedelta(microseconds=1), expiry))
+    clock_lock = threading.Lock()
+
+    def boundary_clock() -> datetime:
+        with clock_lock:
+            return next(values)
+
+    ledger._clock = boundary_clock
+    barrier = threading.Barrier(2)
+    outcomes: list[object] = []
+
+    def decide() -> None:
+        barrier.wait()
+        try:
+            outcomes.append(
+                ledger.record_approval_or_expire(
+                    RUN_ID,
+                    expected_revision=awaiting.run.revision,
+                    operator=None,
+                    host=None,
+                    terminal_present=False,
+                    plan_schema_version="1",
+                )
+            )
+        except FCPMCPError as error:
+            outcomes.append(error)
+
+    threads = [threading.Thread(target=decide) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    winners = [item for item in outcomes if not isinstance(item, FCPMCPError)]
+    losers = [item for item in outcomes if isinstance(item, FCPMCPError)]
+    assert len(winners) == 1
+    assert winners[0].run.state is WorkflowState.APPROVED
+    assert [error.code for error in losers] == [ErrorCode.WORKFLOW_STATE_CONFLICT]
+    assert ledger.get_approval(RUN_ID) == winners[0].approval
+    assert len(
+        [
+            event
+            for event in ledger.list_events(RUN_ID)
+            if event.event_type in {"approval_recorded", "approval_expired"}
+        ]
+    ) == 1
+    assert ledger.verify_integrity(RUN_ID).valid
+
+
 def _metadata(
     *,
     run_id: str = RUN_ID,
