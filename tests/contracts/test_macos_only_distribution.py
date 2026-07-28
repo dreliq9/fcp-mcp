@@ -225,6 +225,18 @@ def test_installed_wheel_smoke_uses_the_full_profile(relative: str):
     _assert_installed_wheel_smoke_profile(_load_workflow(relative))
 
 
+def test_sdist_inventory_uses_runner_builtin_search_tool():
+    workflow = _load_workflow(".github/workflows/ci.yml")
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    steps = jobs["build"]["steps"]
+    assert isinstance(steps, list)
+    command = _step_named(steps, "Verify source-distribution support files")["run"]
+
+    assert "rg -q" not in command
+    assert command.count("grep -q") == 4
+
+
 @pytest.mark.parametrize(
     "relative",
     (".github/workflows/ci.yml", ".github/workflows/publish.yml"),

@@ -131,10 +131,10 @@ jobs:
       - name: Verify source-distribution support files
         run: |
           tar -tf dist/fcp_mcp-0.3.0.tar.gz > /tmp/fcp-mcp-sdist-files
-          rg -q 'examples/quickstart.py' /tmp/fcp-mcp-sdist-files
-          rg -q 'docs/research/' /tmp/fcp-mcp-sdist-files
-          rg -q 'WORKFLOWS.md' /tmp/fcp-mcp-sdist-files
-          rg -q 'server.json' /tmp/fcp-mcp-sdist-files
+          grep -q 'examples/quickstart.py' /tmp/fcp-mcp-sdist-files
+          grep -q 'docs/research/' /tmp/fcp-mcp-sdist-files
+          grep -q 'WORKFLOWS.md' /tmp/fcp-mcp-sdist-files
+          grep -q 'server.json' /tmp/fcp-mcp-sdist-files
       - name: Smoke-test installed wheel
         env:
           FCP_MCP_PROFILE: full
