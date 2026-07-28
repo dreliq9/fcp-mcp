@@ -6,10 +6,10 @@
 covering FCPXML editing, opt-in live FCP control, parametric puppets,
 media analysis, transactional edit approval, and runtime diagnostics.
 
-> **v0.3 release candidate:** The transactional workflow release is available
-> on the `codex/v0.3-transactional-workflows` branch. It has completed the
-> [local release review](docs/reviews/v0.3.0-release-review.md), but is not yet
-> tagged or published to PyPI or the MCP Registry.
+> **v0.3 release candidate:** The transactional workflow release is merged
+> into `main` at `23d2a33` and passed all eight post-merge CI gates. It has
+> completed the [local release review](docs/reviews/v0.3.0-release-review.md),
+> but is not yet tagged or published to PyPI or the MCP Registry.
 
 ```
 You: "Find and repair flash frames in hero.fcpxml."
@@ -167,11 +167,11 @@ Install the current published release from PyPI:
 pipx install fcp-mcp
 ```
 
-Until v0.3 is tagged and published, install its reviewed candidate directly
-from the GitHub branch:
+Until v0.3 is tagged and published, install its merged candidate directly
+from `main`:
 
 ```bash
-pipx install "git+https://github.com/dreliq9/fcp-mcp.git@codex/v0.3-transactional-workflows"
+pipx install "git+https://github.com/dreliq9/fcp-mcp.git@main"
 ```
 
 Or from source (for contributors):

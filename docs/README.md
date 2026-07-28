@@ -21,9 +21,10 @@ review evidence.
 
 ## v0.3 Status
 
-The `codex/v0.3-transactional-workflows` branch is a reviewed release
-candidate. It is not yet a tagged GitHub release and has not been published to
-PyPI or the MCP Registry.
+The reviewed v0.3 release candidate is merged into `main` at
+`23d2a330935bd1a3722d5745ba61ad15b5c40001`. All eight post-merge CI gates
+passed in run `30394569899`. It is not yet a tagged GitHub release and has not
+been published to PyPI or the MCP Registry.
 
 The release changes the default `workflow` profile to a transactional editing
 surface. An AI client prepares a private candidate, presents the semantic diff
