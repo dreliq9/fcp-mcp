@@ -54,8 +54,19 @@ _MAX_IDEMPOTENCY_KEY_CHARS = 128
 _MAX_READ_LIMIT = 1000
 _MAX_INTEGRITY_FINDINGS = 100
 _MAX_CREATE_RACE_RETRIES = 3
-_FINGERPRINT_BATCH_SIZE = 100
-_MAX_FINGERPRINT_COLUMNS = 4096
+_FINGERPRINT_CHUNK_BYTES = 64 * 1024
+_MAX_FINGERPRINT_DATABASE_BYTES = 4 * 1024 * 1024 * 1024
+_MAX_FINGERPRINT_SCHEMA_OBJECTS = 256
+_MAX_FINGERPRINT_SCHEMA_BYTES = 4 * 1024 * 1024
+_MAX_FINGERPRINT_METADATA_BYTES = 1024 * 1024
+_MAX_FINGERPRINT_TABLES = 64
+_MAX_FINGERPRINT_COLUMNS = 128
+_MAX_FINGERPRINT_TABLE_ROWS = 1_000_000
+_MAX_FINGERPRINT_PRIMARY_KEY_BYTES = _FINGERPRINT_CHUNK_BYTES
+_MAX_FINGERPRINT_CELL_BYTES = 2 * 1024 * 1024
+_MAX_FINGERPRINT_ROW_BYTES = 4 * 1024 * 1024
+_MAX_FINGERPRINT_TABLE_BYTES = 1024 * 1024 * 1024
+_MAX_FINGERPRINT_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _SQLITE_MAX_INTEGER = 2**63 - 1
 _BACKUP_PERSISTENT_PRAGMAS = (
     "application_id",
@@ -74,6 +85,8 @@ _BOOTSTRAP_TOKEN_OFFSET = 8128
 _BOOTSTRAP_TEMP_PREFIX = ".runs.sqlite3.bootstrap-"
 _BOOTSTRAP_LOCK_NAME = ".runs.sqlite3.bootstrap.lock"
 _BOOTSTRAP_THREAD_LOCK = threading.Lock()
+_BACKUP_LOCK_NAME = ".runs.sqlite3.backup.lock"
+_BACKUP_THREAD_LOCK = threading.Lock()
 # Generated with SQLite 3.53.0 using a 4096-byte page size, the exact
 # _BOOTSTRAP_SCHEMA_SQL above, and one 64-character zero-token row. SQLite's
 # version-3 file format is backwards compatible across the supported runtime
@@ -791,9 +804,15 @@ def _stat_identity(result: os.stat_result) -> tuple[int, int, int]:
 
 
 def _fingerprint_frame(tag: bytes, payload: bytes) -> bytes:
+    return _fingerprint_frame_header(tag, len(payload)) + payload
+
+
+def _fingerprint_frame_header(tag: bytes, payload_size: int) -> bytes:
     if len(tag) != 1:
         raise _MigrationError("database fingerprint tag is invalid")
-    return tag + len(payload).to_bytes(8, "big") + payload
+    if type(payload_size) is not int or not 0 <= payload_size <= 2**64 - 1:
+        raise _MigrationError("database fingerprint payload size is invalid")
+    return tag + payload_size.to_bytes(8, "big")
 
 
 def _fingerprint_value(value: object) -> bytes:
@@ -816,6 +835,13 @@ def _quote_sqlite_identifier(value: object) -> str:
     if not isinstance(value, str) or "\x00" in value:
         raise _MigrationError("database identifier is invalid")
     return '"' + value.replace('"', '""') + '"'
+
+
+def _sqlite_value_size(expression: str) -> str:
+    return (
+        f"(CASE WHEN {expression} IS NULL THEN 0 "
+        f"ELSE length(CAST({expression} AS BLOB)) END)"
+    )
 
 
 def _attach_cleanup_failures(
@@ -1707,20 +1733,47 @@ class WorkflowLedger:
         self,
         connection: sqlite3.Connection,
     ) -> str:
-        digest = hashlib.sha256()
+        bounds = connection.execute(
+            "SELECT count(*), "
+            "coalesce(sum("
+            "length(CAST(type AS BLOB)) + length(CAST(name AS BLOB)) + "
+            "length(CAST(tbl_name AS BLOB)) + "
+            "coalesce(length(CAST(sql AS BLOB)), 0)"
+            "), 0), "
+            "coalesce(max(max("
+            "length(CAST(type AS BLOB)), length(CAST(name AS BLOB)), "
+            "length(CAST(tbl_name AS BLOB)), "
+            "coalesce(length(CAST(sql AS BLOB)), 0)"
+            ")), 0) "
+            "FROM sqlite_master"
+        ).fetchone()
+        if (
+            bounds is None
+            or type(bounds[0]) is not int
+            or type(bounds[1]) is not int
+            or type(bounds[2]) is not int
+            or bounds[0] > _MAX_FINGERPRINT_SCHEMA_OBJECTS
+            or bounds[1] > _MAX_FINGERPRINT_SCHEMA_BYTES
+            or bounds[2] > _MAX_FINGERPRINT_METADATA_BYTES
+        ):
+            raise _MigrationError("database schema exceeds fingerprint limits")
+        rows: list[tuple[object, ...]] = []
         cursor = connection.execute(
-            "SELECT type, name, tbl_name, rootpage, sql "
-            "FROM sqlite_master "
-            "ORDER BY type COLLATE BINARY, name COLLATE BINARY"
+            "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master"
         )
         while True:
-            rows = cursor.fetchmany(_FINGERPRINT_BATCH_SIZE)
-            if not rows:
+            row = cursor.fetchone()
+            if row is None:
                 break
-            for row in rows:
-                digest.update(_fingerprint_frame(b"S", b""))
-                for value in row:
-                    digest.update(_fingerprint_value(value))
+            rows.append(tuple(row))
+        if len(rows) != bounds[0]:
+            raise _MigrationError("database schema changed during fingerprint")
+        rows.sort(key=lambda row: (str(row[0]).encode(), str(row[1]).encode()))
+        digest = hashlib.sha256()
+        for row in rows:
+            digest.update(_fingerprint_frame(b"S", b""))
+            for value in row:
+                digest.update(_fingerprint_value(value))
         return digest.hexdigest()
 
     def _backup_migration_identity(
@@ -1733,163 +1786,262 @@ class WorkflowLedger:
         self,
         connection: sqlite3.Connection,
     ) -> str:
+        page_count = connection.execute("PRAGMA page_count").fetchone()
+        page_size = connection.execute("PRAGMA page_size").fetchone()
+        if (
+            page_count is None
+            or page_size is None
+            or type(page_count[0]) is not int
+            or type(page_size[0]) is not int
+            or page_count[0] < 0
+            or page_size[0] <= 0
+            or page_count[0] * page_size[0] > _MAX_FINGERPRINT_DATABASE_BYTES
+        ):
+            raise _MigrationError("database exceeds fingerprint file limit")
         digest = hashlib.sha256()
-        digest.update(_fingerprint_frame(b"V", b"fcp-backup-fingerprint-v2"))
+        digest.update(_fingerprint_frame(b"V", b"fcp-backup-fingerprint-v3"))
         for pragma in _BACKUP_PERSISTENT_PRAGMAS:
             row = connection.execute(f"PRAGMA {pragma}").fetchone()
             if row is None or len(row) != 1:
                 raise _MigrationError("persistent database pragma is unavailable")
+            if pragma == "encoding" and row[0] != "UTF-8":
+                raise _MigrationError("database text encoding is unsupported")
             digest.update(_fingerprint_frame(b"P", pragma.encode("ascii")))
             digest.update(_fingerprint_value(row[0]))
 
-        function_name = "__fcp_backup_fingerprint_value_v2"
-        connection.create_function(
-            function_name,
-            1,
-            _fingerprint_value,
-            deterministic=True,
-        )
+        table_bounds = connection.execute(
+            "SELECT count(*), coalesce(max(length(CAST(name AS BLOB))), 0) "
+            "FROM sqlite_master WHERE type = 'table'"
+        ).fetchone()
+        if (
+            table_bounds is None
+            or type(table_bounds[0]) is not int
+            or type(table_bounds[1]) is not int
+            or table_bounds[0] > _MAX_FINGERPRINT_TABLES
+            or table_bounds[1] > _MAX_FINGERPRINT_METADATA_BYTES
+        ):
+            raise _MigrationError("database table inventory is unsupported")
+        table_names: list[str] = []
         table_cursor = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table' "
-            "ORDER BY name COLLATE BINARY"
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
         )
+        while True:
+            table_row = table_cursor.fetchone()
+            if table_row is None:
+                break
+            if not isinstance(table_row[0], str):
+                raise _MigrationError("database table name is invalid")
+            table_names.append(table_row[0])
+        if len(table_names) != table_bounds[0]:
+            raise _MigrationError("database table inventory changed")
+        table_names.sort(key=lambda value: value.encode("utf-8"))
+
         table_count = 0
-        try:
-            while True:
-                tables = table_cursor.fetchmany(_FINGERPRINT_BATCH_SIZE)
-                if not tables:
+        total_value_bytes = 0
+        for table_name in table_names:
+            quoted_table = _quote_sqlite_identifier(table_name)
+            digest.update(
+                _fingerprint_frame(
+                    b"T",
+                    table_name.encode("utf-8"),
+                )
+            )
+            columns: list[sqlite3.Row] = []
+            column_cursor = connection.execute(
+                "SELECT cid, name, type, \"notnull\", dflt_value, "
+                "pk, hidden FROM pragma_table_xinfo(?)",
+                (table_name,),
+            )
+            while len(columns) <= _MAX_FINGERPRINT_COLUMNS:
+                column = column_cursor.fetchone()
+                if column is None:
                     break
-                for table_row in tables:
-                    table_name = table_row[0]
-                    quoted_table = _quote_sqlite_identifier(table_name)
-                    digest.update(
-                        _fingerprint_frame(
-                            b"T",
-                            table_name.encode("utf-8"),
-                        )
-                    )
-                    column_cursor = connection.execute(
-                        "SELECT cid, name, type, \"notnull\", dflt_value, "
-                        "pk, hidden FROM pragma_table_xinfo(?) ORDER BY cid",
-                        (table_name,),
-                    )
-                    columns = tuple(
-                        column_cursor.fetchmany(_MAX_FINGERPRINT_COLUMNS + 1)
-                    )
-                    if (
-                        not columns
-                        or len(columns) > _MAX_FINGERPRINT_COLUMNS
-                        or column_cursor.fetchone() is not None
+                columns.append(column)
+            if not columns or len(columns) > _MAX_FINGERPRINT_COLUMNS:
+                raise _MigrationError(
+                    "database table column count is unsupported"
+                )
+            columns.sort(key=lambda column: int(column["cid"]))
+            column_names: list[str] = []
+            primary_key_columns: list[tuple[int, str]] = []
+            for column in columns:
+                column_name = column["name"]
+                quoted_column = _quote_sqlite_identifier(column_name)
+                column_names.append(quoted_column)
+                digest.update(_fingerprint_frame(b"C", b""))
+                for value in column:
+                    if isinstance(value, (str, bytes)) and (
+                        len(value) > _MAX_FINGERPRINT_METADATA_BYTES
                     ):
                         raise _MigrationError(
-                            "database table column count is unsupported"
+                            "database column metadata is unsupported"
                         )
-                    column_names: list[str] = []
-                    primary_key_columns: list[tuple[int, str]] = []
-                    for column in columns:
-                        column_name = column["name"]
-                        quoted_column = _quote_sqlite_identifier(column_name)
-                        column_names.append(quoted_column)
-                        digest.update(_fingerprint_frame(b"C", b""))
-                        for value in column:
-                            digest.update(_fingerprint_value(value))
-                        if type(column["pk"]) is int and column["pk"] > 0:
-                            primary_key_columns.append(
-                                (column["pk"], quoted_column)
-                            )
+                    digest.update(_fingerprint_value(value))
+                if type(column["pk"]) is int and column["pk"] > 0:
+                    primary_key_columns.append(
+                        (column["pk"], quoted_column)
+                    )
 
-                    table_list_row = connection.execute(
-                        "SELECT type, wr, strict FROM pragma_table_list "
-                        "WHERE schema = 'main' AND name = ?",
-                        (table_name,),
-                    ).fetchone()
-                    if table_list_row is None:
+            table_list_rows = tuple(
+                connection.execute(
+                    "SELECT type, wr, strict FROM pragma_table_list "
+                    "WHERE schema = 'main' AND name = ?",
+                    (table_name,),
+                ).fetchmany(2)
+            )
+            if len(table_list_rows) != 1 or table_list_rows[0]["type"] != "table":
+                raise _MigrationError("database table shape is unsupported")
+            table_list_row = table_list_rows[0]
+            without_rowid = table_list_row["wr"] == 1
+            digest.update(_fingerprint_frame(b"M", b""))
+            for value in table_list_row:
+                digest.update(_fingerprint_value(value))
+
+            value_sizes = [
+                _sqlite_value_size(column)
+                for column in column_names
+            ]
+            row_size = " + ".join(value_sizes)
+            row_count_bound = connection.execute(
+                f"SELECT count(*) FROM (SELECT 1 FROM {quoted_table} LIMIT ?)",
+                (_MAX_FINGERPRINT_TABLE_ROWS + 1,),
+            ).fetchone()
+            if (
+                row_count_bound is None
+                or type(row_count_bound[0]) is not int
+                or row_count_bound[0] > _MAX_FINGERPRINT_TABLE_ROWS
+            ):
+                raise _MigrationError("database table exceeds fingerprint row limit")
+            aggregate_bounds = connection.execute(
+                f"SELECT coalesce(sum({row_size}), 0), "
+                f"coalesce(max({row_size}), 0), "
+                + ", ".join(
+                    f"coalesce(max({size}), 0)"
+                    for size in value_sizes
+                )
+                + f" FROM {quoted_table}"
+            ).fetchone()
+            bounds = (
+                (row_count_bound[0], *tuple(aggregate_bounds))
+                if aggregate_bounds is not None
+                else ()
+            )
+            if (
+                not bounds
+                or any(type(value) is not int for value in bounds)
+                or bounds[1] > _MAX_FINGERPRINT_TABLE_BYTES
+                or bounds[2] > _MAX_FINGERPRINT_ROW_BYTES
+                or any(
+                    value > _MAX_FINGERPRINT_CELL_BYTES
+                    for value in bounds[3:]
+                )
+            ):
+                raise _MigrationError("database table exceeds fingerprint limits")
+            total_value_bytes += bounds[1]
+            if total_value_bytes > _MAX_FINGERPRINT_TOTAL_BYTES:
+                raise _MigrationError("database exceeds fingerprint byte limit")
+
+            if without_rowid:
+                identity_columns, order_clause = (
+                    self._without_rowid_fingerprint_order(
+                        connection,
+                        table_name,
+                        quoted_table,
+                        primary_key_columns,
+                    )
+                )
+                for _, quoted_column in sorted(primary_key_columns):
+                    column_position = column_names.index(quoted_column)
+                    if (
+                        bounds[3 + column_position]
+                        > _MAX_FINGERPRINT_PRIMARY_KEY_BYTES
+                    ):
                         raise _MigrationError(
-                            "database table metadata disappeared"
+                            "database primary key exceeds fingerprint limit"
                         )
-                    without_rowid = table_list_row["wr"] == 1
-                    digest.update(_fingerprint_frame(b"M", b""))
-                    for value in table_list_row:
-                        digest.update(_fingerprint_value(value))
-
-                    encoded_columns = [
-                        f"{function_name}({column})"
-                        for column in column_names
-                    ]
-                    if without_rowid:
-                        ordered_primary_key = [
-                            column
-                            for _, column in sorted(primary_key_columns)
-                        ]
-                        if not ordered_primary_key:
-                            raise _MigrationError(
-                                "WITHOUT ROWID table lacks a primary key"
-                            )
-                        identity_columns = [
-                            f"{function_name}({column})"
-                            for column in ordered_primary_key
-                        ]
-                        select_columns = identity_columns + encoded_columns
-                        order_clause = ", ".join(identity_columns)
-                        identity_count = len(identity_columns)
-                    else:
-                        observed_names = {
-                            str(column["name"]).casefold()
-                            for column in columns
-                        }
-                        rowid_name = next(
-                            (
-                                candidate
-                                for candidate in ("_rowid_", "rowid", "oid")
-                                if candidate.casefold() not in observed_names
-                            ),
-                            None,
-                        )
-                        if rowid_name is None:
-                            raise _MigrationError(
-                                "rowid table hides its row identity"
-                            )
-                        quoted_rowid = _quote_sqlite_identifier(rowid_name)
-                        select_columns = [quoted_rowid] + encoded_columns
-                        order_clause = quoted_rowid
-                        identity_count = 1
-
-                    row_cursor = connection.execute(
-                        f"SELECT {', '.join(select_columns)} "
-                        f"FROM {quoted_table} ORDER BY {order_clause}"
+                identity_select = ", ".join(identity_columns)
+            else:
+                observed_names = {
+                    str(column["name"]).casefold()
+                    for column in columns
+                }
+                rowid_name = next(
+                    (
+                        candidate
+                        for candidate in ("_rowid_", "rowid", "oid")
+                        if candidate.casefold() not in observed_names
+                    ),
+                    None,
+                )
+                if rowid_name is None:
+                    raise _MigrationError(
+                        "rowid table hides its row identity"
                     )
-                    row_count = 0
-                    while True:
-                        rows = row_cursor.fetchmany(_FINGERPRINT_BATCH_SIZE)
-                        if not rows:
-                            break
-                        for row in rows:
-                            digest.update(_fingerprint_frame(b"W", b""))
-                            for position, value in enumerate(row):
-                                if not isinstance(value, (bytes, bytearray)):
-                                    if not (
-                                        not without_rowid
-                                        and position == 0
-                                        and type(value) is int
-                                    ):
-                                        raise _MigrationError(
-                                            "database fingerprint row is invalid"
-                                        )
-                                    encoded = _fingerprint_value(value)
-                                else:
-                                    encoded = bytes(value)
-                                tag = b"K" if position < identity_count else b"D"
-                                digest.update(_fingerprint_frame(tag, encoded))
-                            row_count += 1
-                    digest.update(
-                        _fingerprint_frame(
-                            b"N",
-                            row_count.to_bytes(8, "big"),
+                quoted_rowid = _quote_sqlite_identifier(rowid_name)
+                identity_columns = [quoted_rowid]
+                identity_select = quoted_rowid
+                order_clause = quoted_rowid
+
+            identity_sql = (
+                f"SELECT {identity_select} FROM {quoted_table} "
+                f"ORDER BY {order_clause}"
+            )
+            self._reject_fingerprint_temp_sort(connection, identity_sql)
+            identity_cursor = connection.execute(identity_sql)
+            row_count = 0
+            while True:
+                identity = identity_cursor.fetchone()
+                if identity is None:
+                    break
+                identity_values = tuple(identity)
+                if without_rowid:
+                    if len(identity_values) != len(identity_columns):
+                        raise _MigrationError(
+                            "database fingerprint identity is invalid"
                         )
+                    where_clause = " AND ".join(
+                        f"{column} = ?"
+                        for column in identity_columns
                     )
-                    table_count += 1
-        finally:
-            connection.create_function(function_name, 1, None)
+                    where_parameters = identity_values
+                else:
+                    if len(identity_values) != 1 or type(identity_values[0]) is not int:
+                        raise _MigrationError(
+                            "database fingerprint rowid is invalid"
+                        )
+                    where_clause = f"{identity_columns[0]} = ?"
+                    where_parameters = identity_values
+                digest.update(_fingerprint_frame(b"W", b""))
+                for identity_column in identity_columns:
+                    self._stream_fingerprint_cell(
+                        connection,
+                        digest,
+                        table=quoted_table,
+                        column=identity_column,
+                        where_clause=where_clause,
+                        where_parameters=where_parameters,
+                        frame_tag=b"K",
+                    )
+                for column in column_names:
+                    self._stream_fingerprint_cell(
+                        connection,
+                        digest,
+                        table=quoted_table,
+                        column=column,
+                        where_clause=where_clause,
+                        where_parameters=where_parameters,
+                        frame_tag=b"D",
+                    )
+                row_count += 1
+            if row_count != bounds[0]:
+                raise _MigrationError("database row count changed during fingerprint")
+            digest.update(
+                _fingerprint_frame(
+                    b"N",
+                    row_count.to_bytes(8, "big"),
+                )
+            )
+            table_count += 1
         digest.update(
             _fingerprint_frame(
                 b"Z",
@@ -1897,6 +2049,144 @@ class WorkflowLedger:
             )
         )
         return digest.hexdigest()
+
+    def _without_rowid_fingerprint_order(
+        self,
+        connection: sqlite3.Connection,
+        table_name: str,
+        quoted_table: str,
+        primary_key_columns: Sequence[tuple[int, str]],
+    ) -> tuple[list[str], str]:
+        if not primary_key_columns:
+            raise _MigrationError("WITHOUT ROWID table lacks a primary key")
+        indexes = tuple(
+            connection.execute(
+                "SELECT name FROM pragma_index_list(?) WHERE origin = 'pk'",
+                (table_name,),
+            ).fetchmany(2)
+        )
+        if len(indexes) != 1 or not isinstance(indexes[0]["name"], str):
+            raise _MigrationError("WITHOUT ROWID primary key is unsupported")
+        index_rows = list(
+            connection.execute(
+                "SELECT seqno, cid, name, desc, coll, key "
+                "FROM pragma_index_xinfo(?)",
+                (indexes[0]["name"],),
+            )
+        )
+        key_rows = sorted(
+            (row for row in index_rows if row["key"] == 1),
+            key=lambda row: int(row["seqno"]),
+        )
+        expected = [
+            quoted_column
+            for _, quoted_column in sorted(primary_key_columns)
+        ]
+        observed = [
+            _quote_sqlite_identifier(row["name"])
+            for row in key_rows
+        ]
+        if observed != expected:
+            raise _MigrationError("WITHOUT ROWID primary key is unsupported")
+        order_terms: list[str] = []
+        for row, column in zip(key_rows, observed):
+            collation = row["coll"]
+            if collation not in {"BINARY", "NOCASE", "RTRIM"}:
+                raise _MigrationError(
+                    "WITHOUT ROWID collation is unsupported"
+                )
+            direction = " DESC" if row["desc"] == 1 else ""
+            order_terms.append(
+                f"{column} COLLATE {_quote_sqlite_identifier(collation)}"
+                f"{direction}"
+            )
+        order_clause = ", ".join(order_terms)
+        identity_sql = (
+            f"SELECT {', '.join(observed)} FROM {quoted_table} "
+            f"ORDER BY {order_clause}"
+        )
+        self._reject_fingerprint_temp_sort(connection, identity_sql)
+        return observed, order_clause
+
+    def _reject_fingerprint_temp_sort(
+        self,
+        connection: sqlite3.Connection,
+        sql: str,
+    ) -> None:
+        plan = connection.execute(f"EXPLAIN QUERY PLAN {sql}").fetchall()
+        if any(
+            "USE TEMP B-TREE" in str(row["detail"]).upper()
+            for row in plan
+        ):
+            raise _MigrationError("database ordering requires temporary storage")
+
+    def _stream_fingerprint_cell(
+        self,
+        connection: sqlite3.Connection,
+        digest: Any,
+        *,
+        table: str,
+        column: str,
+        where_clause: str,
+        where_parameters: Sequence[object],
+        frame_tag: bytes,
+    ) -> None:
+        metadata = connection.execute(
+            f"SELECT typeof({column}), {_sqlite_value_size(column)} "
+            f"FROM {table} WHERE {where_clause}",
+            tuple(where_parameters),
+        ).fetchone()
+        if (
+            metadata is None
+            or not isinstance(metadata[0], str)
+            or type(metadata[1]) is not int
+            or not 0 <= metadata[1] <= _MAX_FINGERPRINT_CELL_BYTES
+        ):
+            raise _MigrationError("database cell exceeds fingerprint limit")
+        storage_type = metadata[0]
+        size = metadata[1]
+        tags = {
+            "null": b"N",
+            "integer": b"I",
+            "real": b"R",
+            "text": b"T",
+            "blob": b"B",
+        }
+        value_tag = tags.get(storage_type)
+        if value_tag is None:
+            raise _MigrationError("database cell type is unsupported")
+        if storage_type in {"null", "integer", "real"}:
+            row = connection.execute(
+                f"SELECT {column} FROM {table} WHERE {where_clause}",
+                tuple(where_parameters),
+            ).fetchone()
+            if row is None:
+                raise _MigrationError("database row changed during fingerprint")
+            encoded = _fingerprint_value(row[0])
+            digest.update(_fingerprint_frame(frame_tag, encoded))
+            return
+
+        encoded_size = 1 + 8 + size
+        digest.update(_fingerprint_frame_header(frame_tag, encoded_size))
+        digest.update(_fingerprint_frame_header(value_tag, size))
+        offset = 1
+        remaining = size
+        while remaining:
+            requested = min(remaining, _FINGERPRINT_CHUNK_BYTES)
+            row = connection.execute(
+                f"SELECT substr(CAST({column} AS BLOB), ?, ?) "
+                f"FROM {table} WHERE {where_clause}",
+                (offset, requested, *where_parameters),
+            ).fetchone()
+            if (
+                row is None
+                or not isinstance(row[0], bytes)
+                or len(row[0]) != requested
+            ):
+                raise _MigrationError("database cell changed during fingerprint")
+            digest.update(row[0])
+            offset += requested
+            remaining -= requested
 
     def _validate_backup_content(
         self,
@@ -1962,6 +2252,35 @@ class WorkflowLedger:
     ) -> Path:
         migration_lease = self._retained_lease(migration_connection)
         self._validate_retained_connection(migration_connection)
+        published: Path | None = None
+        try:
+            with self._backup_publication_guard(migration_lease.anchor):
+                published = self._backup_database_guarded(
+                    migration_connection,
+                    migration_lease=migration_lease,
+                    from_version=from_version,
+                    to_version=to_version,
+                )
+            return published
+        except BaseException as error:
+            if published is not None:
+                try:
+                    self._remove_published_backup(
+                        published,
+                        anchor=migration_lease.anchor,
+                    )
+                except _LEDGER_FAILURES as cleanup_error:
+                    _attach_cleanup_failures(error, [cleanup_error])
+            raise
+
+    def _backup_database_guarded(
+        self,
+        migration_connection: sqlite3.Connection,
+        *,
+        migration_lease: _DatabaseLease,
+        from_version: int,
+        to_version: int,
+    ) -> Path:
         timestamp = _canonical_clock_timestamp(self._clock()).replace(":", "").replace("-", "")
         token = secrets.token_hex(8)
         stem = (
@@ -2076,16 +2395,39 @@ class WorkflowLedger:
                 validation_lease,
                 None,
             )
-            validation.close()
-            validation = None
             self._replace_at(anchor, temporary_name, stem)
             replaced = True
-            self._fsync_anchor(anchor)
-            self._validate_retained_connection(migration_connection)
             published_result = self._stat_at(anchor, stem)
             self._validate_database_stat(published_result)
             if _stat_identity(published_result) != _stat_identity(destination_result):
                 raise _MigrationError("published backup identity changed")
+            published_lease = _DatabaseLease(
+                anchor=anchor,
+                name=stem,
+                descriptor=destination_descriptor,
+                identity=_stat_identity(published_result),
+                bootstrap_token=None,
+                owns_anchor=False,
+            )
+            self._validate_connection_identity(
+                published_lease,
+                None,
+            )
+            self._validate_backup_content(
+                validation,
+                source_schema=source_schema,
+                source_migrations=source_migrations,
+                source_content_sha256=source_content_sha256,
+            )
+            self._validate_connection_identity(
+                published_lease,
+                None,
+            )
+            validation.close()
+            validation = None
+            os.fsync(destination_descriptor)
+            self._fsync_anchor(anchor)
+            self._validate_retained_connection(migration_connection)
             return anchor.path / stem
         except BaseException as error:
             primary = error
@@ -2128,6 +2470,64 @@ class WorkflowLedger:
                     error = close_failures[0]
                     _attach_cleanup_failures(error, close_failures[1:])
                     raise error
+
+    @contextmanager
+    def _backup_publication_guard(self, anchor: _RootAnchor):
+        with _BACKUP_THREAD_LOCK:
+            descriptor: int | None = None
+            primary: BaseException | None = None
+            locked = False
+            try:
+                try:
+                    descriptor = self._open_at(
+                        anchor,
+                        _BACKUP_LOCK_NAME,
+                        write=True,
+                        exclusive=True,
+                    )
+                except FileExistsError:
+                    descriptor = self._open_at(
+                        anchor,
+                        _BACKUP_LOCK_NAME,
+                        write=True,
+                    )
+                path_result = self._stat_at(anchor, _BACKUP_LOCK_NAME)
+                opened_result = os.fstat(descriptor)
+                self._validate_database_stat(path_result)
+                self._validate_database_stat(opened_result)
+                if _stat_identity(path_result) != _stat_identity(opened_result):
+                    raise _MigrationError("backup lock identity changed")
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locked = True
+                yield
+            except BaseException as error:
+                primary = error
+                raise
+            finally:
+                failures: list[BaseException] = []
+                if descriptor is not None and locked:
+                    try:
+                        import fcntl
+
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                    except (OSError, RuntimeError) as error:
+                        failures.append(error)
+                if descriptor is not None:
+                    try:
+                        os.close(descriptor)
+                    except OSError as error:
+                        failures.append(error)
+                if failures:
+                    if primary is not None:
+                        _attach_cleanup_failures(primary, failures)
+                    else:
+                        error = _MigrationError(
+                            "backup lock cleanup failed"
+                        )
+                        _attach_cleanup_failures(error, failures)
+                        raise error
 
     def _execute_migration_statement(
         self,

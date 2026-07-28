@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -4021,7 +4022,10 @@ def test_backup_fingerprint_is_order_stable_and_binds_types_and_identity(
         second.close()
 
 
-@pytest.mark.parametrize("failure_stage", ("validation_reopen", "fingerprint"))
+@pytest.mark.parametrize(
+    "failure_stage",
+    ("validation_reopen", "fingerprint", "resource_limit"),
+)
 def test_backup_fingerprint_failures_are_sanitized_and_cleaned_up(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4054,7 +4058,7 @@ def test_backup_fingerprint_failures_are_sanitized_and_cleaned_up(
             return original_connect(lease, read_only=read_only)
 
         monkeypatch.setattr(ledger, "_connect_lease", fail_validation_reopen)
-    else:
+    elif failure_stage == "fingerprint":
         original_fingerprint = ledger._backup_content_sha256
         calls = 0
 
@@ -4074,6 +4078,12 @@ def test_backup_fingerprint_failures_are_sanitized_and_cleaned_up(
             "_backup_content_sha256",
             fail_destination_fingerprint,
         )
+    else:
+        monkeypatch.setattr(
+            ledger_module,
+            "_MAX_FINGERPRINT_CELL_BYTES",
+            3,
+        )
 
     with pytest.raises(FCPMCPError) as error:
         ledger.initialize()
@@ -4083,6 +4093,361 @@ def test_backup_fingerprint_failures_are_sanitized_and_cleaned_up(
     assert paths.database.exists()
     assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
     assert list(paths.root.glob(".runs.sqlite3.backup-*.tmp")) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires retained destination fd")
+def test_backup_post_validation_same_inode_drift_is_removed_and_fsynced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute("CREATE TABLE legacy(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO legacy VALUES ('source')")
+    legacy.close()
+    os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original_replace = ledger._replace_at
+    original_fsync_anchor = ledger._fsync_anchor
+    fsync_observations: list[tuple[str, ...]] = []
+
+    def mutate_then_replace(
+        anchor: ledger_module._RootAnchor,
+        source: str,
+        target: str,
+    ) -> None:
+        attacker = _raw(paths.root / source)
+        try:
+            attacker.execute("UPDATE legacy SET value = 'post-validation-drift'")
+        finally:
+            attacker.close()
+        original_replace(anchor, source, target)
+
+    def observe_directory_fsync(anchor: ledger_module._RootAnchor) -> None:
+        fsync_observations.append(
+            tuple(
+                sorted(
+                    path.name
+                    for path in paths.root.glob("runs.sqlite3.backup-*")
+                )
+            )
+        )
+        original_fsync_anchor(anchor)
+
+    monkeypatch.setattr(ledger, "_replace_at", mutate_then_replace)
+    monkeypatch.setattr(ledger, "_fsync_anchor", observe_directory_fsync)
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert "/private/" not in str(error.value)
+    source = _raw(paths.database)
+    try:
+        assert source.execute("SELECT value FROM legacy").fetchone()[0] == "source"
+    finally:
+        source.close()
+    assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
+    assert list(paths.root.glob(".runs.sqlite3.backup-*.tmp")) == []
+    assert fsync_observations
+    assert fsync_observations[-1] == ()
+
+
+def test_backup_publication_guard_spans_both_validations_replace_and_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute("CREATE TABLE legacy(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO legacy VALUES ('source')")
+    legacy.close()
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original_validate = ledger._validate_backup_content
+    original_replace = ledger._replace_at
+    original_fsync_anchor = ledger._fsync_anchor
+    guard_active = False
+    validation_calls = 0
+
+    @contextmanager
+    def observe_guard(anchor: ledger_module._RootAnchor):
+        nonlocal guard_active
+        del anchor
+        assert guard_active is False
+        guard_active = True
+        try:
+            yield
+        finally:
+            guard_active = False
+
+    def observe_validation(*args: object, **kwargs: object) -> None:
+        nonlocal validation_calls
+        assert guard_active is True
+        validation_calls += 1
+        original_validate(*args, **kwargs)
+
+    def observe_replace(
+        anchor: ledger_module._RootAnchor,
+        source: str,
+        target: str,
+    ) -> None:
+        assert guard_active is True
+        original_replace(anchor, source, target)
+
+    def observe_fsync(anchor: ledger_module._RootAnchor) -> None:
+        if validation_calls:
+            assert guard_active is True
+        original_fsync_anchor(anchor)
+
+    monkeypatch.setattr(
+        ledger,
+        "_backup_publication_guard",
+        observe_guard,
+        raising=False,
+    )
+    monkeypatch.setattr(ledger, "_validate_backup_content", observe_validation)
+    monkeypatch.setattr(ledger, "_replace_at", observe_replace)
+    monkeypatch.setattr(ledger, "_fsync_anchor", observe_fsync)
+
+    ledger.initialize()
+
+    assert validation_calls == 2
+    assert guard_active is False
+
+
+def test_backup_lock_cleanup_failure_removes_published_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute("CREATE TABLE legacy(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO legacy VALUES ('source')")
+    legacy.close()
+    if os.name == "posix":
+        os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+
+    @contextmanager
+    def fail_guard_cleanup(anchor: ledger_module._RootAnchor):
+        del anchor
+        yield
+        raise OSError("/private/sensitive/backup-lock-cleanup")
+
+    monkeypatch.setattr(
+        ledger,
+        "_backup_publication_guard",
+        fail_guard_cleanup,
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert "/private/sensitive" not in str(error.value)
+    source = _raw(paths.database)
+    try:
+        assert source.execute("SELECT value FROM legacy").fetchone()[0] == "source"
+    finally:
+        source.close()
+    assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
+    assert list(paths.root.glob(".runs.sqlite3.backup-*.tmp")) == []
+
+
+def test_backup_fingerprint_uses_index_order_without_temporary_sort(
+    tmp_path: Path,
+) -> None:
+    ledger = WorkflowLedger(
+        _uncreated_paths(tmp_path),
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    connection = _raw(tmp_path / "ordered.sqlite3")
+    traced: list[str] = []
+    try:
+        connection.execute(
+            'CREATE TABLE "ordered values"('
+            '"first" TEXT COLLATE NOCASE, "second" INTEGER DESC, "value" BLOB, '
+            'PRIMARY KEY("first", "second")) WITHOUT ROWID'
+        )
+        connection.executemany(
+            'INSERT INTO "ordered values" VALUES (?, ?, ?)',
+            (
+                ("Beta", 1, sqlite3.Binary(b"\x02")),
+                ("alpha", 2, sqlite3.Binary(b"\x01")),
+            ),
+        )
+        connection.set_trace_callback(traced.append)
+
+        ledger._backup_content_sha256(connection)
+
+        order_queries = [
+            statement
+            for statement in traced
+            if 'FROM "ordered values" ORDER BY' in statement
+        ]
+        assert order_queries
+        assert all(
+            "__fcp_backup_fingerprint" not in statement
+            for statement in order_queries
+        )
+        plan = connection.execute(
+            f"EXPLAIN QUERY PLAN {order_queries[0]}"
+        ).fetchall()
+        assert all(
+            "USE TEMP B-TREE" not in str(row["detail"]).upper()
+            for row in plan
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit_value", "rows"),
+    (
+        ("_MAX_FINGERPRINT_CELL_BYTES", 1024, ((b"x" * 1025, b""),)),
+        ("_MAX_FINGERPRINT_ROW_BYTES", 1024, ((b"x" * 600, b"y" * 600),)),
+        (
+            "_MAX_FINGERPRINT_TABLE_BYTES",
+            1024,
+            ((b"x" * 600, b""), (b"y" * 600, b"")),
+        ),
+        (
+            "_MAX_FINGERPRINT_TOTAL_BYTES",
+            1024,
+            ((b"x" * 600, b""), (b"y" * 600, b"")),
+        ),
+        ("_MAX_FINGERPRINT_TABLE_ROWS", 1, ((b"x", b""), (b"y", b""))),
+    ),
+)
+def test_backup_fingerprint_budgets_reject_before_full_value_materialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit_value: int,
+    rows: tuple[tuple[bytes, bytes], ...],
+) -> None:
+    ledger = WorkflowLedger(
+        _uncreated_paths(tmp_path),
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    connection = _raw(tmp_path / f"{limit_name}.sqlite3")
+    connection.execute("CREATE TABLE bounded(first BLOB, second BLOB)")
+    connection.executemany("INSERT INTO bounded VALUES (?, ?)", rows)
+    traced: list[str] = []
+    connection.set_trace_callback(traced.append)
+    monkeypatch.setattr(
+        ledger_module,
+        limit_name,
+        limit_value,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ledger_module,
+        "_FINGERPRINT_CHUNK_BYTES",
+        256,
+    )
+    original_value = ledger_module._fingerprint_value
+    materialized_oversized_value = False
+
+    def observe_value(value: object) -> bytes:
+        nonlocal materialized_oversized_value
+        if (
+            isinstance(value, (str, bytes, bytearray, memoryview))
+            and len(value) > 256
+        ):
+            materialized_oversized_value = True
+        return original_value(value)
+
+    monkeypatch.setattr(ledger_module, "_fingerprint_value", observe_value)
+    try:
+        with pytest.raises(ledger_module._MigrationError):
+            ledger._backup_content_sha256(connection)
+    finally:
+        connection.close()
+
+    assert materialized_oversized_value is False
+    if limit_name == "_MAX_FINGERPRINT_TABLE_ROWS":
+        assert any("LIMIT 2" in statement for statement in traced)
+
+
+def test_backup_fingerprint_streams_supported_large_values_in_bounded_chunks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = WorkflowLedger(
+        _uncreated_paths(tmp_path),
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    first = _raw(tmp_path / "large-first.sqlite3")
+    second = _raw(tmp_path / "large-second.sqlite3")
+    payload = b"prefix\x00" + (b"x" * 8192) + b"\xffsuffix"
+    for connection in (first, second):
+        connection.execute("CREATE TABLE bounded(value BLOB, text_value TEXT)")
+        connection.execute(
+            "INSERT INTO bounded VALUES (?, ?)",
+            (sqlite3.Binary(payload), "prefix\x00" + ("z" * 8192)),
+        )
+    monkeypatch.setattr(
+        ledger_module,
+        "_FINGERPRINT_CHUNK_BYTES",
+        256,
+        raising=False,
+    )
+    original_value = ledger_module._fingerprint_value
+    largest_materialized_value = 0
+
+    def observe_value(value: object) -> bytes:
+        nonlocal largest_materialized_value
+        if isinstance(value, (str, bytes, bytearray, memoryview)):
+            largest_materialized_value = max(
+                largest_materialized_value,
+                len(value),
+            )
+        return original_value(value)
+
+    monkeypatch.setattr(ledger_module, "_fingerprint_value", observe_value)
+    try:
+        baseline = ledger._backup_content_sha256(first)
+        assert ledger._backup_content_sha256(second) == baseline
+    finally:
+        first.close()
+        second.close()
+
+    assert largest_materialized_value <= 256
+
+
+def test_backup_fingerprint_rejects_unsupported_custom_without_rowid_shape(
+    tmp_path: Path,
+) -> None:
+    ledger = WorkflowLedger(
+        _uncreated_paths(tmp_path),
+        clock=TickClock(),
+        package_version="0.3.0-test",
+    )
+    connection = _raw(tmp_path / "custom-collation.sqlite3")
+    connection.create_collation(
+        "HOSTILE",
+        lambda left, right: (left > right) - (left < right),
+    )
+    try:
+        connection.execute(
+            "CREATE TABLE unsupported("
+            "key TEXT COLLATE HOSTILE PRIMARY KEY, value BLOB) WITHOUT ROWID"
+        )
+        connection.execute(
+            "INSERT INTO unsupported VALUES (?, ?)",
+            ("key", sqlite3.Binary(b"value")),
+        )
+
+        with pytest.raises(ledger_module._MigrationError):
+            ledger._backup_content_sha256(connection)
+    finally:
+        connection.close()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires open-inode displacement")
