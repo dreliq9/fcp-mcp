@@ -52,8 +52,65 @@ class TestMarkers:
 
 class TestClipOperations:
     def test_trim_clip(self, modifier):
+        sequence = modifier.root.find(".//sequence")
+        assert sequence is not None
+        before = sequence.get("duration")
+
         result = modifier.trim_clip("Interview_A", new_duration="120120/30000s")
+
         assert result is True
+        assert sequence.get("duration") == before
+
+    def test_trim_last_storyline_clip_updates_sequence_duration(self, modifier):
+        result = modifier.trim_clip(
+            "Interview_A_Outro",
+            new_duration="1001/30000s",
+        )
+
+        assert result is True
+        sequence = modifier.root.find(".//sequence")
+        assert sequence is not None
+        assert sequence.get("duration") == "61061/5000s"
+
+    def test_trim_storyline_duration_is_relative_to_sequence_timecode(
+        self,
+        tmp_path,
+    ):
+        source = tmp_path / "nonzero-timecode.fcpxml"
+        source.write_text(
+            """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11">
+    <resources><format id="r1" frameDuration="1/30s"/></resources>
+    <library><event name="Event"><project name="Project">
+        <sequence format="r1" duration="10s" tcStart="3600s">
+            <spine><gap name="Storyline" offset="3600s" duration="10s"/></spine>
+        </sequence>
+    </project></event></library>
+</fcpxml>
+"""
+        )
+        modifier = FCPXMLModifier(source)
+
+        result = modifier.trim_clip("Storyline", new_duration="5s")
+
+        assert result is True
+        sequence = modifier.root.find(".//sequence")
+        assert sequence is not None
+        assert sequence.get("duration") == "5s"
+
+    def test_trim_connected_clip_does_not_change_sequence_duration(self, modifier):
+        sequence = modifier.root.find(".//sequence")
+        assert sequence is not None
+        before = sequence.get("duration")
+
+        result = modifier.trim_clip(
+            "Beach Scene",
+            new_duration="600600/30000s",
+        )
+
+        assert result is True
+        assert sequence.get("duration") == before
 
     def test_split_clip(self, modifier):
         result = modifier.split_clip("Interview_A", "60060/30000s")

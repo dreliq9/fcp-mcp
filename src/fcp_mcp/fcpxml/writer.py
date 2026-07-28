@@ -169,6 +169,7 @@ class FCPXMLModifier:
             clip_el.set("start", new_start)
         if new_duration is not None:
             clip_el.set("duration", new_duration)
+            self._sync_primary_sequence_duration(clip_el)
         return True
 
     def split_clip(self, clip_name: str, split_at: str) -> bool:
@@ -460,6 +461,41 @@ class FCPXMLModifier:
                 if child is target:
                     return parent
         return None
+
+    def _primary_sequence_for(self, target: ET.Element) -> ET.Element | None:
+        """Return the sequence when target belongs to its primary storyline."""
+        if target.get("lane", "0") != "0":
+            return None
+        spine = self._find_parent(target)
+        if spine is None or spine.tag != "spine":
+            return None
+        sequence = self._find_parent(spine)
+        if sequence is None or sequence.tag != "sequence":
+            return None
+        return sequence
+
+    def _primary_storyline_duration(self, sequence: ET.Element) -> RationalTime:
+        """Calculate sequence duration from the endpoint of its primary storyline."""
+        spine = sequence.find("spine")
+        tc_start = RationalTime.from_fcpxml(sequence.get("tcStart", "0s"))
+        endpoint = tc_start
+        if spine is not None:
+            for child in spine:
+                if child.get("lane", "0") != "0" or child.get("duration") is None:
+                    continue
+                offset = RationalTime.from_fcpxml(child.get("offset", "0s"))
+                duration = RationalTime.from_fcpxml(child.get("duration", "0s"))
+                endpoint = max(endpoint, offset + duration)
+        return endpoint - tc_start
+
+    def _sync_primary_sequence_duration(self, target: ET.Element) -> None:
+        """Synchronize duplicated sequence duration after a primary-storyline edit."""
+        sequence = self._primary_sequence_for(target)
+        if sequence is not None:
+            duration = self._primary_storyline_duration(sequence)
+            current = sequence.get("duration")
+            if current is None or RationalTime.from_fcpxml(current) != duration:
+                sequence.set("duration", duration.to_fcpxml())
 
     def _recalculate_offsets(self, spine_el: ET.Element) -> None:
         """Recalculate offsets for all clips in a spine sequentially."""

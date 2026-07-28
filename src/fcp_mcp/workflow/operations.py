@@ -1048,6 +1048,10 @@ def _execute_trim_clip(
         raise _ExecutionError(ErrorCode.OPERATION_FAILED, "preflight target disappeared")
     before_start = target.get("start", "0s")
     before_duration = target.get("duration", "0s")
+    sequence = modifier._primary_sequence_for(target)
+    before_sequence_duration = (
+        sequence.get("duration") if sequence is not None else None
+    )
     result = modifier.trim_clip(
         operation.clip_name,
         operation.new_start,
@@ -1055,10 +1059,21 @@ def _execute_trim_clip(
     )
     expected_start = operation.new_start or before_start
     expected_duration = operation.new_duration or before_duration
+    after_sequence_duration = (
+        sequence.get("duration") if sequence is not None else None
+    )
+    sequence_duration_valid = True
+    if sequence is not None and operation.new_duration is not None:
+        sequence_duration_valid = (
+            after_sequence_duration is not None
+            and RationalTime.from_fcpxml(after_sequence_duration)
+            == modifier._primary_storyline_duration(sequence)
+        )
     if (
         result is not True
         or target.get("start", "0s") != expected_start
         or target.get("duration", "0s") != expected_duration
+        or not sequence_duration_valid
     ):
         raise _ExecutionError(
             ErrorCode.OPERATION_FAILED,
@@ -1069,6 +1084,14 @@ def _execute_trim_clip(
         changes.append(_change("start", before_start, expected_start))
     if before_duration != expected_duration:
         changes.append(_change("duration", before_duration, expected_duration))
+    if before_sequence_duration != after_sequence_duration:
+        changes.append(
+            _change(
+                "sequence_duration",
+                before_sequence_duration,
+                after_sequence_duration,
+            )
+        )
     return _success_receipt(
         item,
         affected_entities=[operation.clip_name],

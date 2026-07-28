@@ -1221,6 +1221,32 @@ def test_reorder_receipt_reports_offset_only_changes(sample_fcpxml_path):
     assert _first_named(root, "Broll_City").get("offset") == "91091/10000s"
 
 
+def test_trim_last_storyline_clip_updates_sequence_duration_and_receipt(
+    sample_fcpxml_path,
+):
+    execution = execute_plan(
+        sample_fcpxml_path,
+        _plan(
+            TrimClipOperation(
+                kind="trim_clip",
+                clip_name="Interview_A_Outro",
+                new_duration="1001/30000s",
+            )
+        ),
+    )
+
+    root = _candidate_root(execution)
+    sequence = root.find(".//sequence")
+    assert sequence is not None
+    assert sequence.get("duration") == "61061/5000s"
+    assert any(
+        change.field == "sequence_duration"
+        and change.before == "390390/30000s"
+        and change.after == "61061/5000s"
+        for change in execution.receipts[0].changes
+    )
+
+
 def test_reorder_receipt_reports_missing_offset_normalization(
     sample_fcpxml_path, tmp_path
 ):
