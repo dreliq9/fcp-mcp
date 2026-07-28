@@ -34,8 +34,6 @@ def _sha256(path: Path) -> str:
 
 
 def _sync_directory(path: Path) -> None:
-    if os.name != "posix":
-        return
     descriptor = None
     try:
         descriptor = os.open(path, os.O_RDONLY)

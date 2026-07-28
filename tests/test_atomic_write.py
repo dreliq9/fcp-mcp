@@ -1,9 +1,30 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import fcp_mcp.utils.atomic_write as atomic_write_module
 from fcp_mcp.contracts import FCPMCPError
-from fcp_mcp.utils.atomic_write import atomic_replace_bytes
+from fcp_mcp.utils.atomic_write import _sync_directory, atomic_replace_bytes
+
+
+def test_directory_sync_has_no_unsupported_runtime_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls: list[tuple[str, object]] = []
+    fake_os = SimpleNamespace(
+        name="nt",
+        O_RDONLY=0,
+        open=lambda path, flags: calls.append(("open", path)) or 17,
+        fsync=lambda descriptor: calls.append(("fsync", descriptor)),
+        close=lambda descriptor: calls.append(("close", descriptor)),
+    )
+    monkeypatch.setattr(atomic_write_module, "os", fake_os)
+
+    _sync_directory(tmp_path)
+
+    assert calls == [("open", tmp_path), ("fsync", 17), ("close", 17)]
 
 
 def test_existing_destination_is_backed_up(tmp_path: Path):
