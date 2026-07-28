@@ -9,7 +9,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import ClassVar
 
-from ..utils.safe_xml import parse_fcpxml
+from ..utils.safe_xml import parse_fcpxml, parse_string
 from .models import (
     AppliedEffect,
     Asset,
@@ -57,8 +57,15 @@ class FCPXMLParser:
     def parse(self, path: str | Path) -> FCPXMLDocument:
         """Parse an FCPXML file and return a document model."""
         tree = parse_fcpxml(path)
-        root = tree.getroot()
+        return self._parse_root(tree.getroot())
 
+    def parse_bytes(self, payload: bytes) -> FCPXMLDocument:
+        """Parse in-memory FCPXML bytes without creating a temporary file."""
+        if not isinstance(payload, bytes):
+            raise TypeError("FCPXML payload must be bytes")
+        return self._parse_root(parse_string(payload))
+
+    def _parse_root(self, root: ET.Element) -> FCPXMLDocument:
         doc = FCPXMLDocument()
         doc.version = root.get("version", "1.11")
 

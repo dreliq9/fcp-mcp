@@ -64,8 +64,12 @@ from fcp_mcp.workflow.models import (
     ApprovalSource,
     ApprovalStrength,
     FindingDisposition,
+    LockState,
+    ObservedFileState,
     OperationReceiptV1,
     PriorDestinationState,
+    RecoveryAssessmentV1,
+    RecoveryBranch,
     ValidationIssueV1,
     ValidationResultV1,
     WorkflowCommitReceiptV1,
@@ -73,11 +77,18 @@ from fcp_mcp.workflow.models import (
     WorkflowPrepareRequestV1,
     WorkflowPreviewV1,
     WorkflowState,
+    WorkflowVerificationResultV1,
     canonical_json,
 )
 from fcp_mcp.workflow.operations import (
     CandidateDisposition,
     execute_plan,
+)
+from fcp_mcp.workflow.recovery import (
+    assess_run,
+    read_regular_bytes,
+    remove_stale_lock,
+    verify_run,
 )
 
 GRAPH_VERSION = "1"
@@ -1288,6 +1299,318 @@ class WorkflowEngine:
             self.ledger,
             run_id,
             now=self.utc_clock(),
+        )
+
+    def assess(self, run_id: str) -> RecoveryAssessmentV1:
+        """Purely classify durable evidence for one selected workflow run."""
+        run = self.ledger.get_run(run_id)
+        if run is None:
+            raise _coded(ErrorCode.WORKFLOW_STATE_CONFLICT, "workflow run does not exist")
+        return assess_run(
+            ledger=self.ledger,
+            artifacts=self.artifacts,
+            run=run,
+            max_file_bytes=self.config.max_source_bytes,
+            validate_candidate=self._validate_candidate_read_only,
+            receipt_evidence_status=self._receipt_evidence_status,
+        )
+
+    def _validate_candidate_read_only(self, payload: bytes) -> ValidationResultV1:
+        try:
+            parsed = FCPXMLParser().parse_bytes(payload)
+            converted = self._validation_result(
+                self.validator.validate_document(parsed)
+            )
+            if not converted.valid:
+                raise _coded(
+                    ErrorCode.VALIDATION_FAILED,
+                    "candidate validation failed",
+                )
+            return converted
+        except FCPMCPError:
+            raise
+        except Exception as error:  # noqa: BLE001 - parser/validator trust boundary
+            raise _coded(
+                ErrorCode.VALIDATION_FAILED,
+                "candidate validation failed",
+                error,
+            )
+
+    def _existing_recovery_receipt(
+        self,
+        run: LedgerRunRecord,
+    ) -> tuple[WorkflowCommitReceiptV1, bytes] | None:
+        path = self.artifacts.paths.artifacts / run.run_id / "receipt.json"
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        observation, payload = read_regular_bytes(
+            path,
+            self.config.max_artifact_bytes,
+            required_mode=0o600,
+        )
+        if observation.state is not ObservedFileState.PRESENT or payload is None:
+            raise _coded(
+                ErrorCode.RECOVERY_REQUIRED,
+                "unrecorded receipt cannot be inspected safely",
+            )
+        try:
+            receipt = WorkflowCommitReceiptV1.model_validate_json(payload)
+            approval = self.ledger.get_approval(run.run_id)
+            logical = hashlib.sha256(
+                canonical_json(
+                    {
+                        **receipt.model_dump(mode="json"),
+                        "receipt_sha256": "0" * 64,
+                    }
+                )
+            ).hexdigest()
+            consistent = (
+                approval is not None
+                and receipt.run_id == run.run_id
+                and receipt.commit_attempt_id == run.commit_attempt_id
+                and receipt.candidate_sha256 == run.candidate_sha256
+                and receipt.output_sha256 == run.candidate_sha256
+                and receipt.source_sha256 == run.source_sha256
+                and receipt.prior_destination_sha256
+                == run.prior_destination_sha256
+                and receipt.destination_path == run.destination_path
+                and receipt.backup_path == run.expected_backup_path
+                and receipt.approval_source is approval.source
+                and receipt.approval_binding_sha256 == approval.binding_sha256
+                and receipt.receipt_sha256 == logical
+            )
+            if not consistent:
+                raise _coded(
+                    ErrorCode.RECOVERY_REQUIRED,
+                    "unrecorded receipt contradicts commit intent",
+            )
+            return receipt, payload
+        except (ValidationError, ValueError, TypeError) as error:
+            raise _coded(
+                ErrorCode.RECOVERY_REQUIRED,
+                "unrecorded receipt is invalid",
+                error,
+            )
+
+    def _receipt_evidence_status(self, run: LedgerRunRecord) -> str:
+        try:
+            existing = self._existing_recovery_receipt(run)
+        except FCPMCPError:
+            return "invalid"
+        return "valid" if existing is not None else "absent"
+
+    def _recovery_receipt(
+        self,
+        run: LedgerRunRecord,
+        candidate: bytes,
+    ) -> tuple[WorkflowCommitReceiptV1, bytes, str, bool]:
+        candidate_record = self.ledger.get_artifact(
+            run.run_id,
+            ArtifactKind.CANDIDATE,
+        )
+        approval = self.ledger.get_approval(run.run_id)
+        if (
+            candidate_record is None
+            or approval is None
+            or run.commit_attempt_id is None
+            or run.candidate_sha256 is None
+            or run.source_sha256 is None
+        ):
+            raise _coded(
+                ErrorCode.RECOVERY_REQUIRED,
+                "commit recovery evidence is incomplete",
+            )
+        if hashlib.sha256(candidate).hexdigest() != run.candidate_sha256:
+            raise _coded(ErrorCode.RECOVERY_REQUIRED, "candidate recovery hash changed")
+        existing = self._existing_recovery_receipt(run)
+        if existing is not None:
+            receipt, payload = existing
+            return receipt, payload, receipt.committed_at, True
+        validation = self._validate_candidate(candidate)
+        warnings = tuple(
+            issue.summary
+            for issue in validation.issues
+            if issue.severity is FindingDisposition.WARN
+        )[:MAX_WARNINGS]
+        strength = (
+            ApprovalStrength.CLI_VERIFIED_HUMAN
+            if approval.source is ApprovalSource.CLI
+            else ApprovalStrength.CLIENT_UNVERIFIED_HUMAN
+        )
+        committed_at = _canonical_utc(self.utc_clock())
+        fields = {
+            "schema_version": SCHEMA_VERSION,
+            "run_id": run.run_id,
+            "commit_attempt_id": run.commit_attempt_id,
+            "candidate_sha256": run.candidate_sha256,
+            "output_sha256": run.candidate_sha256,
+            "source_sha256": run.source_sha256,
+            "prior_destination_sha256": run.prior_destination_sha256,
+            "destination_path": run.destination_path,
+            "backup_path": run.expected_backup_path,
+            "validation_warnings": list(warnings),
+            "approval_source": approval.source,
+            "approval_strength": strength,
+            "approval_binding_sha256": approval.binding_sha256,
+            "committed_at": committed_at,
+        }
+        logical_hash = hashlib.sha256(
+            canonical_json({**fields, "receipt_sha256": "0" * 64})
+        ).hexdigest()
+        receipt = WorkflowCommitReceiptV1(
+            **fields,
+            receipt_sha256=logical_hash,
+        )
+        return receipt, canonical_json(receipt), committed_at, False
+
+    def reconcile(self, run_id: str) -> LedgerRunRecord:
+        """Apply one explicit recovery decision from rechecked durable evidence."""
+        run = self.ledger.get_run(run_id)
+        if run is None:
+            raise _coded(ErrorCode.WORKFLOW_STATE_CONFLICT, "workflow run does not exist")
+        assessment = self.assess(run_id)
+        destination = Path(run.destination_path)
+
+        if run.state is WorkflowState.APPROVED:
+            if assessment.recommended_branch is not RecoveryBranch.CLEAR_ORPHAN_LOCK:
+                return run
+            remove_stale_lock(self.artifacts.paths.locks, destination, run.run_id)
+            recorded = self.ledger.append_event(
+                run.run_id,
+                expected_state=WorkflowState.APPROVED,
+                expected_revision=run.revision,
+                event_type="orphan_lock_cleared",
+                payload={"lock_sha256": assessment.lock_sha256},
+            )
+            return recorded.run
+
+        if run.state is not WorkflowState.COMMITTING:
+            return run
+        if assessment.lock_state is LockState.STALE:
+            remove_stale_lock(self.artifacts.paths.locks, destination, run.run_id)
+        elif assessment.lock_state in {LockState.HELD, LockState.UNKNOWN}:
+            raise _coded(
+                ErrorCode.RECOVERY_REQUIRED,
+                "destination lock owner is live or ambiguous",
+            )
+
+        lock = DestinationLock(self.artifacts.paths, destination, run.run_id)
+        lock.acquire()
+        primary: BaseException | None = None
+        try:
+            current = self.ledger.get_run(run.run_id)
+            if current is None:
+                raise _coded(
+                    ErrorCode.WORKFLOW_STATE_CONFLICT,
+                    "workflow run does not exist",
+                )
+            if current.state is not WorkflowState.COMMITTING:
+                return current
+            reassessed = assess_run(
+                ledger=self.ledger,
+                artifacts=self.artifacts,
+                run=current,
+                max_file_bytes=self.config.max_source_bytes,
+                validate_candidate=self._validate_candidate_read_only,
+                receipt_evidence_status=self._receipt_evidence_status,
+            )
+            branch = reassessed.recommended_branch
+            if branch is RecoveryBranch.FINALIZE_COMMITTED:
+                record = self.ledger.get_artifact(
+                    current.run_id,
+                    ArtifactKind.CANDIDATE,
+                )
+                if record is None:
+                    raise _coded(
+                        ErrorCode.RECOVERY_REQUIRED,
+                        "candidate recovery evidence is missing",
+                    )
+                candidate = self.artifacts.read(_artifact_metadata(record))
+                receipt, payload, committed_at, receipt_exists = self._recovery_receipt(
+                    current,
+                    candidate,
+                )
+                metadata = (
+                    ArtifactMetadataV1(
+                        run_id=current.run_id,
+                        kind=ArtifactKind.RECEIPT,
+                        relative_path=(
+                            f"artifacts/{current.run_id}/receipt.json"
+                        ),
+                        sha256=hashlib.sha256(payload).hexdigest(),
+                        byte_size=len(payload),
+                        created_at=self.utc_clock(),
+                    )
+                    if receipt_exists
+                    else self.artifacts.write(
+                        current.run_id,
+                        ArtifactKind.RECEIPT,
+                        payload,
+                    )
+                )
+                finalized = self.ledger.record_commit_finalized(
+                    metadata,
+                    expected_revision=current.revision,
+                    destination_sha256=receipt.output_sha256,
+                    backup_sha256=current.backup_sha256,
+                    committed_at=committed_at,
+                )
+                return finalized.run
+            if branch is RecoveryBranch.MARK_ROLLED_BACK:
+                rolled_back = self.ledger.transition(
+                    current.run_id,
+                    expected_state=WorkflowState.COMMITTING,
+                    expected_revision=current.revision,
+                    target_state=WorkflowState.ROLLED_BACK,
+                    event_type="commit_reconciled_rolled_back",
+                    payload={"error_code": ErrorCode.TRANSACTION_FAILED.value},
+                    projection_patch={
+                        "terminal_error_code": ErrorCode.TRANSACTION_FAILED,
+                        "terminal_error_summary": "interrupted commit left prior state",
+                    },
+                )
+                return rolled_back.run
+            recovery_required = self.ledger.transition(
+                current.run_id,
+                expected_state=WorkflowState.COMMITTING,
+                expected_revision=current.revision,
+                target_state=WorkflowState.RECOVERY_REQUIRED,
+                event_type="commit_recovery_required",
+                payload={"error_code": ErrorCode.RECOVERY_REQUIRED.value},
+                projection_patch={
+                    "terminal_error_code": ErrorCode.RECOVERY_REQUIRED,
+                    "terminal_error_summary": (
+                        reassessed.ambiguity_reasons[0]
+                        if reassessed.ambiguity_reasons
+                        else "commit evidence is ambiguous"
+                    ),
+                },
+            )
+            return recovery_required.run
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                lock.release()
+            except FCPMCPError as release_error:
+                if primary is None:
+                    raise
+                if primary.__context__ is None:
+                    primary.__context__ = release_error
+
+    def verify(self, run_id: str) -> WorkflowVerificationResultV1:
+        """Read-only verification for one selected workflow run."""
+        run = self.ledger.get_run(run_id)
+        if run is None:
+            raise _coded(ErrorCode.WORKFLOW_STATE_CONFLICT, "workflow run does not exist")
+        return verify_run(
+            ledger=self.ledger,
+            artifacts=self.artifacts,
+            run=run,
+            max_file_bytes=self.config.max_source_bytes,
         )
 
     def _committed_receipt(

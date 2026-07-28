@@ -17,7 +17,7 @@ def parse_file(path: str | Path) -> ET.ElementTree:
     return SafeET.parse(str(path))
 
 
-def parse_string(xml_string: str) -> ET.Element:
+def parse_string(xml_string: str | bytes) -> ET.Element:
     """Parse an XML string safely, return root element."""
     return SafeET.fromstring(xml_string)
 

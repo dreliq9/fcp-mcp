@@ -1016,7 +1016,12 @@ def _validate_projection_policy(
         ):
             return
         raise _state_conflict("terminal workflow runs are immutable")
-    if target in {WorkflowState.APPROVED, WorkflowState.REJECTED}:
+    approved_audit = (
+        source is target is WorkflowState.APPROVED
+        and event_type == "orphan_lock_cleared"
+        and not patch
+    )
+    if target in {WorkflowState.APPROVED, WorkflowState.REJECTED} and not approved_audit:
         raise _state_conflict("approval transitions require record_decision")
     fields = frozenset(patch)
     if fields & _APPROVAL_PROJECTION_FIELDS:
