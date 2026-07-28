@@ -34,6 +34,9 @@ All notable changes to fcp-mcp are documented here. Format based on
 - The installed-wheel smoke source now includes the required asset
   `media-rep`, and live project durations serialize as FCPXML rational times
   instead of JavaScript object strings.
+- Primary-storyline trims now synchronize the owning sequence duration,
+  account for nonzero sequence timecode origins, preserve unchanged rational
+  spellings, and report any duration correction in the operation receipt.
 
 ### Boundaries
 
