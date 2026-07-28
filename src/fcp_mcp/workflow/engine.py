@@ -25,6 +25,24 @@ from fcp_mcp.fcpxml.parser import FCPXMLParser
 from fcp_mcp.fcpxml.validator import FCPXMLValidator, ValidationResult
 from fcp_mcp.observability import emit_event
 from fcp_mcp.security.paths import PathPolicy
+from fcp_mcp.workflow.approval import (
+    ClientApproval,
+)
+from fcp_mcp.workflow.approval import (
+    approve_cli as apply_cli_approval,
+)
+from fcp_mcp.workflow.approval import (
+    approve_client as stage_client_approval,
+)
+from fcp_mcp.workflow.approval import (
+    cancel as cancel_workflow,
+)
+from fcp_mcp.workflow.approval import (
+    effective_state as effective_workflow_state,
+)
+from fcp_mcp.workflow.approval import (
+    reject as reject_workflow,
+)
 from fcp_mcp.workflow.artifacts import (
     ArtifactKind,
     ArtifactMetadataV1,
@@ -33,6 +51,7 @@ from fcp_mcp.workflow.artifacts import (
 )
 from fcp_mcp.workflow.ledger import (
     ArtifactRecord,
+    DecisionMutationResult,
     EventMutationResult,
     LedgerRunRecord,
     WorkflowLedger,
@@ -1236,6 +1255,95 @@ class WorkflowEngine:
             },
         )
         return result.run
+
+    def _approval_run(self, run_id: str) -> LedgerRunRecord:
+        run = self.ledger.get_run(run_id)
+        if run is None:
+            raise _coded(
+                ErrorCode.WORKFLOW_STATE_CONFLICT,
+                "workflow run does not exist",
+            )
+        return run
+
+    def effective_state(self, run_id: str) -> WorkflowState:
+        """Return effective approval expiry without changing the ledger."""
+        return effective_workflow_state(
+            self._approval_run(run_id),
+            now=self.utc_clock(),
+        )
+
+    def approve_cli(
+        self,
+        run_id: str,
+        *,
+        input_stream: TextIO,
+        output_stream: TextIO,
+        yes: bool = False,
+        expect_candidate_sha256: str | None = None,
+        operator: str | None = None,
+        host: str | None = None,
+    ) -> DecisionMutationResult:
+        """Apply the CLI approval policy to one exact prepared run."""
+        return apply_cli_approval(
+            self.ledger,
+            self._approval_run(run_id),
+            plan_schema_version=SCHEMA_VERSION,
+            now=self.utc_clock(),
+            input_stream=input_stream,
+            output_stream=output_stream,
+            yes=yes,
+            expect_candidate_sha256=expect_candidate_sha256,
+            operator=operator,
+            host=host,
+        )
+
+    def approve_client(
+        self,
+        run_id: str,
+        *,
+        expect_candidate_sha256: str,
+    ) -> ClientApproval:
+        """Stage client evidence for Task 17's atomic commit boundary."""
+        return stage_client_approval(
+            self.ledger,
+            self._approval_run(run_id),
+            plan_schema_version=SCHEMA_VERSION,
+            now=self.utc_clock(),
+            expect_candidate_sha256=expect_candidate_sha256,
+        )
+
+    def reject(
+        self,
+        run_id: str,
+        *,
+        reason: str | None = None,
+        operator: str | None = None,
+        host: str | None = None,
+        terminal_present: bool = False,
+    ) -> DecisionMutationResult:
+        """Persist one immutable approval rejection."""
+        return reject_workflow(
+            self.ledger,
+            self._approval_run(run_id),
+            plan_schema_version=SCHEMA_VERSION,
+            reason=reason,
+            operator=operator,
+            host=host,
+            terminal_present=terminal_present,
+        )
+
+    def cancel(
+        self,
+        run_id: str,
+        *,
+        reason: str | None = None,
+    ) -> LedgerRunRecord:
+        """Cancel a legal workflow run while preserving its evidence."""
+        return cancel_workflow(
+            self.ledger,
+            self._approval_run(run_id),
+            reason=reason,
+        )
 
 
 __all__ = ["GRAPH_VERSION", "RUN_VERSION", "SCHEMA_VERSION", "WorkflowEngine"]
