@@ -353,11 +353,24 @@ def test_noncanonical_lock_keys_are_rejected(tmp_path: Path, lock_key: str):
     _assert_code(error, ErrorCode.INVALID_ARGUMENTS)
 
 
-def test_artifact_kind_is_closed(tmp_path: Path):
+def test_receipt_is_a_first_class_fixed_private_artifact(tmp_path: Path):
+    paths = StatePaths.from_config(_config(tmp_path))
+
+    assert paths.artifact_path(RUN_ID, ArtifactKind.RECEIPT) == (
+        paths.artifacts / RUN_ID / "receipt.json"
+    )
+    store = _store(tmp_path)
+    metadata = store.write(RUN_ID, ArtifactKind.RECEIPT, b'{"receipt":"exact"}')
+    assert metadata.relative_path == f"artifacts/{RUN_ID}/receipt.json"
+    assert _mode(paths.root / metadata.relative_path) == 0o600
+    assert store.read(metadata) == b'{"receipt":"exact"}'
+
+
+def test_artifact_kind_remains_closed_after_receipt(tmp_path: Path):
     paths = StatePaths.from_config(_config(tmp_path))
 
     with pytest.raises(FCPMCPError) as error:
-        paths.artifact_path(RUN_ID, "receipt")  # type: ignore[arg-type]
+        paths.artifact_path(RUN_ID, "unknown")  # type: ignore[arg-type]
 
     _assert_code(error, ErrorCode.INVALID_ARGUMENTS)
 

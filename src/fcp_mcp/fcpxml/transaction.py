@@ -68,6 +68,8 @@ def commit_fcpxml(
     validate_candidate: Callable[[Path], None] | None = None,
     event_format: str = "text",
     operation: str = "fcpxml_commit",
+    transaction_id: str | None = None,
+    backup_path: str | Path | None = None,
 ) -> FCPXMLTransactionReceipt:
     return commit_fcpxml_bytes(
         source=source,
@@ -77,6 +79,8 @@ def commit_fcpxml(
         validate_candidate=validate_candidate,
         event_format=event_format,
         operation=operation,
+        transaction_id=transaction_id,
+        backup_path=backup_path,
     )
 
 
@@ -89,9 +93,11 @@ def commit_fcpxml_bytes(
     validate_candidate: Callable[[Path], None] | None = None,
     event_format: str = "text",
     operation: str = "fcpxml_commit",
+    transaction_id: str | None = None,
+    backup_path: str | Path | None = None,
 ) -> FCPXMLTransactionReceipt:
     started = time.perf_counter()
-    transaction_id = str(uuid.uuid4())
+    transaction_id = transaction_id or str(uuid.uuid4())
     destination_path = Path(destination).expanduser().resolve()
     source_path = Path(source).expanduser().resolve() if source is not None else None
 
@@ -122,6 +128,7 @@ def commit_fcpxml_bytes(
             validate=validate,
             event_format=event_format,
             transaction_id=transaction_id,
+            backup_path=backup_path,
         )
     except FCPMCPError as error:
         emit_event(

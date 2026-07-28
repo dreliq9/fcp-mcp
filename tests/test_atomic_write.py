@@ -65,3 +65,75 @@ def test_post_commit_failure_removes_new_destination(tmp_path: Path):
 
     assert destination.exists() is False
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_preassigned_backup_is_exact_absent_and_same_parent(tmp_path: Path):
+    destination = tmp_path / "out.txt"
+    destination.write_bytes(b"before")
+    attempt = "223e4567-e89b-42d3-a456-426614174000"
+    backup = tmp_path / f"out.txt.bak.{attempt}"
+
+    receipt = atomic_replace_bytes(
+        destination,
+        b"after",
+        transaction_id=attempt,
+        backup_path=backup,
+    )
+
+    assert receipt.transaction_id == attempt
+    assert receipt.backup_path == backup
+    assert backup.read_bytes() == b"before"
+    assert destination.read_bytes() == b"after"
+
+
+def test_preassigned_backup_rejects_existing_or_wrong_identity_without_mutation(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "out.txt"
+    destination.write_bytes(b"before")
+    attempt = "223e4567-e89b-42d3-a456-426614174000"
+    valid = tmp_path / f"out.txt.bak.{attempt}"
+    valid.write_bytes(b"occupied")
+    for backup in (valid, tmp_path / "other.bak", tmp_path.parent / valid.name):
+        with pytest.raises(FCPMCPError):
+            atomic_replace_bytes(
+                destination,
+                b"after",
+                transaction_id=attempt,
+                backup_path=backup,
+            )
+        assert destination.read_bytes() == b"before"
+        assert valid.read_bytes() == b"occupied"
+
+
+def test_preassigned_backup_is_created_exclusively_after_absence_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "out.txt"
+    destination.write_bytes(b"before")
+    attempt = "223e4567-e89b-42d3-a456-426614174000"
+    backup = tmp_path / f"out.txt.bak.{attempt}"
+    original_exists = Path.exists
+    injected = False
+
+    def appear_after_check(path: Path) -> bool:
+        nonlocal injected
+        if path == backup and not injected:
+            backup.write_bytes(b"concurrent owner")
+            injected = True
+            return False
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", appear_after_check)
+
+    with pytest.raises(FCPMCPError):
+        atomic_replace_bytes(
+            destination,
+            b"after",
+            transaction_id=attempt,
+            backup_path=backup,
+        )
+
+    assert destination.read_bytes() == b"before"
+    assert backup.read_bytes() == b"concurrent owner"

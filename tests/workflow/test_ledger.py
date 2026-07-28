@@ -392,7 +392,11 @@ def _metadata(
     digest: str = HASH_C,
     size: int = 9,
 ) -> ArtifactMetadataV1:
-    filename = "candidate.fcpxml" if kind is ArtifactKind.CANDIDATE else "diff.json"
+    filename = {
+        ArtifactKind.CANDIDATE: "candidate.fcpxml",
+        ArtifactKind.DIFF: "diff.json",
+        ArtifactKind.RECEIPT: "receipt.json",
+    }[kind]
     return ArtifactMetadataV1(
         run_id=run_id,
         kind=kind,
@@ -605,10 +609,9 @@ def test_migration_checksum_has_stable_unambiguous_serialization() -> None:
         migration_checksum(1, "initial", ("SELECT 1", "SELECT 2"))
         == "28c57fce233ef9c2cef4dd505c80ade109d1c27278f155b32fcf85668b8f57b5"
     )
-    assert [migration.version for migration in MIGRATIONS] == [1, 2]
+    assert [migration.version for migration in MIGRATIONS] == [1]
     assert [migration.name for migration in MIGRATIONS] == [
         "initial_workflow_ledger",
-        "add_prepare_failure_evidence",
     ]
     for migration in MIGRATIONS:
         assert migration == Migration(
@@ -637,8 +640,8 @@ def test_initialize_is_idempotent_and_records_package_and_canonical_time(
         rows = connection.execute("SELECT * FROM schema_migrations").fetchall()
     finally:
         connection.close()
-    assert len(rows) == 2
-    assert [row["version"] for row in rows] == [1, 2]
+    assert len(rows) == 1
+    assert [row["version"] for row in rows] == [1]
     assert [row["name"] for row in rows] == [
         migration.name for migration in MIGRATIONS
     ]
@@ -675,13 +678,14 @@ def test_concurrent_initializers_apply_migration_once(tmp_path: Path) -> None:
     assert all(not thread.is_alive() for thread in threads)
     connection = _raw(paths.database)
     try:
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
     finally:
         connection.close()
 
 
-def test_v1_to_v2_migration_preserves_artifacts_and_recreates_append_only_triggers(
+def test_future_post_release_migration_preserves_existing_artifacts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths = _paths(tmp_path)
     ledger = _ledger(tmp_path)
@@ -693,39 +697,20 @@ def test_v1_to_v2_migration_preserves_artifacts_and_recreates_append_only_trigge
         event_type="candidate_stored",
         event_payload={"sha256": HASH_C},
     ).artifact
-    connection = _raw(paths.database)
-    try:
-        connection.execute("DROP TRIGGER artifacts_no_update")
-        connection.execute("DROP TRIGGER artifacts_no_delete")
-        connection.execute("ALTER TABLE artifacts RENAME TO artifacts_v2")
-        v1_table = next(
-            statement
-            for statement in ledger_module._MIGRATION_1_STATEMENTS
-            if statement.startswith("CREATE TABLE artifacts")
-        )
-        connection.execute(v1_table)
-        connection.execute(
-            "INSERT INTO artifacts "
-            "SELECT run_id, kind, relative_path, sha256, byte_size, created_at "
-            "FROM artifacts_v2"
-        )
-        connection.execute("DROP TABLE artifacts_v2")
-        for statement in ledger_module._MIGRATION_1_STATEMENTS:
-            if statement.startswith("CREATE TRIGGER artifacts_"):
-                connection.execute(statement)
-        connection.execute("DROP TRIGGER schema_migrations_no_delete")
-        connection.execute("DELETE FROM schema_migrations WHERE version = 2")
-        connection.execute(
-            next(
-                statement
-                for statement in ledger_module._MIGRATION_1_STATEMENTS
-                if statement.startswith(
-                    "CREATE TRIGGER schema_migrations_no_delete"
-                )
-            )
-        )
-    finally:
-        connection.close()
+    future_statements = (
+        "CREATE TABLE post_release_probe(value TEXT NOT NULL)",
+    )
+    future = Migration(
+        version=2,
+        name="post_release_probe",
+        statements=future_statements,
+        checksum=migration_checksum(
+            2,
+            "post_release_probe",
+            future_statements,
+        ),
+    )
+    monkeypatch.setattr(ledger_module, "MIGRATIONS", MIGRATIONS + (future,))
 
     WorkflowLedger(
         paths,
@@ -748,6 +733,13 @@ def test_v1_to_v2_migration_preserves_artifacts_and_recreates_append_only_trigge
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
         ] == [1, 2]
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'post_release_probe'"
+            ).fetchone()[0]
+            == 1
+        )
         connection.execute("BEGIN")
         with pytest.raises(sqlite3.IntegrityError, match="append-only"):
             connection.execute(
@@ -780,7 +772,7 @@ def test_existing_meaningful_database_is_backed_up_before_migration(
     ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
     ledger.initialize()
 
-    backups = list(paths.root.glob("runs.sqlite3.backup-v0-to-v2-*"))
+    backups = list(paths.root.glob("runs.sqlite3.backup-v0-to-v1-*"))
     assert len(backups) == 1
     if os.name == "posix":
         assert _mode(backups[0]) == 0o600
@@ -799,7 +791,7 @@ def test_existing_meaningful_database_is_backed_up_before_migration(
     current = _raw(paths.database)
     try:
         assert current.execute("SELECT value FROM legacy").fetchone()[0] == "snapshot"
-        assert current.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 2
+        assert current.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
     finally:
         current.close()
 
@@ -982,7 +974,7 @@ def test_migration_failure_attaches_residual_backup_cleanup_failure(
     cleanup_failures = getattr(cause, "cleanup_failures", ())
     assert cleanup_failures
     assert all(len(str(failure)) <= 255 for failure in cleanup_failures)
-    assert len(list(paths.root.glob("runs.sqlite3.backup-v0-to-v2-*"))) == 1
+    assert len(list(paths.root.glob("runs.sqlite3.backup-v0-to-v1-*"))) == 1
     current = _raw(paths.database)
     try:
         assert (
@@ -2507,7 +2499,7 @@ def test_integrity_verifier_accepts_valid_chains_and_is_read_only(tmp_path: Path
     )
     assert isinstance(result, IntegrityResult)
     assert result.valid is True
-    assert result.checked_migrations == 2
+    assert result.checked_migrations == 1
     assert result.checked_runs == 1
     assert result.checked_events == 2
     assert result.findings == ()
@@ -3817,49 +3809,29 @@ def test_present_destination_final_commit_echoes_authenticated_backup(
 
     for final_backup in (None, HASH_B):
         with pytest.raises(FCPMCPError) as mismatch:
-            ledger.transition(
-                RUN_ID,
-                expected_state=WorkflowState.COMMITTING,
-                expected_revision=committing.run.revision,
-                target_state=WorkflowState.COMMITTED,
-                event_type="committed",
-                payload={
-                    "destination_sha256": HASH_C,
-                    "backup_sha256": final_backup,
-                    "receipt_sha256": HASH_E,
-                    "receipt_size_bytes": 42,
-                    "committed_at": "2026-07-27T02:02:03Z",
-                },
-                projection_patch={
-                    "destination_sha256": HASH_C,
-                    "backup_sha256": final_backup,
-                    "receipt_sha256": HASH_E,
-                    "receipt_size_bytes": 42,
-                    "committed_at": "2026-07-27T02:02:03Z",
-                },
-            )
+                ledger.record_commit_finalized(
+                    _metadata(
+                        kind=ArtifactKind.RECEIPT,
+                        digest=HASH_E,
+                        size=42,
+                    ),
+                    expected_revision=committing.run.revision,
+                    destination_sha256=HASH_C,
+                    backup_sha256=final_backup,
+                    committed_at="2026-07-27T02:02:03Z",
+                )
         _assert_code(mismatch, ErrorCode.WORKFLOW_STATE_CONFLICT)
 
-    committed = ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.COMMITTING,
+    committed = ledger.record_commit_finalized(
+        _metadata(
+            kind=ArtifactKind.RECEIPT,
+            digest=HASH_E,
+            size=42,
+        ),
         expected_revision=committing.run.revision,
-        target_state=WorkflowState.COMMITTED,
-        event_type="committed",
-        payload={
-            "destination_sha256": HASH_C,
-            "backup_sha256": HASH_A,
-            "receipt_sha256": HASH_E,
-            "receipt_size_bytes": 42,
-            "committed_at": "2026-07-27T02:02:03Z",
-        },
-        projection_patch={
-            "destination_sha256": HASH_C,
-            "backup_sha256": HASH_A,
-            "receipt_sha256": HASH_E,
-            "receipt_size_bytes": 42,
-            "committed_at": "2026-07-27T02:02:03Z",
-        },
+        destination_sha256=HASH_C,
+        backup_sha256=HASH_A,
+        committed_at="2026-07-27T02:02:03Z",
     )
 
     assert committed.run.backup_sha256 == HASH_A
@@ -5067,3 +5039,84 @@ def test_public_close_failures_are_sanitized_without_masking_primary_code(
     if primary_failure:
         assert cleanup_failures
         assert all("/private/sensitive" not in str(item) for item in cleanup_failures)
+
+
+def test_commit_intent_is_one_authoritative_approval_consuming_cas(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    approved = _approve(ledger, _complete_prepare(ledger))
+    result = ledger.record_commit_intent(
+        RUN_ID,
+        expected_revision=approved.run.revision,
+        commit_attempt_id=ATTEMPT_ID,
+        expected_backup_path=None,
+        backup_sha256=None,
+        plan_schema_version="1",
+    )
+
+    assert result.run.state is WorkflowState.COMMITTING
+    assert result.run.commit_attempt_id == ATTEMPT_ID
+    assert result.approval == approved.approval
+    assert result.event.event_type == "commit_started"
+    assert result.event.payload == {
+        "backup_sha256": None,
+        "commit_attempt_id": ATTEMPT_ID,
+        "expected_backup_path": None,
+    }
+    assert ledger.list_events(RUN_ID, limit=100)[-1] == result.event
+
+
+def test_client_approval_is_created_only_inside_commit_intent_cas(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger, approval_mode=ApprovalMode.CLIENT)
+    awaiting = _complete_prepare(ledger)
+    binding = ledger.approval_binding(RUN_ID, plan_schema_version="1")
+    assert ledger.get_approval(RUN_ID) is None
+
+    result = ledger.record_commit_intent(
+        RUN_ID,
+        expected_revision=awaiting.run.revision,
+        commit_attempt_id=ATTEMPT_ID,
+        expected_backup_path=None,
+        backup_sha256=None,
+        plan_schema_version="1",
+        client_binding_sha256=binding,
+    )
+
+    assert result.run.state is WorkflowState.COMMITTING
+    assert result.approval.source is ApprovalSource.CLIENT
+    assert ledger.get_approval(RUN_ID) == result.approval
+
+
+def test_unreleased_v03_schema_is_one_baseline_with_current_artifact_contract(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    assert [migration.version for migration in MIGRATIONS] == [1]
+    _create(ledger)
+    original = ledger.record_artifact(
+        _metadata(),
+        expected_state=WorkflowState.PREPARING,
+        expected_revision=1,
+        event_type="candidate_stored",
+        event_payload={"sha256": HASH_C},
+    ).artifact
+    assert ledger.get_artifact(RUN_ID, ArtifactKind.CANDIDATE) == original
+
+    connection = _raw(_paths(tmp_path).database)
+    try:
+        sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='artifacts'"
+        ).fetchone()["sql"]
+        assert "'receipt'" in sql
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "DELETE FROM artifacts WHERE run_id = ?",
+                (RUN_ID,),
+            )
+    finally:
+        connection.close()

@@ -22,6 +22,7 @@ from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.fcpxml.diff import append_operation_effects, build_workflow_diff
 from fcp_mcp.fcpxml.parser import FCPXMLParser
+from fcp_mcp.fcpxml.transaction import commit_fcpxml_bytes
 from fcp_mcp.fcpxml.validator import FCPXMLValidator, ValidationResult
 from fcp_mcp.observability import emit_event
 from fcp_mcp.security.paths import PathPolicy
@@ -56,14 +57,18 @@ from fcp_mcp.workflow.ledger import (
     LedgerRunRecord,
     WorkflowLedger,
 )
+from fcp_mcp.workflow.locking import DestinationLock
 from fcp_mcp.workflow.models import (
     MAX_EVIDENCE_ITEMS,
     MAX_WARNINGS,
+    ApprovalSource,
+    ApprovalStrength,
     FindingDisposition,
     OperationReceiptV1,
     PriorDestinationState,
     ValidationIssueV1,
     ValidationResultV1,
+    WorkflowCommitReceiptV1,
     WorkflowPlanV1,
     WorkflowPrepareRequestV1,
     WorkflowPreviewV1,
@@ -350,6 +355,27 @@ def _snapshot_bytes(payload: bytes, root: Path) -> _DescriptorSnapshot:
                     "private snapshot cleanup failed",
                 )
         raise
+
+
+def _snapshot_payload(snapshot: _DescriptorSnapshot) -> bytes:
+    snapshot.verify()
+    chunks: list[bytes] = []
+    offset = 0
+    while offset < snapshot.size:
+        chunk = os.pread(
+            snapshot.descriptor,
+            min(_READ_CHUNK, snapshot.size - offset),
+            offset,
+        )
+        if not chunk:
+            raise _coded(
+                ErrorCode.WORKFLOW_STALE,
+                "private snapshot was truncated",
+            )
+        chunks.append(chunk)
+        offset += len(chunk)
+    snapshot.verify()
+    return b"".join(chunks)
 
 
 def _snapshot_regular(
@@ -1263,6 +1289,307 @@ class WorkflowEngine:
             run_id,
             now=self.utc_clock(),
         )
+
+    def _committed_receipt(
+        self,
+        run: LedgerRunRecord,
+    ) -> WorkflowCommitReceiptV1:
+        record = self.ledger.get_artifact(run.run_id, ArtifactKind.RECEIPT)
+        if record is None:
+            raise _coded(ErrorCode.ARTIFACT_CORRUPT, "commit receipt is missing")
+        payload = self.artifacts.read(_artifact_metadata(record))
+        if hashlib.sha256(payload).hexdigest() != run.receipt_sha256:
+            raise _coded(ErrorCode.ARTIFACT_CORRUPT, "commit receipt hash mismatch")
+        try:
+            receipt = WorkflowCommitReceiptV1.model_validate_json(payload)
+        except ValidationError as error:
+            raise _coded(ErrorCode.ARTIFACT_CORRUPT, "commit receipt is invalid", error)
+        current = _read_regular(
+            Path(run.destination_path),
+            self.config.max_source_bytes,
+            missing_ok=False,
+        )
+        if current.sha256 != receipt.output_sha256:
+            raise _coded(
+                ErrorCode.WORKFLOW_STALE,
+                "committed destination no longer matches receipt",
+            )
+        return receipt
+
+    def commit(
+        self,
+        run_id: str,
+        *,
+        client_approval: ClientApproval | None = None,
+    ) -> WorkflowCommitReceiptV1:
+        """Commit one exact approved candidate through durable intent."""
+        run = self.ledger.get_run(run_id)
+        if run is None:
+            raise _coded(ErrorCode.WORKFLOW_STATE_CONFLICT, "workflow run does not exist")
+        if run.state is WorkflowState.COMMITTED:
+            return self._committed_receipt(run)
+        expected_state = (
+            WorkflowState.APPROVED
+            if run.approval_mode.value == ApprovalSource.CLI.value
+            else WorkflowState.AWAITING_APPROVAL
+        )
+        if run.state is not expected_state:
+            raise _coded(
+                ErrorCode.WORKFLOW_STATE_CONFLICT,
+                "workflow is not approved for commit",
+            )
+        if run.approval_mode.value == ApprovalSource.CLIENT.value:
+            if client_approval is None or client_approval.run_id != run.run_id:
+                raise _coded(
+                    ErrorCode.APPROVAL_REQUIRED,
+                    "client commit requires exact staged approval",
+                )
+        elif client_approval is not None:
+            raise _coded(
+                ErrorCode.WORKFLOW_STATE_CONFLICT,
+                "CLI commit cannot consume client approval",
+            )
+
+        destination = Path(run.destination_path)
+        lock = DestinationLock(self.artifacts.paths, destination, run.run_id)
+        lock.acquire()
+        primary: BaseException | None = None
+        finalized = False
+        try:
+            source = _read_regular(
+                Path(run.source_path),
+                self.config.max_source_bytes,
+                missing_ok=False,
+            )
+            prior = _read_regular(
+                destination,
+                self.config.max_source_bytes,
+                missing_ok=True,
+            )
+            candidate_record = self.ledger.get_artifact(
+                run.run_id,
+                ArtifactKind.CANDIDATE,
+            )
+            diff_record = self.ledger.get_artifact(run.run_id, ArtifactKind.DIFF)
+            if candidate_record is None or diff_record is None:
+                raise _coded(
+                    ErrorCode.ARTIFACT_CORRUPT,
+                    "commit evidence is incomplete",
+                )
+            candidate = self.artifacts.read(_artifact_metadata(candidate_record))
+            diff = self.artifacts.read(_artifact_metadata(diff_record))
+            try:
+                envelope = json.loads(diff.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise _coded(ErrorCode.ARTIFACT_CORRUPT, "diff evidence is invalid", error)
+            evidence_matches = (
+                source.sha256 == run.source_sha256
+                and prior.state is run.prior_destination_state
+                and prior.sha256 == run.prior_destination_sha256
+                and hashlib.sha256(candidate).hexdigest() == run.candidate_sha256
+                and len(candidate) == run.candidate_size_bytes
+                and hashlib.sha256(diff).hexdigest() == run.diff_sha256
+                and len(diff) == run.diff_size_bytes
+                and isinstance(envelope, dict)
+                and canonical_json(envelope) == diff
+                and envelope.get("plan_sha256") == run.plan_sha256
+                and envelope.get("candidate_sha256") == run.candidate_sha256
+                and envelope.get("run_id") == run.run_id
+            )
+            if not evidence_matches:
+                stale = self.ledger.transition(
+                    run.run_id,
+                    expected_state=run.state,
+                    expected_revision=run.revision,
+                    target_state=WorkflowState.STALE,
+                    event_type="commit_precondition_stale",
+                    payload={"error_code": ErrorCode.WORKFLOW_STALE.value},
+                )
+                self._observe_mutation(
+                    stale,
+                    "commit_precondition_stale",
+                    self.monotonic_clock(),
+                )
+                raise _coded(ErrorCode.WORKFLOW_STALE, "commit precondition changed")
+
+            attempt_id = str(self.uuid_factory())
+            backup_path = (
+                destination.with_name(f"{destination.name}.bak.{attempt_id}")
+                if run.prior_destination_sha256 is not None
+                else None
+            )
+            intent = self.ledger.record_commit_intent(
+                run.run_id,
+                expected_revision=run.revision,
+                commit_attempt_id=attempt_id,
+                expected_backup_path=(
+                    str(backup_path) if backup_path is not None else None
+                ),
+                backup_sha256=run.prior_destination_sha256,
+                plan_schema_version=SCHEMA_VERSION,
+                client_binding_sha256=(
+                    client_approval.binding_sha256
+                    if client_approval is not None
+                    else None
+                ),
+            )
+            self._fault("commit_started")
+            write_receipt = commit_fcpxml_bytes(
+                source=run.source_path,
+                destination=destination,
+                xml_bytes=candidate,
+                validator=self.validator,
+                event_format=self.config.log_format,
+                operation="fcpxml_workflow_commit",
+                transaction_id=attempt_id,
+                backup_path=backup_path,
+            )
+            self._fault("destination_replaced")
+            if write_receipt.prior_sha256 != run.prior_destination_sha256:
+                raise _coded(
+                    ErrorCode.RECOVERY_REQUIRED,
+                    "commit prior-destination evidence changed after intent",
+                )
+            if backup_path is not None:
+                backup = _read_regular(
+                    backup_path,
+                    self.config.max_source_bytes,
+                    missing_ok=False,
+                )
+                if backup.sha256 != run.prior_destination_sha256:
+                    raise _coded(
+                        ErrorCode.RECOVERY_REQUIRED,
+                        "commit backup verification failed",
+                    )
+            elif write_receipt.backup_path is not None:
+                raise _coded(
+                    ErrorCode.RECOVERY_REQUIRED,
+                    "unexpected commit backup was created",
+                )
+            try:
+                final_snapshot, final_evidence = _snapshot_regular(
+                    destination,
+                    self.config.max_source_bytes,
+                    self.artifacts.paths.root,
+                )
+            except (FCPMCPError, OSError) as error:
+                raise _coded(
+                    ErrorCode.RECOVERY_REQUIRED,
+                    "committed destination cannot be inspected safely",
+                    error,
+                )
+            final_primary: BaseException | None = None
+            try:
+                reopened = _snapshot_payload(final_snapshot)
+                output_sha256 = hashlib.sha256(reopened).hexdigest()
+                if (
+                    final_evidence.sha256 != output_sha256
+                    or reopened != candidate
+                    or output_sha256 != run.candidate_sha256
+                ):
+                    raise _coded(
+                        ErrorCode.RECOVERY_REQUIRED,
+                        "committed destination verification failed",
+                    )
+                validation, _ = self._validate_and_parse_candidate(reopened)
+                if not validation.valid:
+                    raise _coded(
+                        ErrorCode.RECOVERY_REQUIRED,
+                        "committed destination validation failed",
+                    )
+            except BaseException as error:
+                final_primary = error
+                raise
+            finally:
+                if final_primary is None:
+                    final_snapshot.close()
+                else:
+                    final_snapshot.close_preserving(final_primary)
+            approval = intent.approval
+            strength = (
+                ApprovalStrength.CLI_VERIFIED_HUMAN
+                if approval.source is ApprovalSource.CLI
+                else ApprovalStrength.CLIENT_UNVERIFIED_HUMAN
+            )
+            committed_at = _canonical_utc(self.utc_clock())
+            receipt_fields = {
+                "schema_version": SCHEMA_VERSION,
+                "run_id": run.run_id,
+                "commit_attempt_id": attempt_id,
+                "candidate_sha256": run.candidate_sha256,
+                "output_sha256": output_sha256,
+                "source_sha256": run.source_sha256,
+                "prior_destination_sha256": run.prior_destination_sha256,
+                "destination_path": str(destination),
+                "backup_path": (
+                    str(write_receipt.backup_path)
+                    if write_receipt.backup_path is not None
+                    else None
+                ),
+                "validation_warnings": list(write_receipt.validation_warnings),
+                "approval_source": approval.source,
+                "approval_strength": strength,
+                "approval_binding_sha256": approval.binding_sha256,
+                "committed_at": committed_at,
+            }
+            logical_hash = hashlib.sha256(
+                canonical_json({**receipt_fields, "receipt_sha256": "0" * 64})
+            ).hexdigest()
+            receipt = WorkflowCommitReceiptV1(
+                **receipt_fields,
+                receipt_sha256=logical_hash,
+            )
+            receipt_bytes = canonical_json(receipt)
+            receipt_metadata = self.artifacts.write(
+                run.run_id,
+                ArtifactKind.RECEIPT,
+                receipt_bytes,
+            )
+            self._fault("receipt_body_written")
+            final = self.ledger.record_commit_finalized(
+                receipt_metadata,
+                expected_revision=intent.run.revision,
+                destination_sha256=output_sha256,
+                backup_sha256=run.prior_destination_sha256,
+                committed_at=committed_at,
+            )
+            finalized = True
+            self._observe(
+                run=final.run,
+                sequence=final.event.sequence,
+                node="committed",
+                started=self.monotonic_clock(),
+            )
+            return receipt
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                lock.release()
+            except FCPMCPError as release_error:
+                try:
+                    emit_event(
+                        {
+                            "event": "fcpxml_workflow",
+                            "run_id": run.run_id,
+                            "graph_version": run.graph_version,
+                            "run_version": run.run_version,
+                            "schema_version": SCHEMA_VERSION,
+                            "node": "commit_lock_release_failed",
+                            "disposition": "warning",
+                            "error_code": release_error.code.value,
+                        },
+                        format=self.config.log_format,
+                        stream=self.log_stream,
+                    )
+                except OSError as observation_error:
+                    if release_error.__context__ is None:
+                        release_error.__context__ = observation_error
+                if primary is None and not finalized:
+                    raise
+                if primary is not None and primary.__context__ is None:
+                    primary.__context__ = release_error
 
     def approve_cli(
         self,

@@ -122,6 +122,11 @@ _UTC_RE = re.compile(
 _PROJECTED_ARTIFACT_KINDS = (
     ArtifactKind.CANDIDATE,
     ArtifactKind.DIFF,
+    ArtifactKind.RECEIPT,
+)
+_PREPARE_ARTIFACT_KINDS = (
+    ArtifactKind.CANDIDATE,
+    ArtifactKind.DIFF,
 )
 
 
@@ -406,6 +411,20 @@ class DecisionMutationResult:
 
 
 @dataclass(frozen=True)
+class CommitIntentMutationResult:
+    run: LedgerRunRecord
+    approval: ApprovalRecord
+    event: EventRecord
+
+
+@dataclass(frozen=True)
+class CommitFinalizeMutationResult:
+    run: LedgerRunRecord
+    artifact: ArtifactRecord
+    event: EventRecord
+
+
+@dataclass(frozen=True)
 class ApprovalOrExpireResult:
     run: LedgerRunRecord
     approval: ApprovalRecord | None
@@ -585,7 +604,9 @@ _MIGRATION_1_STATEMENTS = (
     """
     CREATE TABLE artifacts (
         run_id TEXT NOT NULL REFERENCES runs(run_id) CHECK (length(run_id) = 36),
-        kind TEXT NOT NULL CHECK (kind IN ('candidate', 'diff')),
+        kind TEXT NOT NULL CHECK (
+            kind IN ('candidate', 'diff', 'receipt', 'failure_evidence')
+        ),
         relative_path TEXT NOT NULL UNIQUE CHECK (length(relative_path) BETWEEN 1 AND 255),
         sha256 TEXT NOT NULL CHECK (
             length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
@@ -673,47 +694,6 @@ _MIGRATION_1_STATEMENTS = (
     """.strip(),
 )
 
-_FAILURE_EVIDENCE_ARTIFACTS_TABLE = """
-    CREATE TABLE artifacts (
-        run_id TEXT NOT NULL REFERENCES runs(run_id) CHECK (length(run_id) = 36),
-        kind TEXT NOT NULL CHECK (kind IN ('candidate', 'diff', 'failure_evidence')),
-        relative_path TEXT NOT NULL UNIQUE CHECK (length(relative_path) BETWEEN 1 AND 255),
-        sha256 TEXT NOT NULL CHECK (
-            length(sha256) = 64 AND sha256 NOT GLOB '*[^0-9a-f]*'
-        ),
-        byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
-        created_at TEXT NOT NULL CHECK (length(created_at) BETWEEN 20 AND 27),
-        PRIMARY KEY (run_id, kind)
-    )
-    """.strip()
-
-_ARTIFACTS_NO_UPDATE_TRIGGER = """
-    CREATE TRIGGER artifacts_no_update
-    BEFORE UPDATE ON artifacts
-    BEGIN SELECT RAISE(ABORT, 'artifacts is append-only'); END
-    """.strip()
-
-_ARTIFACTS_NO_DELETE_TRIGGER = """
-    CREATE TRIGGER artifacts_no_delete
-    BEFORE DELETE ON artifacts
-    BEGIN SELECT RAISE(ABORT, 'artifacts is append-only'); END
-    """.strip()
-
-_MIGRATION_2_STATEMENTS = (
-    "DROP TRIGGER artifacts_no_update",
-    "DROP TRIGGER artifacts_no_delete",
-    "ALTER TABLE artifacts RENAME TO artifacts_v1",
-    _FAILURE_EVIDENCE_ARTIFACTS_TABLE,
-    """
-    INSERT INTO artifacts(run_id, kind, relative_path, sha256, byte_size, created_at)
-    SELECT run_id, kind, relative_path, sha256, byte_size, created_at
-    FROM artifacts_v1
-    """.strip(),
-    "DROP TABLE artifacts_v1",
-    _ARTIFACTS_NO_UPDATE_TRIGGER,
-    _ARTIFACTS_NO_DELETE_TRIGGER,
-)
-
 MIGRATIONS = (
     Migration(
         version=1,
@@ -725,19 +705,9 @@ MIGRATIONS = (
             _MIGRATION_1_STATEMENTS,
         ),
     ),
-    Migration(
-        version=2,
-        name="add_prepare_failure_evidence",
-        statements=_MIGRATION_2_STATEMENTS,
-        checksum=migration_checksum(
-            2,
-            "add_prepare_failure_evidence",
-            _MIGRATION_2_STATEMENTS,
-        ),
-    ),
 )
 
-_ALL_MIGRATION_STATEMENTS = _MIGRATION_1_STATEMENTS + _MIGRATION_2_STATEMENTS
+_ALL_MIGRATION_STATEMENTS = _MIGRATION_1_STATEMENTS
 _EXPECTED_TABLE_SQL = {
     statement.split()[2]: statement
     for statement in _ALL_MIGRATION_STATEMENTS
@@ -3132,7 +3102,7 @@ class WorkflowLedger:
             ).fetchmany(3)
         )
         artifacts = {row["kind"]: row for row in rows}
-        for kind in _PROJECTED_ARTIFACT_KINDS:
+        for kind in _PREPARE_ARTIFACT_KINDS:
             artifact = artifacts.get(kind.value)
             if artifact is None or (
                 artifact["sha256"] != values[f"{kind.value}_sha256"]
@@ -4043,6 +4013,293 @@ class WorkflowLedger:
 
         return self._write(record)
 
+    def record_commit_intent(
+        self,
+        run_id: str,
+        *,
+        expected_revision: int,
+        commit_attempt_id: str,
+        expected_backup_path: str | None,
+        backup_sha256: str | None,
+        plan_schema_version: str,
+        client_binding_sha256: str | None = None,
+    ) -> CommitIntentMutationResult:
+        """Consume exact approval and durably record intent in one write transaction."""
+        canonical_run_id = _run_id(run_id)
+        revision = _positive_revision(expected_revision)
+        attempt = _bounded_text(
+            commit_attempt_id,
+            field="commit_attempt_id",
+            maximum=255,
+        )
+        backup_path = _optional_text(
+            expected_backup_path,
+            field="expected_backup_path",
+            maximum=4096,
+        )
+        backup_hash = (
+            _sha256(backup_sha256, field="backup_sha256")
+            if backup_sha256 is not None
+            else None
+        )
+        version = _bounded_text(
+            plan_schema_version,
+            field="plan_schema_version",
+            maximum=64,
+        )
+        staged_binding = (
+            _sha256(client_binding_sha256, field="client_binding_sha256")
+            if client_binding_sha256 is not None
+            else None
+        )
+
+        def record(connection: sqlite3.Connection) -> CommitIntentMutationResult:
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?",
+                (canonical_run_id,),
+            ).fetchone()
+            if row is None:
+                raise _state_conflict("workflow run does not exist")
+            current = _row_to_run(row)
+            expected_state = (
+                WorkflowState.APPROVED
+                if current.approval_mode is ApprovalMode.CLI
+                else WorkflowState.AWAITING_APPROVAL
+            )
+            if current.state is not expected_state or current.revision != revision:
+                raise _state_conflict("workflow state or revision is stale")
+            self._require_complete_prepare(
+                connection,
+                current,
+                {},
+                require_expiry=True,
+            )
+            timestamp = _canonical_clock_timestamp(self._clock())
+            if current.expires_at is None or timestamp >= current.expires_at:
+                raise _coded(ErrorCode.APPROVAL_EXPIRED, "workflow approval expired")
+            binding = approval_binding_for_run(
+                current,
+                plan_schema_version=version,
+            )
+            approval_row = connection.execute(
+                "SELECT * FROM approvals WHERE run_id = ?",
+                (canonical_run_id,),
+            ).fetchone()
+            if current.approval_mode is ApprovalMode.CLI:
+                if approval_row is None:
+                    raise _state_conflict("authoritative CLI approval is missing")
+                approval = _row_to_approval(approval_row)
+                if (
+                    approval.decision is not ApprovalDecision.APPROVED
+                    or approval.source is not ApprovalSource.CLI
+                    or approval.binding_sha256 != binding
+                ):
+                    raise _state_conflict("authoritative CLI approval is inconsistent")
+                if staged_binding is not None:
+                    raise _state_conflict("CLI commit cannot stage client approval")
+            else:
+                if approval_row is not None:
+                    raise _state_conflict("client approval decision is already recorded")
+                if staged_binding != binding:
+                    raise _state_conflict("staged client approval binding is stale")
+                connection.execute(
+                    """
+                    INSERT INTO approvals(
+                        run_id, decision, source, operator, host, terminal_present,
+                        binding_sha256, created_at, expires_at
+                    ) VALUES (?, ?, ?, NULL, NULL, 0, ?, ?, ?)
+                    """,
+                    (
+                        canonical_run_id,
+                        ApprovalDecision.APPROVED.value,
+                        ApprovalSource.CLIENT.value,
+                        binding,
+                        timestamp,
+                        current.expires_at,
+                    ),
+                )
+                approval = ApprovalRecord(
+                    run_id=canonical_run_id,
+                    decision=ApprovalDecision.APPROVED,
+                    source=ApprovalSource.CLIENT,
+                    operator=None,
+                    host=None,
+                    terminal_present=False,
+                    binding_sha256=binding,
+                    created_at=timestamp,
+                    expires_at=current.expires_at,
+                )
+            patch = {
+                "commit_attempt_id": attempt,
+                "expected_backup_path": backup_path,
+                "backup_sha256": backup_hash,
+            }
+            self._validate_commit_intent(current, patch, patch)
+            cursor = connection.execute(
+                """
+                UPDATE runs SET state = ?, revision = ?, updated_at = ?,
+                    approved_at = COALESCE(approved_at, ?),
+                    approval_decision = ?, approval_source = ?,
+                    approval_summary = ?, commit_attempt_id = ?,
+                    expected_backup_path = ?, backup_sha256 = ?
+                WHERE run_id = ? AND state = ? AND revision = ?
+                """,
+                (
+                    WorkflowState.COMMITTING.value,
+                    current.revision + 1,
+                    timestamp,
+                    timestamp,
+                    ApprovalDecision.APPROVED.value,
+                    approval.source.value,
+                    "Exact workflow evidence approved",
+                    attempt,
+                    backup_path,
+                    backup_hash,
+                    canonical_run_id,
+                    expected_state.value,
+                    revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise _state_conflict("workflow state or revision is stale")
+            payload, payload_text = _event_payload(patch)
+            event = self._append_event_locked(
+                connection,
+                run_id=canonical_run_id,
+                event_type="commit_started",
+                payload=payload,
+                payload_text=payload_text,
+                timestamp=timestamp,
+                elapsed_ms=None,
+            )
+            updated = self._select_run(connection, canonical_run_id)
+            if updated is None:
+                raise _MigrationError("updated run disappeared")
+            return CommitIntentMutationResult(updated, approval, event)
+
+        return self._write(record)
+
+    def record_commit_finalized(
+        self,
+        metadata: ArtifactMetadataV1,
+        *,
+        expected_revision: int,
+        destination_sha256: str,
+        backup_sha256: str | None,
+        committed_at: str,
+    ) -> CommitFinalizeMutationResult:
+        """Insert the immutable receipt and finalize committing in one transaction."""
+        canonical = _artifact_metadata(metadata)
+        if canonical.kind is not ArtifactKind.RECEIPT:
+            raise _state_conflict("commit finalization requires receipt metadata")
+        revision = _positive_revision(expected_revision)
+        destination_hash = _sha256(
+            destination_sha256,
+            field="destination_sha256",
+        )
+        backup_hash = (
+            _sha256(backup_sha256, field="backup_sha256")
+            if backup_sha256 is not None
+            else None
+        )
+        committed = _canonical_timestamp(committed_at, field="committed_at")
+        created = _canonical_datetime(canonical.created_at)
+
+        def record(connection: sqlite3.Connection) -> CommitFinalizeMutationResult:
+            current = self._run_for_cas(
+                connection,
+                run_id=canonical.run_id,
+                expected_state=WorkflowState.COMMITTING,
+                expected_revision=revision,
+            )
+            if destination_hash != current.candidate_sha256:
+                raise _state_conflict("destination hash does not match candidate")
+            if backup_hash != current.backup_sha256:
+                raise _state_conflict("backup hash does not match commit intent")
+            if connection.execute(
+                "SELECT 1 FROM artifacts WHERE run_id = ? AND kind = ?",
+                (canonical.run_id, ArtifactKind.RECEIPT.value),
+            ).fetchone() is not None:
+                raise _state_conflict("receipt artifact is already recorded")
+            connection.execute(
+                """
+                INSERT INTO artifacts(
+                    run_id, kind, relative_path, sha256, byte_size, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    canonical.run_id,
+                    canonical.kind.value,
+                    canonical.relative_path,
+                    canonical.sha256,
+                    canonical.byte_size,
+                    created,
+                ),
+            )
+            patch = {
+                "destination_sha256": destination_hash,
+                "backup_sha256": backup_hash,
+                "receipt_sha256": canonical.sha256,
+                "receipt_size_bytes": canonical.byte_size,
+                "committed_at": committed,
+            }
+            self._validate_event_mutation(
+                connection,
+                current=current,
+                target=WorkflowState.COMMITTED,
+                event_type="committed",
+                payload=patch,
+                patch=patch,
+            )
+            timestamp = _canonical_clock_timestamp(self._clock())
+            cursor = connection.execute(
+                """
+                UPDATE runs SET state = ?, revision = ?, updated_at = ?,
+                    destination_sha256 = ?, backup_sha256 = ?,
+                    receipt_sha256 = ?, receipt_size_bytes = ?, committed_at = ?
+                WHERE run_id = ? AND state = ? AND revision = ?
+                """,
+                (
+                    WorkflowState.COMMITTED.value,
+                    current.revision + 1,
+                    timestamp,
+                    destination_hash,
+                    backup_hash,
+                    canonical.sha256,
+                    canonical.byte_size,
+                    committed,
+                    canonical.run_id,
+                    WorkflowState.COMMITTING.value,
+                    revision,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise _state_conflict("workflow state or revision is stale")
+            payload, payload_text = _event_payload(patch)
+            event = self._append_event_locked(
+                connection,
+                run_id=canonical.run_id,
+                event_type="committed",
+                payload=payload,
+                payload_text=payload_text,
+                timestamp=timestamp,
+                elapsed_ms=None,
+            )
+            updated = self._select_run(connection, canonical.run_id)
+            if updated is None:
+                raise _MigrationError("updated run disappeared")
+            artifact = ArtifactRecord(
+                run_id=canonical.run_id,
+                kind=canonical.kind,
+                relative_path=canonical.relative_path,
+                sha256=canonical.sha256,
+                byte_size=canonical.byte_size,
+                created_at=created,
+            )
+            return CommitFinalizeMutationResult(updated, artifact, event)
+
+        return self._write(record)
+
     def get_run(self, run_id: str) -> LedgerRunRecord | None:
         canonical_run_id = _run_id(run_id)
         connection = self._connect_existing()
@@ -4746,7 +5003,7 @@ class WorkflowLedger:
                         )
                         if not prepare_complete or any(
                             kind.value not in artifacts_by_kind
-                            for kind in _PROJECTED_ARTIFACT_KINDS
+                            for kind in _PREPARE_ARTIFACT_KINDS
                         ) or any(
                             field not in prepare_event_evidence
                             for field in _PREPARE_PROJECTION_EVENTS

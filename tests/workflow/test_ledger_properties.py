@@ -171,43 +171,27 @@ def _create_committed_run(ledger: WorkflowLedger) -> None:
     )
     assert approved.approval.created_at == "2026-07-27T01:02:03Z"
     assert approved.approval.expires_at == awaiting.run.expires_at
-    committing = ledger.transition(
+    committing = ledger.record_commit_intent(
         RUN_ID,
-        expected_state=WorkflowState.APPROVED,
         expected_revision=approved.run.revision,
-        target_state=WorkflowState.COMMITTING,
-        event_type="commit_started",
-        payload={
-            "commit_attempt_id": ATTEMPT_ID,
-            "expected_backup_path": None,
-            "backup_sha256": None,
-        },
-        projection_patch={
-            "commit_attempt_id": ATTEMPT_ID,
-            "expected_backup_path": None,
-            "backup_sha256": None,
-        },
+        commit_attempt_id=ATTEMPT_ID,
+        expected_backup_path=None,
+        backup_sha256=None,
+        plan_schema_version="1",
     )
-    ledger.transition(
-        RUN_ID,
-        expected_state=WorkflowState.COMMITTING,
+    ledger.record_commit_finalized(
+        ArtifactMetadataV1(
+            run_id=RUN_ID,
+            kind=ArtifactKind.RECEIPT,
+            relative_path=f"artifacts/{RUN_ID}/receipt.json",
+            sha256=HASH_E,
+            byte_size=42,
+            created_at=UTC,
+        ),
         expected_revision=committing.run.revision,
-        target_state=WorkflowState.COMMITTED,
-        event_type="commit_completed",
-        payload={
-            "destination_sha256": HASH_C,
-            "backup_sha256": None,
-            "receipt_sha256": HASH_E,
-            "receipt_size_bytes": 42,
-            "committed_at": "2026-07-27T02:02:03Z",
-        },
-        projection_patch={
-            "destination_sha256": HASH_C,
-            "backup_sha256": None,
-            "receipt_sha256": HASH_E,
-            "receipt_size_bytes": 42,
-            "committed_at": "2026-07-27T02:02:03Z",
-        },
+        destination_sha256=HASH_C,
+        backup_sha256=None,
+        committed_at="2026-07-27T02:02:03Z",
     )
 
 
