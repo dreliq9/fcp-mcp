@@ -99,7 +99,11 @@ def _create_committed_run(ledger: WorkflowLedger) -> None:
         expected_state=WorkflowState.PREPARING,
         expected_revision=1,
         event_type="source_inspected",
-        payload={"sha256": HASH_A},
+        payload={
+            "source_sha256": HASH_A,
+            "prior_destination_state": PriorDestinationState.ABSENT,
+            "prior_destination_sha256": None,
+        },
         projection_patch={
             "source_sha256": HASH_A,
             "prior_destination_state": PriorDestinationState.ABSENT,
@@ -111,7 +115,7 @@ def _create_committed_run(ledger: WorkflowLedger) -> None:
         expected_state=WorkflowState.PREPARING,
         expected_revision=inspected.run.revision,
         event_type="plan_built",
-        payload={"sha256": HASH_B},
+        payload={"plan_sha256": HASH_B},
         projection_patch={"plan_sha256": HASH_B},
     )
     candidate = ledger.record_artifact(
@@ -191,12 +195,14 @@ def _create_committed_run(ledger: WorkflowLedger) -> None:
         event_type="commit_completed",
         payload={
             "destination_sha256": HASH_C,
+            "backup_sha256": None,
             "receipt_sha256": HASH_E,
             "receipt_size_bytes": 42,
             "committed_at": "2026-07-27T02:02:03Z",
         },
         projection_patch={
             "destination_sha256": HASH_C,
+            "backup_sha256": None,
             "receipt_sha256": HASH_E,
             "receipt_size_bytes": 42,
             "committed_at": "2026-07-27T02:02:03Z",
@@ -378,6 +384,7 @@ def test_alternative_json_spellings_never_alias_canonical_storage(
             ("approval_source", ApprovalSource.CLIENT.value),
             ("commit_attempt_id", None),
             ("destination_sha256", None),
+            ("backup_sha256", HASH_A),
             ("committed_at", None),
             ("receipt_sha256", None),
             ("receipt_size_bytes", None),
@@ -400,6 +407,130 @@ def test_verifier_rejects_every_committed_projection_invariant_mutation(
                 f'UPDATE runs SET "{field}" = ? WHERE run_id = ?',
                 (value, RUN_ID),
             )
+        finally:
+            connection.close()
+
+        result = ledger.verify_integrity(RUN_ID)
+
+        assert result.valid is False
+        assert {finding.code for finding in result.findings} == {
+            "projection_invariant"
+        }
+
+
+@given(
+    st.sampled_from(
+        (
+            ("expires_at", "2026-08-30T01:02:03Z"),
+            (
+                "prior_destination_evidence",
+                PriorDestinationState.PRESENT.value,
+            ),
+        )
+    ),
+    st.booleans(),
+)
+@settings(max_examples=8, deadline=None)
+def test_verifier_rejects_valid_to_valid_prepare_projection_mutations(
+    mutation: tuple[str, str],
+    approved_state: bool,
+) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        ledger = _ledger(Path(directory))
+        _create(ledger, RUN_ID)
+        inspected = ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=1,
+            event_type="source_inspected",
+            payload={
+                "source_sha256": HASH_A,
+                "prior_destination_state": PriorDestinationState.ABSENT,
+                "prior_destination_sha256": None,
+            },
+            projection_patch={
+                "source_sha256": HASH_A,
+                "prior_destination_state": PriorDestinationState.ABSENT,
+                "prior_destination_sha256": None,
+            },
+        )
+        planned = ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=inspected.run.revision,
+            event_type="plan_built",
+            payload={"plan_sha256": HASH_B},
+            projection_patch={"plan_sha256": HASH_B},
+        )
+        candidate = ledger.record_artifact(
+            ArtifactMetadataV1(
+                run_id=RUN_ID,
+                kind=ArtifactKind.CANDIDATE,
+                relative_path=f"artifacts/{RUN_ID}/candidate.fcpxml",
+                sha256=HASH_C,
+                byte_size=9,
+                created_at=UTC,
+            ),
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=planned.run.revision,
+            event_type="candidate_stored",
+            event_payload={"sha256": HASH_C},
+        )
+        diff = ledger.record_artifact(
+            ArtifactMetadataV1(
+                run_id=RUN_ID,
+                kind=ArtifactKind.DIFF,
+                relative_path=f"artifacts/{RUN_ID}/diff.json",
+                sha256=HASH_D,
+                byte_size=17,
+                created_at=UTC,
+            ),
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=candidate.run.revision,
+            event_type="diff_created",
+            event_payload={"sha256": HASH_D},
+        )
+        awaiting = ledger.transition(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=diff.run.revision,
+            target_state=WorkflowState.AWAITING_APPROVAL,
+            event_type="awaiting_approval",
+            payload={"expires_at": "2026-07-28T01:02:03Z"},
+            projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
+        )
+        if approved_state:
+            ledger.record_decision(
+                RUN_ID,
+                expected_state=WorkflowState.AWAITING_APPROVAL,
+                expected_revision=awaiting.run.revision,
+                decision=ApprovalDecision.APPROVED,
+                source=ApprovalSource.CLI,
+                operator="editor",
+                host="workstation",
+                terminal_present=True,
+                binding_sha256=HASH_E,
+                expires_at="2026-07-28T01:02:03Z",
+                approval_summary="Approved",
+                event_type="approval_recorded",
+                event_payload={"binding_sha256": HASH_E},
+            )
+        assert ledger.verify_integrity(RUN_ID).valid is True
+
+        field, value = mutation
+        connection = _connection(ledger)
+        try:
+            if field == "prior_destination_evidence":
+                connection.execute(
+                    "UPDATE runs SET prior_destination_state = ?, "
+                    "prior_destination_sha256 = ? WHERE run_id = ?",
+                    (value, HASH_E, RUN_ID),
+                )
+            else:
+                connection.execute(
+                    f'UPDATE runs SET "{field}" = ? WHERE run_id = ?',
+                    (value, RUN_ID),
+                )
         finally:
             connection.close()
 

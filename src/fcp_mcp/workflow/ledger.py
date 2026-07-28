@@ -691,6 +691,13 @@ _PREPARE_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
         }
     ),
 }
+_SOURCE_INSPECTION_FIELDS = frozenset(
+    {
+        "source_sha256",
+        "prior_destination_state",
+        "prior_destination_sha256",
+    }
+)
 _COMMIT_INTENT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
     "commit_attempt_id": frozenset({"commit_started"}),
     "expected_backup_path": frozenset({"commit_started"}),
@@ -698,6 +705,7 @@ _COMMIT_INTENT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
 }
 _COMMIT_RESULT_PROJECTION_EVENTS: Mapping[str, frozenset[str]] = {
     "destination_sha256": frozenset({"commit_completed", "committed"}),
+    "backup_sha256": frozenset({"commit_completed", "committed"}),
     "receipt_sha256": frozenset({"commit_completed", "committed"}),
     "receipt_size_bytes": frozenset({"commit_completed", "committed"}),
     "committed_at": frozenset({"commit_completed", "committed"}),
@@ -853,6 +861,15 @@ def _validate_projection_policy(
 
     allowed: set[str] = set()
     if source is WorkflowState.PREPARING:
+        inspected_fields = fields & _SOURCE_INSPECTION_FIELDS
+        if (
+            event_type == "source_inspected"
+            and inspected_fields
+            and inspected_fields != _SOURCE_INSPECTION_FIELDS
+        ):
+            raise _state_conflict(
+                "source_inspected requires complete source evidence"
+            )
         for field, event_types in _PREPARE_PROJECTION_EVENTS.items():
             if event_type in event_types:
                 allowed.add(field)
@@ -875,7 +892,8 @@ def _validate_projection_policy(
         for field, event_types in _COMMIT_RESULT_PROJECTION_EVENTS.items():
             if event_type in event_types:
                 allowed.add(field)
-        if any(patch.get(field) is None for field in _COMMIT_RESULT_FIELDS):
+        required_non_null = _COMMIT_RESULT_FIELDS - {"backup_sha256"}
+        if any(patch.get(field) is None for field in required_non_null):
             raise _state_conflict(
                 "committed transitions require non-null receipt evidence"
             )
@@ -1599,6 +1617,58 @@ class WorkflowLedger:
             is not None
         )
 
+    def _backup_schema_identity(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            tuple(row)
+            for row in connection.execute(
+                "SELECT type, name, tbl_name, rootpage, sql "
+                "FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+        )
+
+    def _backup_migration_identity(
+        self,
+        connection: sqlite3.Connection,
+    ) -> tuple[tuple[object, ...], ...]:
+        return tuple(tuple(row) for row in self._migration_rows(connection))
+
+    def _backup_content_sha256(
+        self,
+        connection: sqlite3.Connection,
+    ) -> str:
+        digest = hashlib.sha256()
+        for statement in connection.iterdump():
+            encoded = statement.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+        return digest.hexdigest()
+
+    def _validate_backup_content(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_schema: tuple[tuple[object, ...], ...],
+        source_migrations: tuple[tuple[object, ...], ...],
+        source_content_sha256: str,
+    ) -> None:
+        integrity_rows = tuple(
+            row[0]
+            for row in connection.execute("PRAGMA integrity_check").fetchmany(2)
+        )
+        if integrity_rows != ("ok",):
+            raise _MigrationError("backup database integrity check failed")
+        if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise _MigrationError("backup database foreign key check failed")
+        if self._backup_schema_identity(connection) != source_schema:
+            raise _MigrationError("backup database schema identity changed")
+        if self._backup_migration_identity(connection) != source_migrations:
+            raise _MigrationError("backup database migration identity changed")
+        if self._backup_content_sha256(connection) != source_content_sha256:
+            raise _MigrationError("backup database content differs from source")
+
     def _drop_verified_bootstrap(
         self,
         connection: sqlite3.Connection,
@@ -1652,6 +1722,7 @@ class WorkflowLedger:
         destination_descriptor: int | None = None
         source: sqlite3.Connection | None = None
         destination: sqlite3.Connection | None = None
+        validation: sqlite3.Connection | None = None
         replaced = False
         primary: BaseException | None = None
         try:
@@ -1703,6 +1774,9 @@ class WorkflowLedger:
             )
             source = self._connect_lease(source_lease, read_only=True)
             destination = self._connect_lease(destination_lease, read_only=False)
+            source_schema = self._backup_schema_identity(source)
+            source_migrations = self._backup_migration_identity(source)
+            source_content_sha256 = self._backup_content_sha256(source)
             self._validate_connection_identity(source_lease, None)
             self._validate_connection_identity(
                 destination_lease,
@@ -1724,6 +1798,34 @@ class WorkflowLedger:
                 destination_result
             ):
                 raise _MigrationError("backup destination changed before publish")
+            self._bootstrap_token_from_descriptor(
+                destination_descriptor,
+                current_destination,
+            )
+            validation_lease = _DatabaseLease(
+                anchor=anchor,
+                name=temporary_name,
+                descriptor=destination_descriptor,
+                identity=_stat_identity(current_destination),
+                bootstrap_token=None,
+                owns_anchor=False,
+            )
+            validation = self._connect_lease(
+                validation_lease,
+                read_only=True,
+            )
+            self._validate_backup_content(
+                validation,
+                source_schema=source_schema,
+                source_migrations=source_migrations,
+                source_content_sha256=source_content_sha256,
+            )
+            self._validate_connection_identity(
+                validation_lease,
+                None,
+            )
+            validation.close()
+            validation = None
             self._replace_at(anchor, temporary_name, stem)
             replaced = True
             self._fsync_anchor(anchor)
@@ -1736,7 +1838,7 @@ class WorkflowLedger:
         except BaseException as error:
             primary = error
             cleanup_failures: list[BaseException] = []
-            for opened_connection in (destination, source):
+            for opened_connection in (validation, destination, source):
                 if opened_connection is None:
                     continue
                 try:
@@ -2324,6 +2426,29 @@ class WorkflowLedger:
         payload: Mapping[str, object],
         patch: Mapping[str, object],
     ) -> None:
+        if current.state is WorkflowState.PREPARING:
+            event_prepare_fields = {
+                field
+                for field, event_types in _PREPARE_PROJECTION_EVENTS.items()
+                if event_type in event_types
+            }
+            projected_prepare_fields = {
+                field
+                for field in patch
+                if field in event_prepare_fields
+            }
+            payload_prepare_fields = {
+                field
+                for field in payload
+                if field in event_prepare_fields
+            }
+            if any(
+                field not in payload or payload[field] != patch[field]
+                for field in projected_prepare_fields
+            ) or payload_prepare_fields != projected_prepare_fields:
+                raise _state_conflict(
+                    "prepare payload must match projected prepare evidence"
+                )
         if target is WorkflowState.AWAITING_APPROVAL:
             self._require_complete_prepare(
                 connection,
@@ -2347,8 +2472,12 @@ class WorkflowLedger:
                 raise _state_conflict(
                     "committed destination hash must equal the candidate hash"
                 )
+            if patch["backup_sha256"] != current.backup_sha256:
+                raise _state_conflict(
+                    "committed backup hash must match commit intent evidence"
+                )
             if any(
-                payload.get(field) != patch[field]
+                field not in payload or payload[field] != patch[field]
                 for field in _COMMIT_RESULT_FIELDS
             ):
                 raise _state_conflict(
@@ -3195,7 +3324,9 @@ class WorkflowLedger:
                     expected_sequence = 1
                     expected_previous = _ZERO_HASH
                     run_event_count = 0
-                    event_evidence: dict[str, object] = {}
+                    prepare_event_evidence: dict[str, object] = {}
+                    commit_intent_event_evidence: dict[str, object] = {}
+                    commit_result_event_evidence: dict[str, object] = {}
                     approval_bindings: set[str] = set()
                     while True:
                         event_rows = event_cursor.fetchmany(100)
@@ -3306,25 +3437,24 @@ class WorkflowLedger:
                                 )
                             if payload_value is not None and sequence_value is not None:
                                 event_name = row["event_type"]
-                                payload_sha = payload_value.get("sha256")
-                                if (
-                                    event_name == "source_inspected"
-                                    and isinstance(payload_sha, str)
-                                    and _SHA256_RE.fullmatch(payload_sha)
+                                for field, event_types in (
+                                    _PREPARE_PROJECTION_EVENTS.items()
                                 ):
-                                    event_evidence["source_sha256"] = payload_sha
-                                elif (
-                                    event_name in {"plan_built", "plan_normalized"}
-                                    and isinstance(payload_sha, str)
-                                    and _SHA256_RE.fullmatch(payload_sha)
-                                ):
-                                    event_evidence["plan_sha256"] = payload_sha
+                                    if (
+                                        event_name in event_types
+                                        and field in payload_value
+                                    ):
+                                        prepare_event_evidence[field] = (
+                                            payload_value[field]
+                                        )
                                 if event_name == "commit_started" and all(
                                     field in payload_value
                                     for field in _COMMIT_INTENT_FIELDS
                                 ):
                                     for field in _COMMIT_INTENT_FIELDS:
-                                        event_evidence[field] = payload_value[field]
+                                        commit_intent_event_evidence[field] = (
+                                            payload_value[field]
+                                        )
                                 if event_name in {
                                     "commit_completed",
                                     "committed",
@@ -3333,7 +3463,9 @@ class WorkflowLedger:
                                     for field in _COMMIT_RESULT_FIELDS
                                 ):
                                     for field in _COMMIT_RESULT_FIELDS:
-                                        event_evidence[field] = payload_value[field]
+                                        commit_result_event_evidence[field] = (
+                                            payload_value[field]
+                                        )
                                 binding = payload_value.get("binding_sha256")
                                 if (
                                     isinstance(binding, str)
@@ -3385,15 +3517,23 @@ class WorkflowLedger:
                             "event chain does not match the run revision",
                             finding_run_id=current_run_id,
                         )
-                    for field, expected_value in event_evidence.items():
-                        if run_row[field] != expected_value:
-                            add(
-                                "projection_invariant",
-                                "event evidence does not match the run projection",
-                                finding_run_id=current_run_id,
-                            )
-                    for field in ("source_sha256", "plan_sha256"):
-                        if run_row[field] is not None and field not in event_evidence:
+                    for evidence in (
+                        prepare_event_evidence,
+                        commit_intent_event_evidence,
+                        commit_result_event_evidence,
+                    ):
+                        for field, expected_value in evidence.items():
+                            if run_row[field] != expected_value:
+                                add(
+                                    "projection_invariant",
+                                    "event evidence does not match the run projection",
+                                    finding_run_id=current_run_id,
+                                )
+                    for field in _PREPARE_PROJECTION_EVENTS:
+                        if (
+                            run_row[field] is not None
+                            and field not in prepare_event_evidence
+                        ):
                             add(
                                 "projection_invariant",
                                 "run projection lacks its required event evidence",
@@ -3476,6 +3616,9 @@ class WorkflowLedger:
                         if not prepare_complete or any(
                             kind.value not in artifacts_by_kind
                             for kind in ArtifactKind
+                        ) or any(
+                            field not in prepare_event_evidence
+                            for field in _PREPARE_PROJECTION_EVENTS
                         ):
                             add(
                                 "projection_invariant",
@@ -3636,19 +3779,33 @@ class WorkflowLedger:
                             )
                         else:
                             backup_consistent = False
-                        if not canonical_attempt or not backup_consistent:
+                        if (
+                            not canonical_attempt
+                            or not backup_consistent
+                            or any(
+                                field not in commit_intent_event_evidence
+                                for field in _COMMIT_INTENT_FIELDS
+                            )
+                        ):
                             add(
                                 "projection_invariant",
                                 "commit state lacks consistent intent evidence",
                                 finding_run_id=current_run_id,
                             )
+                    required_result_fields = (
+                        _COMMIT_RESULT_FIELDS - {"backup_sha256"}
+                    )
                     result_fields_present = tuple(
                         run_row[field] is not None
-                        for field in _COMMIT_RESULT_FIELDS
+                        for field in required_result_fields
                     )
                     if current_state is WorkflowState.COMMITTED:
                         if (
                             not all(result_fields_present)
+                            or any(
+                                field not in commit_result_event_evidence
+                                for field in _COMMIT_RESULT_FIELDS
+                            )
                             or run_row["destination_sha256"]
                             != run_row["candidate_sha256"]
                         ):

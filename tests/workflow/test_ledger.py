@@ -141,7 +141,11 @@ def _record_prepare_evidence(
         expected_state=WorkflowState.PREPARING,
         expected_revision=revision,
         event_type="source_inspected",
-        payload={"sha256": HASH_A},
+        payload={
+            "source_sha256": HASH_A,
+            "prior_destination_state": prior_state,
+            "prior_destination_sha256": prior_sha256,
+        },
         projection_patch={
             "source_sha256": HASH_A,
             "prior_destination_state": prior_state,
@@ -153,7 +157,7 @@ def _record_prepare_evidence(
         expected_state=WorkflowState.PREPARING,
         expected_revision=inspected.run.revision,
         event_type="plan_built",
-        payload={"sha256": HASH_B},
+        payload={"plan_sha256": HASH_B},
         projection_patch={"plan_sha256": HASH_B},
     )
     candidate = ledger.record_artifact(
@@ -1436,11 +1440,16 @@ def test_sequences_are_contiguous_and_independent_per_run(tmp_path: Path) -> Non
         expected_state=WorkflowState.PREPARING,
         expected_revision=1,
         event_type="source_inspected",
-        payload={"sha256": HASH_A},
+        payload={
+            "source_sha256": HASH_A,
+            "prior_destination_state": PriorDestinationState.ABSENT,
+            "prior_destination_sha256": None,
+        },
         elapsed_ms=7,
         projection_patch={
             "source_sha256": HASH_A,
             "prior_destination_state": PriorDestinationState.ABSENT,
+            "prior_destination_sha256": None,
         },
     )
     second = ledger.append_event(
@@ -1448,7 +1457,7 @@ def test_sequences_are_contiguous_and_independent_per_run(tmp_path: Path) -> Non
         expected_state=WorkflowState.PREPARING,
         expected_revision=2,
         event_type="plan_built",
-        payload={"sha256": HASH_B},
+        payload={"plan_sha256": HASH_B},
         projection_patch={"plan_sha256": HASH_B},
     )
 
@@ -1482,8 +1491,16 @@ def test_append_event_projection_event_and_revision_are_one_atomic_change(
             expected_state=WorkflowState.PREPARING,
             expected_revision=1,
             event_type="source_inspected",
-            payload={"sha256": HASH_A},
-            projection_patch={"source_sha256": HASH_A},
+            payload={
+                "source_sha256": HASH_A,
+                "prior_destination_state": PriorDestinationState.ABSENT,
+                "prior_destination_sha256": None,
+            },
+            projection_patch={
+                "source_sha256": HASH_A,
+                "prior_destination_state": PriorDestinationState.ABSENT,
+                "prior_destination_sha256": None,
+            },
         )
 
     _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
@@ -2845,7 +2862,7 @@ def test_awaiting_approval_requires_complete_prepare_artifacts_and_expiry(
             expected_revision=1,
             target_state=WorkflowState.AWAITING_APPROVAL,
             event_type="awaiting_approval",
-            payload={},
+            payload={"expires_at": "2026-07-28T01:02:03Z"},
             projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
         )
     _assert_code(incomplete, ErrorCode.WORKFLOW_STATE_CONFLICT)
@@ -2861,6 +2878,57 @@ def test_awaiting_approval_requires_complete_prepare_artifacts_and_expiry(
             payload={},
         )
     _assert_code(missing_expiry, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload", "patch"),
+    (
+        (
+            "source_inspected",
+            {"source_sha256": HASH_A},
+            {
+                "source_sha256": HASH_A,
+                "prior_destination_state": PriorDestinationState.ABSENT,
+                "prior_destination_sha256": None,
+            },
+        ),
+        (
+            "plan_built",
+            {"plan_sha256": HASH_A},
+            {"plan_sha256": HASH_B},
+        ),
+        (
+            "awaiting_approval",
+            {},
+            {"expires_at": "2026-07-28T01:02:03Z"},
+        ),
+        (
+            "plan_built",
+            {"plan_sha256": HASH_A},
+            {},
+        ),
+    ),
+)
+def test_prepare_projection_payload_must_carry_exact_owned_evidence(
+    tmp_path: Path,
+    event_type: str,
+    payload: dict[str, object],
+    patch: dict[str, object],
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.append_event(
+            RUN_ID,
+            expected_state=WorkflowState.PREPARING,
+            expected_revision=1,
+            event_type=event_type,
+            payload=payload,
+            projection_patch=patch,
+        )
+
+    _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
 
 
 @pytest.mark.parametrize(
@@ -3055,12 +3123,14 @@ def test_receipt_evidence_is_forbidden_during_prepare_and_required_on_commit(
         event_type="committed",
         payload={
             "destination_sha256": HASH_C,
+            "backup_sha256": None,
             "receipt_sha256": HASH_E,
             "receipt_size_bytes": 42,
             "committed_at": "2026-07-27T02:02:03Z",
         },
         projection_patch={
             "destination_sha256": HASH_C,
+            "backup_sha256": None,
             "receipt_sha256": HASH_E,
             "receipt_size_bytes": 42,
             "committed_at": "2026-07-27T02:02:03Z",
@@ -3068,6 +3138,140 @@ def test_receipt_evidence_is_forbidden_during_prepare_and_required_on_commit(
     )
     assert committed.run.receipt_sha256 == HASH_E
     assert committed.run.receipt_size_bytes == 42
+
+
+def test_present_destination_final_commit_echoes_authenticated_backup(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    approved = _approve(
+        ledger,
+        _complete_prepare(
+            ledger,
+            prior_state=PriorDestinationState.PRESENT,
+            prior_sha256=HASH_A,
+        ),
+    )
+    expected_backup = f"/private/output.fcpxml.bak.{ATTEMPT_ID}"
+    committing = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.APPROVED,
+        expected_revision=approved.run.revision,
+        target_state=WorkflowState.COMMITTING,
+        event_type="commit_started",
+        payload={
+            "commit_attempt_id": ATTEMPT_ID,
+            "expected_backup_path": expected_backup,
+            "backup_sha256": HASH_A,
+        },
+        projection_patch={
+            "commit_attempt_id": ATTEMPT_ID,
+            "expected_backup_path": expected_backup,
+            "backup_sha256": HASH_A,
+        },
+    )
+
+    for final_backup in (None, HASH_B):
+        with pytest.raises(FCPMCPError) as mismatch:
+            ledger.transition(
+                RUN_ID,
+                expected_state=WorkflowState.COMMITTING,
+                expected_revision=committing.run.revision,
+                target_state=WorkflowState.COMMITTED,
+                event_type="committed",
+                payload={
+                    "destination_sha256": HASH_C,
+                    "backup_sha256": final_backup,
+                    "receipt_sha256": HASH_E,
+                    "receipt_size_bytes": 42,
+                    "committed_at": "2026-07-27T02:02:03Z",
+                },
+                projection_patch={
+                    "destination_sha256": HASH_C,
+                    "backup_sha256": final_backup,
+                    "receipt_sha256": HASH_E,
+                    "receipt_size_bytes": 42,
+                    "committed_at": "2026-07-27T02:02:03Z",
+                },
+            )
+        _assert_code(mismatch, ErrorCode.WORKFLOW_STATE_CONFLICT)
+
+    committed = ledger.transition(
+        RUN_ID,
+        expected_state=WorkflowState.COMMITTING,
+        expected_revision=committing.run.revision,
+        target_state=WorkflowState.COMMITTED,
+        event_type="committed",
+        payload={
+            "destination_sha256": HASH_C,
+            "backup_sha256": HASH_A,
+            "receipt_sha256": HASH_E,
+            "receipt_size_bytes": 42,
+            "committed_at": "2026-07-27T02:02:03Z",
+        },
+        projection_patch={
+            "destination_sha256": HASH_C,
+            "backup_sha256": HASH_A,
+            "receipt_sha256": HASH_E,
+            "receipt_size_bytes": 42,
+            "committed_at": "2026-07-27T02:02:03Z",
+        },
+    )
+
+    assert committed.run.backup_sha256 == HASH_A
+    assert ledger.verify_integrity(RUN_ID).valid is True
+
+    connection = _raw(ledger.paths.database)
+    try:
+        trigger_rows = connection.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = 'events'"
+        ).fetchall()
+        update_triggers = tuple(
+            row
+            for row in trigger_rows
+            if "BEFORE UPDATE" in row["sql"].upper()
+        )
+        assert update_triggers
+        for trigger in update_triggers:
+            connection.execute(f'DROP TRIGGER "{trigger["name"]}"')
+        final_event = connection.execute(
+            "SELECT * FROM events WHERE run_id = ? ORDER BY sequence DESC LIMIT 1",
+            (RUN_ID,),
+        ).fetchone()
+        assert final_event is not None
+        mutated_payload = json.loads(final_event["payload_text"])
+        mutated_payload["backup_sha256"] = HASH_B
+        mutated_hash = ledger_module._event_digest(
+            run_id=RUN_ID,
+            sequence=final_event["sequence"],
+            event_type=final_event["event_type"],
+            payload=mutated_payload,
+            timestamp=final_event["timestamp"],
+            elapsed_ms=final_event["elapsed_ms"],
+            previous_hash=final_event["previous_hash"],
+        )
+        connection.execute(
+            "UPDATE events SET payload_text = ?, event_hash = ? "
+            "WHERE run_id = ? AND sequence = ?",
+            (
+                canonical_json(mutated_payload).decode("utf-8"),
+                mutated_hash,
+                RUN_ID,
+                final_event["sequence"],
+            ),
+        )
+        for trigger in update_triggers:
+            connection.execute(trigger["sql"])
+    finally:
+        connection.close()
+
+    result = ledger.verify_integrity(RUN_ID)
+    assert result.valid is False
+    assert {finding.code for finding in result.findings} == {
+        "projection_invariant"
+    }
 
 
 @pytest.mark.parametrize(
@@ -3294,6 +3498,7 @@ def test_backup_destination_is_token_authenticated_before_sqlite_writes(
     ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
     original = ledger._connect_lease
     authenticated: list[str] = []
+    validated: list[str] = []
 
     def require_authenticated_destination(
         lease: ledger_module._DatabaseLease,
@@ -3301,14 +3506,17 @@ def test_backup_destination_is_token_authenticated_before_sqlite_writes(
         read_only: bool,
     ) -> sqlite3.Connection:
         if lease.name.endswith(".tmp"):
-            assert read_only is False
-            assert lease.bootstrap_token is not None
-            observed = ledger._bootstrap_token_from_descriptor(
-                lease.descriptor,
-                os.fstat(lease.descriptor),
-            )
-            assert observed == lease.bootstrap_token
-            authenticated.append(lease.name)
+            if lease.bootstrap_token is not None:
+                assert read_only is False
+                observed = ledger._bootstrap_token_from_descriptor(
+                    lease.descriptor,
+                    os.fstat(lease.descriptor),
+                )
+                assert observed == lease.bootstrap_token
+                authenticated.append(lease.name)
+            else:
+                assert read_only is True
+                validated.append(lease.name)
         return original(lease, read_only=read_only)
 
     monkeypatch.setattr(ledger, "_connect_lease", require_authenticated_destination)
@@ -3316,6 +3524,60 @@ def test_backup_destination_is_token_authenticated_before_sqlite_writes(
     ledger.initialize()
 
     assert len(authenticated) == 1
+    assert validated == authenticated
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires retained destination fd")
+def test_backup_destination_same_inode_corruption_is_rejected_before_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _paths(tmp_path)
+    legacy = _raw(paths.database)
+    legacy.execute("CREATE TABLE legacy(value TEXT NOT NULL)")
+    legacy.execute("INSERT INTO legacy VALUES ('source')")
+    legacy.close()
+    os.chmod(paths.database, 0o600)
+    ledger = WorkflowLedger(paths, clock=TickClock(), package_version="0.3.0-test")
+    original_connect = ledger._connect_lease
+    original_backup = ledger_module._LedgerConnection.backup
+    destination_descriptor: int | None = None
+
+    def capture_destination(
+        lease: ledger_module._DatabaseLease,
+        *,
+        read_only: bool,
+    ) -> sqlite3.Connection:
+        nonlocal destination_descriptor
+        if lease.name.endswith(".tmp"):
+            destination_descriptor = lease.descriptor
+        return original_connect(lease, read_only=read_only)
+
+    def corrupt_after_backup(
+        source: ledger_module._LedgerConnection,
+        target: sqlite3.Connection,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        original_backup(source, target, *args, **kwargs)
+        assert destination_descriptor is not None
+        os.pwrite(destination_descriptor, b"BROKEN", 0)
+        os.fsync(destination_descriptor)
+
+    monkeypatch.setattr(ledger, "_connect_lease", capture_destination)
+    monkeypatch.setattr(
+        ledger_module._LedgerConnection,
+        "backup",
+        corrupt_after_backup,
+    )
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.initialize()
+
+    _assert_code(error, ErrorCode.LEDGER_UNAVAILABLE)
+    assert paths.database.read_bytes().startswith(b"SQLite format 3\x00")
+    assert list(paths.root.glob("runs.sqlite3.backup-*")) == []
+    assert list(paths.root.glob(".runs.sqlite3.backup-*.tmp")) == []
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires open-inode displacement")
@@ -3443,8 +3705,16 @@ def test_public_close_failures_are_sanitized_without_masking_primary_code(
                 expected_state=WorkflowState.PREPARING,
                 expected_revision=2,
                 event_type="source_inspected",
-                payload={"sha256": HASH_A},
-                projection_patch={"source_sha256": HASH_A},
+                payload={
+                    "source_sha256": HASH_A,
+                    "prior_destination_state": PriorDestinationState.ABSENT,
+                    "prior_destination_sha256": None,
+                },
+                projection_patch={
+                    "source_sha256": HASH_A,
+                    "prior_destination_state": PriorDestinationState.ABSENT,
+                    "prior_destination_sha256": None,
+                },
             )
         else:
             ledger.get_run(RUN_ID)
