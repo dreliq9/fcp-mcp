@@ -13,6 +13,8 @@ except ModuleNotFoundError:
 
 ROOT = Path(__file__).resolve().parents[2]
 FULL_PROFILE_CHECK = "FCP_MCP_PROFILE=full python scripts/check_contracts.py"
+FULL_PROFILE_ENVIRONMENT = {"FCP_MCP_PROFILE": "full"}
+WHEEL_SMOKE_STEP_NAME = "Smoke-test installed wheel"
 PUBLISHER_ENVIRONMENT = {
     "name": "pypi",
     "url": "https://pypi.org/p/fcp-mcp",
@@ -122,6 +124,22 @@ def _step_named(steps: list[dict[str, object]], name: str) -> dict[str, object]:
     return next(step for step in steps if step.get("name") == name)
 
 
+def _assert_installed_wheel_smoke_profile(workflow: dict[str, object]) -> None:
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    smoke_steps = [
+        _step_named(job["steps"], WHEEL_SMOKE_STEP_NAME)
+        for job in jobs.values()
+        if isinstance(job.get("steps"), list)
+        and any(
+            step.get("name") == WHEEL_SMOKE_STEP_NAME
+            for step in job["steps"]
+        )
+    ]
+    assert len(smoke_steps) == 1
+    assert smoke_steps[0].get("env") == FULL_PROFILE_ENVIRONMENT
+
+
 def test_package_and_active_docs_claim_only_macos():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     classifiers = project["project"]["classifiers"]
@@ -197,3 +215,29 @@ def test_active_contract_checks_use_the_full_documentation_profile():
 
     contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
     assert FULL_PROFILE_CHECK in contributing
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (".github/workflows/ci.yml", ".github/workflows/publish.yml"),
+)
+def test_installed_wheel_smoke_uses_the_full_profile(relative: str):
+    _assert_installed_wheel_smoke_profile(_load_workflow(relative))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    (".github/workflows/ci.yml", ".github/workflows/publish.yml"),
+)
+def test_installed_wheel_smoke_profile_rejects_its_removal(relative: str):
+    workflow = _load_workflow(relative)
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    for job in jobs.values():
+        if isinstance(job.get("steps"), list):
+            for step in job["steps"]:
+                if step.get("name") == WHEEL_SMOKE_STEP_NAME:
+                    del step["env"]
+
+    with pytest.raises(AssertionError):
+        _assert_installed_wheel_smoke_profile(workflow)

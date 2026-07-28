@@ -24,6 +24,7 @@ def _command() -> Path:
 def _environment(tmp_path: Path) -> dict[str, str]:
     return {
         **os.environ,
+        "FCP_MCP_PROFILE": "full",
         "FCP_MCP_OUTPUT_DIR": str(tmp_path),
         "FCP_MCP_ALLOWED_ROOTS": str(tmp_path),
         "FCP_MCP_ENABLE_LIVE_CONTROL": "0",

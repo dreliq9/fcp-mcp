@@ -132,6 +132,8 @@ jobs:
           rg -q 'WORKFLOWS.md' /tmp/fcp-mcp-sdist-files
           rg -q 'server.json' /tmp/fcp-mcp-sdist-files
       - name: Smoke-test installed wheel
+        env:
+          FCP_MCP_PROFILE: full
         run: |
           python -m venv /tmp/fcp-mcp-wheel-smoke
           /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip

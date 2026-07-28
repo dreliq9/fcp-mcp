@@ -39,6 +39,8 @@ jobs:
           python -m build
           python -m twine check dist/*
       - name: Smoke-test installed wheel
+        env:
+          FCP_MCP_PROFILE: full
         run: |
           python -m venv /tmp/fcp-mcp-wheel-smoke
           /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip
