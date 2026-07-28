@@ -19,10 +19,9 @@ from pydantic import ValidationError
 
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
-from fcp_mcp.fcpxml.diff import build_workflow_diff
+from fcp_mcp.fcpxml.diff import append_operation_effects, build_workflow_diff
 from fcp_mcp.fcpxml.parser import FCPXMLParser
 from fcp_mcp.fcpxml.validator import FCPXMLValidator, ValidationResult
-from fcp_mcp.fcpxml.writer import FCPXMLModifier
 from fcp_mcp.observability import emit_event
 from fcp_mcp.security.paths import PathPolicy
 from fcp_mcp.workflow.artifacts import (
@@ -41,7 +40,6 @@ from fcp_mcp.workflow.models import (
     MAX_EVIDENCE_ITEMS,
     MAX_WARNINGS,
     FindingDisposition,
-    OperationDisposition,
     OperationReceiptV1,
     PriorDestinationState,
     ValidationIssueV1,
@@ -54,10 +52,7 @@ from fcp_mcp.workflow.models import (
 )
 from fcp_mcp.workflow.operations import (
     CandidateDisposition,
-    OperationPreflightError,
-    build_source_inventory,
     execute_plan,
-    normalize_plan,
 )
 
 GRAPH_VERSION = "1"
@@ -76,6 +71,72 @@ class _FileEvidence:
     identity: tuple[int, int, int] | None
 
 
+@dataclass
+class _DescriptorSnapshot:
+    descriptor: int
+    size: int
+    sha256: str
+    identity: tuple[int, int, int]
+
+    @property
+    def path(self) -> Path:
+        if self.descriptor < 0:
+            raise _coded(ErrorCode.TRANSACTION_FAILED, "private snapshot is closed")
+        return Path(f"/dev/fd/{self.descriptor}")
+
+    def verify(self) -> None:
+        if self.descriptor < 0:
+            raise _coded(ErrorCode.TRANSACTION_FAILED, "private snapshot is closed")
+        result = os.fstat(self.descriptor)
+        if (
+            not stat.S_ISREG(result.st_mode)
+            or _identity(result) != self.identity
+            or result.st_size != self.size
+        ):
+            raise _coded(ErrorCode.WORKFLOW_STALE, "private snapshot identity changed")
+        digest = hashlib.sha256()
+        offset = 0
+        while offset < self.size:
+            chunk = os.pread(
+                self.descriptor,
+                min(_READ_CHUNK, self.size - offset),
+                offset,
+            )
+            if not chunk:
+                raise _coded(ErrorCode.WORKFLOW_STALE, "private snapshot was truncated")
+            digest.update(chunk)
+            offset += len(chunk)
+        if digest.hexdigest() != self.sha256:
+            raise _coded(ErrorCode.WORKFLOW_STALE, "private snapshot content changed")
+
+    def invoke(self, call: Callable[[Path], object]) -> object:
+        self.verify()
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        result = call(self.path)
+        self.verify()
+        return result
+
+    def close(self) -> None:
+        if self.descriptor < 0:
+            return
+        descriptor, self.descriptor = self.descriptor, -1
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            raise _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot cleanup failed",
+                error,
+            ) from error
+
+    def close_preserving(self, primary: BaseException) -> None:
+        try:
+            self.close()
+        except FCPMCPError as cleanup:
+            if primary.__context__ is None:
+                primary.__context__ = cleanup
+
+
 def _coded(
     code: ErrorCode,
     message: str,
@@ -85,6 +146,157 @@ def _coded(
     if cause is not None:
         error.__cause__ = cause
     return error
+
+
+def _new_unlinked_descriptor(root: Path) -> tuple[int, tuple[int, int, int]]:
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=".workflow-snapshot-",
+        suffix=".fcpxml",
+        dir=root,
+    )
+    path = Path(raw_path)
+    try:
+        os.fchmod(descriptor, 0o600)
+        try:
+            path.unlink()
+        except OSError:
+            # No content has been copied yet. A second unlink closes the narrow
+            # transient-cleanup seam without ever leaving plaintext behind.
+            path.unlink(missing_ok=True)
+        result = os.fstat(descriptor)
+        if not stat.S_ISREG(result.st_mode):
+            raise OSError("private snapshot is not a regular file")
+        return descriptor, _identity(result)
+    except BaseException as primary:
+        cleanup: FCPMCPError | None = None
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            cleanup = _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot cleanup failed",
+                error,
+            )
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            cleanup = cleanup or _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot cleanup failed",
+                error,
+            )
+        if cleanup is not None and primary.__context__ is None:
+            primary.__context__ = cleanup
+        raise
+
+
+def _write_all(descriptor: int, payload: bytes | memoryview) -> None:
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.write(descriptor, view[written:])
+        if count <= 0:
+            raise OSError("private snapshot write made no progress")
+        written += count
+
+
+def _snapshot_bytes(payload: bytes, root: Path) -> _DescriptorSnapshot:
+    descriptor, identity = _new_unlinked_descriptor(root)
+    try:
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        snapshot = _DescriptorSnapshot(
+            descriptor=descriptor,
+            size=len(payload),
+            sha256=hashlib.sha256(payload).hexdigest(),
+            identity=identity,
+        )
+        snapshot.verify()
+        return snapshot
+    except BaseException as primary:
+        try:
+            os.close(descriptor)
+        except OSError as error:
+            if primary.__context__ is None:
+                primary.__context__ = _coded(
+                    ErrorCode.TRANSACTION_FAILED,
+                    "private snapshot cleanup failed",
+                    error,
+                )
+        raise
+
+
+def _snapshot_regular(
+    path: Path,
+    limit: int,
+    root: Path,
+) -> tuple[_DescriptorSnapshot, _FileEvidence]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    source = os.open(path, flags)
+    snapshot_fd = -1
+    primary: BaseException | None = None
+    try:
+        opened = os.fstat(source)
+        if not stat.S_ISREG(opened.st_mode):
+            raise _coded(ErrorCode.INVALID_PATH, "workflow input is not a regular file")
+        enforce_source_size(opened.st_size, max_source_bytes=limit)
+        snapshot_fd, snapshot_identity = _new_unlinked_descriptor(root)
+        digest = hashlib.sha256()
+        total = 0
+        while total <= limit:
+            chunk = os.read(source, min(_READ_CHUNK, limit + 1 - total))
+            if not chunk:
+                break
+            digest.update(chunk)
+            _write_all(snapshot_fd, chunk)
+            total += len(chunk)
+        enforce_source_size(total, max_source_bytes=limit)
+        os.fsync(snapshot_fd)
+        after = os.fstat(source)
+        current = path.lstat()
+        if (
+            _identity(opened) != _identity(after)
+            or opened.st_size != after.st_size
+            or _identity(opened) != _identity(current)
+            or total != opened.st_size
+        ):
+            raise _coded(ErrorCode.WORKFLOW_STALE, "workflow file changed during inspection")
+        sha256 = digest.hexdigest()
+        snapshot = _DescriptorSnapshot(
+            descriptor=snapshot_fd,
+            size=total,
+            sha256=sha256,
+            identity=snapshot_identity,
+        )
+        snapshot.verify()
+        snapshot_fd = -1
+        return snapshot, _FileEvidence(
+            PriorDestinationState.PRESENT,
+            sha256,
+            total,
+            _identity(opened),
+        )
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        cleanup: FCPMCPError | None = None
+        for descriptor in (source, snapshot_fd):
+            if descriptor < 0:
+                continue
+            try:
+                os.close(descriptor)
+            except OSError as error:
+                cleanup = cleanup or _coded(
+                    ErrorCode.TRANSACTION_FAILED,
+                    "private snapshot cleanup failed",
+                    error,
+                )
+        if cleanup is not None:
+            if primary is None:
+                raise cleanup
+            if primary.__context__ is None:
+                primary.__context__ = cleanup
 
 
 def _canonical_utc(value: datetime) -> str:
@@ -275,33 +487,19 @@ class WorkflowEngine:
     def _request_sha256(self, request: WorkflowPrepareRequestV1) -> str:
         return hashlib.sha256(canonical_json(request)).hexdigest()
 
-    def _validate_candidate(self, payload: bytes) -> ValidationResultV1:
-        descriptor, raw_path = tempfile.mkstemp(
-            prefix=".candidate-validate-",
-            suffix=".fcpxml",
-            dir=self.artifacts.paths.root,
-        )
-        path = Path(raw_path)
+    def _validate_and_parse_candidate(
+        self,
+        payload: bytes,
+    ) -> tuple[ValidationResultV1, object]:
+        snapshot = _snapshot_bytes(payload, self.artifacts.paths.root)
         primary: BaseException | None = None
         try:
-            os.fchmod(descriptor, 0o600)
-            view = memoryview(payload)
-            written = 0
-            while written < len(view):
-                count = os.write(descriptor, view[written:])
-                if count <= 0:
-                    raise OSError("candidate validation write made no progress")
-                written += count
-            os.fsync(descriptor)
-            os.close(descriptor)
-            descriptor = -1
-            result = self.validator.validate_file(path)
-            # Independently parse the exact persisted bytes through the safe boundary.
-            FCPXMLParser().parse(path)
+            result = snapshot.invoke(self.validator.validate_file)
+            parsed = snapshot.invoke(FCPXMLParser().parse)
             converted = self._validation_result(result)
             if not converted.valid:
                 raise _coded(ErrorCode.VALIDATION_FAILED, "candidate validation failed")
-            return converted
+            return converted, parsed
         except FCPMCPError as error:
             primary = error
             raise
@@ -313,24 +511,14 @@ class WorkflowEngine:
             )
             raise primary
         finally:
-            if descriptor >= 0:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    if primary is None:
-                        raise _coded(
-                            ErrorCode.TRANSACTION_FAILED,
-                            "candidate validation cleanup failed",
-                        )
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as error:
-                if primary is None:
-                    raise _coded(
-                        ErrorCode.TRANSACTION_FAILED,
-                        "candidate validation cleanup failed",
-                        error,
-                    )
+            if primary is None:
+                snapshot.close()
+            else:
+                snapshot.close_preserving(primary)
+
+    def _validate_candidate(self, payload: bytes) -> ValidationResultV1:
+        validation, _ = self._validate_and_parse_candidate(payload)
+        return validation
 
     def _validation_result(self, result: ValidationResult) -> ValidationResultV1:
         issues = []
@@ -536,21 +724,8 @@ class WorkflowEngine:
         *,
         plan_sha256: str | None,
         receipts: tuple[OperationReceiptV1, ...],
-        fallback_kind: str,
     ) -> None:
         try:
-            failure_receipts = receipts
-            if not failure_receipts:
-                failure_receipts = (
-                    OperationReceiptV1(
-                        operation_id="op-001",
-                        kind=fallback_kind,
-                        disposition=OperationDisposition.FAILED,
-                        affected_count=0,
-                        error_code=error.code,
-                        error_summary="workflow prepare failed",
-                    ),
-                )
             body = canonical_json(
                 {
                     "schema_version": SCHEMA_VERSION,
@@ -561,7 +736,7 @@ class WorkflowEngine:
                     "error_code": error.code.value,
                     "operation_receipts": [
                         receipt.model_dump(mode="json")
-                        for receipt in failure_receipts
+                        for receipt in receipts
                     ],
                 }
             )
@@ -653,15 +828,15 @@ class WorkflowEngine:
         run = created.run
         failure_plan_sha256: str | None = None
         failure_receipts: tuple[OperationReceiptV1, ...] = ()
-        fallback_kind = request.operations[0].kind
+        source_snapshot: _DescriptorSnapshot | None = None
         self._observe(run=run, sequence=1, node="run_created", started=started)
         self._fault("run_created")
 
         try:
-            source_evidence = _read_regular(
+            source_snapshot, source_evidence = _snapshot_regular(
                 source,
                 self.config.max_source_bytes,
-                missing_ok=False,
+                self.artifacts.paths.root,
             )
             prior_evidence = _read_regular(
                 destination,
@@ -692,19 +867,13 @@ class WorkflowEngine:
             ):
                 raise _coded(ErrorCode.WORKFLOW_STALE, "source hash precondition failed")
 
-            source_document = FCPXMLParser().parse(source)
+            source_document = source_snapshot.invoke(FCPXMLParser().parse)
             plan = WorkflowPlanV1(operations=request.operations)
-            try:
-                normalized = normalize_plan(
-                    plan,
-                    build_source_inventory(FCPXMLModifier(source)),
-                )
-                plan_sha256 = normalized.caller_plan_sha256
-            except OperationPreflightError:
-                execution = self.execute_plan(source, plan)
-                plan_sha256 = execution.normalized_plan.caller_plan_sha256
-                normalized = execution.normalized_plan
-                failure_receipts = execution.receipts
+            execution = source_snapshot.invoke(
+                lambda snapshot_path: self.execute_plan(snapshot_path, plan)
+            )
+            plan_sha256 = execution.normalized_plan.caller_plan_sha256
+            failure_receipts = execution.receipts
             failure_plan_sha256 = plan_sha256
             normalized_event = self.ledger.append_event(
                 run.run_id,
@@ -717,8 +886,6 @@ class WorkflowEngine:
             )
             run = self._observe_mutation(normalized_event, "plan_normalized", started)
 
-            execution = self.execute_plan(source, plan)
-            failure_receipts = execution.receipts
             if execution.disposition is not CandidateDisposition.SUCCEEDED:
                 raise _coded(
                     execution.error_code or ErrorCode.OPERATION_FAILED,
@@ -726,6 +893,8 @@ class WorkflowEngine:
                 )
             if execution.candidate_bytes is None:
                 raise _coded(ErrorCode.OPERATION_FAILED, "workflow produced no candidate")
+            source_snapshot.close()
+            source_snapshot = None
             dry_run = self.ledger.append_event(
                 run.run_id,
                 expected_state=WorkflowState.PREPARING,
@@ -750,7 +919,9 @@ class WorkflowEngine:
             candidate_bytes = self.artifacts.read(candidate_metadata)
             if candidate_bytes != execution.candidate_bytes:
                 raise _coded(ErrorCode.ARTIFACT_CORRUPT, "candidate reopen mismatch")
-            validation = self._validate_candidate(candidate_bytes)
+            validation, candidate_document = self._validate_and_parse_candidate(
+                candidate_bytes
+            )
             candidate_recorded = self.ledger.record_artifact(
                 candidate_metadata,
                 expected_state=WorkflowState.PREPARING,
@@ -772,30 +943,10 @@ class WorkflowEngine:
             )
             self._fault("candidate_validated")
 
-            validation_path = self.artifacts.paths.root / f".diff-source-{run.run_id}.fcpxml"
-            # Candidate is already safely parsed; use a short-lived private copy
-            # solely because the repository parser accepts paths.
-            fd = os.open(
-                validation_path,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                0o600,
+            semantic_diff = append_operation_effects(
+                build_workflow_diff(source_document, candidate_document),
+                execution.receipts,
             )
-            try:
-                view = memoryview(candidate_bytes)
-                written = 0
-                while written < len(view):
-                    count = os.write(fd, view[written:])
-                    if count <= 0:
-                        raise OSError("candidate parser copy made no progress")
-                    written += count
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            try:
-                candidate_document = FCPXMLParser().parse(validation_path)
-            finally:
-                validation_path.unlink(missing_ok=True)
-            semantic_diff = build_workflow_diff(source_document, candidate_document)
             summary_lines = [
                 f"{change.change_type} {change.entity_kind} "
                 f"{change.entity_name} {change.field}: "
@@ -894,6 +1045,9 @@ class WorkflowEngine:
             return self._rehydrate(run)
         except FCPMCPError as error:
             current = self.ledger.get_run(run.run_id)
+            if source_snapshot is not None:
+                source_snapshot.close_preserving(error)
+                source_snapshot = None
             if current is not None and current.state is WorkflowState.PREPARING:
                 self._fail(
                     current,
@@ -901,11 +1055,13 @@ class WorkflowEngine:
                     started,
                     plan_sha256=failure_plan_sha256,
                     receipts=failure_receipts,
-                    fallback_kind=fallback_kind,
                 )
             raise _coded(error.code, "workflow prepare failed", error)
         except Exception as error:  # noqa: BLE001 - normalize the public engine boundary
             coded = _coded(ErrorCode.INTERNAL_ERROR, "workflow prepare failed", error)
+            if source_snapshot is not None:
+                source_snapshot.close_preserving(coded)
+                source_snapshot = None
             current = self.ledger.get_run(run.run_id)
             if current is not None and current.state is WorkflowState.PREPARING:
                 self._fail(
@@ -914,7 +1070,6 @@ class WorkflowEngine:
                     started,
                     plan_sha256=failure_plan_sha256,
                     receipts=failure_receipts,
-                    fallback_kind=fallback_kind,
                 )
             raise coded
 

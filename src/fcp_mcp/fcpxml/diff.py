@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -222,6 +223,67 @@ class WorkflowDocumentDiff:
         }
 
 
+def append_operation_effects(
+    document_diff: WorkflowDocumentDiff,
+    receipts: Iterable[object],
+) -> WorkflowDocumentDiff:
+    """Bind verified executor effects into the typed diff.
+
+    The document model deliberately omits some FCPXML constructs, including
+    transitions and time maps. Successful operation receipts are produced only
+    after the executor verifies the exact requested mutation, so their bounded
+    value changes provide deterministic coverage for those effects as well as
+    an audit link for modeled effects.
+    """
+    changes = list(document_diff.changes)
+    for receipt_index, receipt in enumerate(receipts, start=1):
+        operation_id = _workflow_diff_text(
+            getattr(receipt, "operation_id", ""),
+            fallback=f"operation-{receipt_index}",
+        )
+        kind = _workflow_diff_text(
+            getattr(receipt, "kind", ""),
+            fallback="unknown",
+        )
+        for change_index, value_change in enumerate(
+            getattr(receipt, "changes", ()),
+            start=1,
+        ):
+            before = getattr(value_change, "before", None)
+            after = getattr(value_change, "after", None)
+            changes.append(
+                _entity_change(
+                    project_name="<workflow>",
+                    project_occurrence=1,
+                    source_project_index=None,
+                    candidate_project_index=None,
+                    entity_kind="operation_effect",
+                    entity_name=operation_id,
+                    entity_occurrence=receipt_index,
+                    source_entity_index=None,
+                    candidate_entity_index=change_index - 1,
+                    change_type=(
+                        "added"
+                        if before is None
+                        else "removed"
+                        if after is None
+                        else "changed"
+                    ),
+                    field=f"{kind}.{getattr(value_change, 'field', 'effect')}",
+                    before=before,
+                    after=after,
+                )
+            )
+    ordered = tuple(sorted(changes, key=WorkflowDiffChange.sort_key))
+    return WorkflowDocumentDiff(
+        schema_version=document_diff.schema_version,
+        project_count_source=document_diff.project_count_source,
+        project_count_candidate=document_diff.project_count_candidate,
+        change_count=len(ordered),
+        changes=ordered,
+    )
+
+
 def _project_occurrences(
     document: FCPXMLDocument,
 ) -> list[tuple[int, str, int, object]]:
@@ -268,6 +330,92 @@ def _clip_fields(clip: Clip) -> tuple[tuple[str, str], ...]:
         ("lane", str(clip.lane)),
         ("enabled", "true" if clip.enabled else "false"),
     )
+
+
+def _nested_entities(
+    clip: Clip,
+    kind: Literal["marker", "keyword"],
+) -> dict[tuple[tuple[str, ...], int], tuple[int, str, str]]:
+    items = clip.markers if kind == "marker" else clip.keywords
+    counts: dict[tuple[str, ...], int] = {}
+    result: dict[tuple[tuple[str, ...], int], tuple[int, str, str]] = {}
+    for index, item in enumerate(items):
+        if kind == "marker":
+            identity = (
+                item.start.to_fcpxml(),
+                item.duration.to_fcpxml(),
+                _workflow_diff_text(item.value),
+                _workflow_diff_text(item.note),
+                item.marker_type.value,
+                "true" if item.completed else "false",
+            )
+            rendered = (
+                f"start={identity[0]};duration={identity[1]};value={identity[2]};"
+                f"note={identity[3]};type={identity[4]};completed={identity[5]}"
+            )
+            name = identity[2] or "<unnamed-marker>"
+        else:
+            identity = (
+                item.start.to_fcpxml(),
+                item.duration.to_fcpxml(),
+                _workflow_diff_text(item.value),
+            )
+            rendered = (
+                f"start={identity[0]};duration={identity[1]};value={identity[2]}"
+            )
+            name = identity[2] or "<unnamed-keyword>"
+        occurrence = counts.get(identity, 0) + 1
+        counts[identity] = occurrence
+        result[(identity, occurrence)] = (
+            index,
+            name,
+            _workflow_diff_text(rendered),
+        )
+    return result
+
+
+def _nested_changes(
+    *,
+    before_clip: Clip,
+    after_clip: Clip,
+    kind: Literal["marker", "keyword"],
+    project_name: str,
+    project_occurrence: int,
+    source_project_index: int,
+    candidate_project_index: int,
+) -> list[WorkflowDiffChange]:
+    before = _nested_entities(before_clip, kind)
+    after = _nested_entities(after_clip, kind)
+    changes: list[WorkflowDiffChange] = []
+    for identity, occurrence in sorted(set(before) | set(after)):
+        before_entry = before.get((identity, occurrence))
+        after_entry = after.get((identity, occurrence))
+        if before_entry is not None and after_entry is not None:
+            continue
+        entry = before_entry or after_entry
+        assert entry is not None
+        changes.append(
+            _entity_change(
+                project_name=project_name,
+                project_occurrence=project_occurrence,
+                source_project_index=source_project_index,
+                candidate_project_index=candidate_project_index,
+                entity_kind=kind,
+                entity_name=entry[1],
+                entity_occurrence=occurrence,
+                source_entity_index=(
+                    before_entry[0] if before_entry is not None else None
+                ),
+                candidate_entity_index=(
+                    after_entry[0] if after_entry is not None else None
+                ),
+                change_type="added" if before_entry is None else "removed",
+                field="entity",
+                before=before_entry[2] if before_entry is not None else None,
+                after=after_entry[2] if after_entry is not None else None,
+            )
+        )
+    return changes
 
 
 def _entity_change(
@@ -390,6 +538,24 @@ def build_workflow_diff(
                 continue
             before_fields = dict(_clip_fields(before_entry[1]))
             after_fields = dict(_clip_fields(after_entry[1]))
+            if before_entry[0] != after_entry[0]:
+                changes.append(
+                    _entity_change(
+                        project_name=project_name,
+                        project_occurrence=project_occurrence,
+                        source_project_index=source_project_index,
+                        candidate_project_index=candidate_project_index,
+                        entity_kind=entity_kind,
+                        entity_name=entity_name,
+                        entity_occurrence=entity_occurrence,
+                        source_entity_index=before_entry[0],
+                        candidate_entity_index=after_entry[0],
+                        change_type="changed",
+                        field="position",
+                        before=str(before_entry[0]),
+                        after=str(after_entry[0]),
+                    )
+                )
             for field_name in sorted(before_fields.keys() | after_fields.keys()):
                 before = before_fields.get(field_name)
                 after = after_fields.get(field_name)
@@ -410,6 +576,18 @@ def build_workflow_diff(
                         field=field_name,
                         before=before,
                         after=after,
+                    )
+                )
+            for nested_kind in ("marker", "keyword"):
+                changes.extend(
+                    _nested_changes(
+                        before_clip=before_entry[1],
+                        after_clip=after_entry[1],
+                        kind=nested_kind,
+                        project_name=project_name,
+                        project_occurrence=project_occurrence,
+                        source_project_index=source_project_index,
+                        candidate_project_index=candidate_project_index,
                     )
                 )
     ordered = tuple(sorted(changes, key=WorkflowDiffChange.sort_key))

@@ -5,12 +5,13 @@ import json
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
-from fcp_mcp.fcpxml.diff import build_workflow_diff
+from fcp_mcp.fcpxml.diff import append_operation_effects, build_workflow_diff
 from fcp_mcp.fcpxml.parser import FCPXMLParser
 from fcp_mcp.profiles import ApprovalMode
 from fcp_mcp.security.paths import PathPolicy
@@ -23,6 +24,7 @@ from fcp_mcp.workflow.artifacts import (
 from fcp_mcp.workflow.engine import WorkflowEngine
 from fcp_mcp.workflow.ledger import ArtifactRecord, WorkflowLedger
 from fcp_mcp.workflow.models import (
+    AddKeywordOperation,
     AddMarkerOperation,
     PriorDestinationState,
     WorkflowPrepareRequestV1,
@@ -207,6 +209,50 @@ def test_prepare_has_exact_trajectory_and_never_mutates_destination(
     assert envelope["plan_sha256"] == preview.plan_sha256
     assert "diff_sha256" not in envelope
     assert envelope["operation_receipts"][0]["operation_id"] == "op-001"
+    marker_changes = [
+        change
+        for change in envelope["semantic_diff"]["changes"]
+        if change["entity_kind"] == "marker"
+    ]
+    assert len(marker_changes) == 1
+    assert "value=Chapter" in marker_changes[0]["after"]
+    assert "marker" in preview.summary
+    assert "Chapter" in preview.summary
+
+
+def test_keyword_effect_is_typed_duplicate_aware_and_summarized(tmp_path: Path):
+    source = tmp_path / "source.fcpxml"
+    destination = tmp_path / "destination.fcpxml"
+    source.write_bytes(SOURCE_XML)
+    engine, ledger, artifacts = _engine(tmp_path)
+    request = WorkflowPrepareRequestV1(
+        source_path=str(source),
+        destination_path=str(destination),
+        operations=(
+            AddKeywordOperation(
+                kind="add_keyword",
+                clip_name="Clip",
+                start="0s",
+                duration="1001/30000s",
+                value="Interview",
+            ),
+        ),
+    )
+
+    preview = engine.prepare(request)
+
+    diff_record = ledger.get_artifact(RUN_ID, ArtifactKind.DIFF)
+    assert diff_record is not None
+    envelope = json.loads(artifacts.read(_metadata(diff_record)))
+    changes = envelope["semantic_diff"]["changes"]
+    keyword = next(
+        change for change in changes if change["entity_kind"] == "keyword"
+    )
+    assert keyword["entity_occurrence"] == 1
+    assert "value=Interview" in keyword["after"]
+    assert keyword["field"] == "entity"
+    assert "keyword" in preview.summary
+    assert "Interview" in preview.summary
 
 
 def test_prepare_rejects_pre_run_path_and_configured_operation_failures(tmp_path: Path):
@@ -275,8 +321,11 @@ def test_post_creation_failures_are_coded_terminal_and_have_no_phantom_nodes(
     assert failure_evidence["schema_version"] == "1"
     assert failure_evidence["run_id"] == RUN_ID
     assert failure_evidence["error_code"] == code.value
-    assert failure_evidence["operation_receipts"][-1]["disposition"] == "failed"
-    assert failure_evidence["operation_receipts"][-1]["error_code"] == code.value
+    if code is ErrorCode.WORKFLOW_STALE:
+        assert failure_evidence["operation_receipts"] == []
+    else:
+        assert failure_evidence["operation_receipts"][-1]["disposition"] == "failed"
+        assert failure_evidence["operation_receipts"][-1]["error_code"] == code.value
     assert set(failure_evidence) == {
         "schema_version",
         "graph_version",
@@ -345,6 +394,34 @@ def test_exact_idempotency_duplicate_rehydrates_without_second_execution(tmp_pat
     assert second == first
     assert len(ledger.list_events(RUN_ID)) == 8
     assert ledger.get_run("123e4567-e89b-42d3-a456-426614174001") is None
+
+
+@pytest.mark.parametrize("clip_name", ["Clip", "missing"])
+def test_prepare_calls_execute_plan_exactly_once_for_success_and_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clip_name: str,
+) -> None:
+    source = tmp_path / "source.fcpxml"
+    destination = tmp_path / "destination.fcpxml"
+    source.write_bytes(SOURCE_XML)
+    engine, _, _ = _engine(tmp_path)
+    original = engine.execute_plan
+    calls = 0
+
+    def counted(path, plan):
+        nonlocal calls
+        calls += 1
+        return original(path, plan)
+
+    monkeypatch.setattr(engine, "execute_plan", counted)
+    if clip_name == "missing":
+        with pytest.raises(FCPMCPError):
+            engine.prepare(_request(source, destination, clip_name=clip_name))
+    else:
+        engine.prepare(_request(source, destination, clip_name=clip_name))
+
+    assert calls == 1
 
 
 def test_idempotency_conflict_and_nonawaiting_duplicate_are_stable(tmp_path: Path):
@@ -460,3 +537,48 @@ def test_typed_diff_is_duplicate_aware_rational_and_canonical(tmp_path: Path):
         for change in payload["changes"]
     )
     assert canonical_json(payload) == canonical_json(dict(reversed(tuple(payload.items()))))
+
+
+def test_typed_diff_binds_all_verified_operation_effects(tmp_path: Path):
+    document_path = tmp_path / "same.fcpxml"
+    document_path.write_bytes(SOURCE_XML)
+    document = FCPXMLParser().parse(document_path)
+    receipts = (
+        SimpleNamespace(
+            operation_id="op-001",
+            kind="add_transition",
+            changes=(
+                SimpleNamespace(field="transition_count", before="0", after="1"),
+            ),
+        ),
+        SimpleNamespace(
+            operation_id="op-002",
+            kind="change_speed",
+            changes=(
+                SimpleNamespace(field="duration", before="2s", after="1s"),
+                SimpleNamespace(field="speed_factor", before=None, after="2.0"),
+            ),
+        ),
+    )
+
+    diff = append_operation_effects(
+        build_workflow_diff(document, document),
+        receipts,
+    )
+    payload = diff.to_mapping()
+
+    assert payload["change_count"] == 3
+    assert [
+        (
+            change["entity_kind"],
+            change["entity_name"],
+            change["field"],
+            change["before"],
+            change["after"],
+        )
+        for change in payload["changes"]
+    ] == [
+        ("operation_effect", "op-001", "add_transition.transition_count", "0", "1"),
+        ("operation_effect", "op-002", "change_speed.duration", "2s", "1s"),
+        ("operation_effect", "op-002", "change_speed.speed_factor", None, "2.0"),
+    ]
