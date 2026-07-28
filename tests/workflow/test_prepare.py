@@ -537,7 +537,10 @@ def test_idempotency_conflict_and_nonawaiting_duplicate_are_stable(tmp_path: Pat
     assert "cancelled" in error.value.message
 
 
-def test_concurrent_duplicate_callers_create_one_run_and_one_graph(tmp_path: Path):
+def test_concurrent_duplicate_callers_create_one_run_and_one_graph(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     source = tmp_path / "source.fcpxml"
     destination = tmp_path / "destination.fcpxml"
     source.write_bytes(SOURCE_XML)
@@ -556,22 +559,38 @@ def test_concurrent_duplicate_callers_create_one_run_and_one_graph(tmp_path: Pat
 
     engine, ledger, _ = _engine(tmp_path, uuid_factory=next_id)
     request = _request(source, destination, idempotency_key="concurrent")
-    barrier = threading.Barrier(2)
+    execution_started = threading.Event()
+    release_execution = threading.Event()
+    original_execute_plan = engine.execute_plan
+
+    def blocking_execute_plan(path, plan):
+        execution_started.set()
+        if not release_execution.wait(timeout=5):
+            raise TimeoutError("test did not release workflow execution")
+        return original_execute_plan(path, plan)
+
+    monkeypatch.setattr(engine, "execute_plan", blocking_execute_plan)
     results = []
     errors = []
 
     def call():
-        barrier.wait()
         try:
             results.append(engine.prepare(request))
         except FCPMCPError as error:
             errors.append(error)
 
-    threads = [threading.Thread(target=call) for _ in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
+    first = threading.Thread(target=call)
+    second = threading.Thread(target=call)
+    first.start()
+    try:
+        assert execution_started.wait(timeout=5)
+        second.start()
+        second.join(timeout=5)
+        assert not second.is_alive()
+    finally:
+        release_execution.set()
+        first.join(timeout=5)
+    assert not first.is_alive()
 
     assert len(results) == 1
     assert len(errors) == 1
