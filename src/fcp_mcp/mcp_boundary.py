@@ -15,9 +15,11 @@ from pydantic import BaseModel, ValidationError
 
 from .config import RuntimeConfig
 from .contracts import ErrorCode, FCPMCPError
+from .profiles import ToolClass
 from .registry import PromptRegistry, ResourceRegistry, ToolDefinition, ToolRegistry
 from .result_models.common import LegacyTextResult, ToolOutcome
 from .tool_metadata import SafetyHints
+from .version import package_version
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +92,17 @@ def coerce_outcome(
     return ToolOutcome(text=text, structured=structured)
 
 
-def _invoker(definition: ToolDefinition):
+def _invoker(definition: ToolDefinition, config: RuntimeConfig):
     @functools.wraps(definition.handler)
     async def invoke(**arguments):
+        if (
+            definition.tool_class in {ToolClass.LIVE_READ, ToolClass.LIVE_WRITE}
+            and not config.live_control_enabled
+        ):
+            raise FCPMCPError(
+                ErrorCode.LIVE_CONTROL_DISABLED,
+                "Set FCP_MCP_ENABLE_LIVE_CONTROL=1 to use live FCP or Compressor tools",
+            )
         returned = definition.handler(**arguments)
         if inspect.isawaitable(returned):
             returned = await returned
@@ -163,16 +173,25 @@ def build_mcp_server(
     prompts: PromptRegistry,
     resources: ResourceRegistry | None = None,
 ) -> FCPFastMCP:
+    visible_tools = tools.for_profile(config.profile)
+    visible_names = {definition.name for definition in visible_tools}
+    visible_prompts = prompts.for_tools(visible_names)
+    visible_resources = resources.for_profile(config.profile) if resources else ()
+    live_control = "enabled" if config.live_control_enabled else "disabled"
+
     server = FCPFastMCP(
         "fcp-mcp",
         instructions=(
-            "fcp-mcp v0.2.1 — FCPXML engine + live FCP control + media analysis "
-            "+ puppet animation. 89 tools across 12 categories and 5 prompts."
+            f"fcp-mcp {package_version()}; profile={config.profile.value}; "
+            f"catalog={len(visible_tools)} tools/{len(visible_prompts)} prompts/"
+            f"{len(visible_resources)} resources; "
+            f"approval={config.workflow_approval.value}; live_control={live_control}. "
+            "Transactional FCPXML workflows require evidence review and explicit "
+            "approval before commit."
         ),
     )
-    visible_tools = tools.for_profile(config.profile)
     for definition in visible_tools:
-        invoke = _invoker(definition)
+        invoke = _invoker(definition, config)
         server.tool(
             name=definition.name,
             description=definition.description,
@@ -187,20 +206,23 @@ def build_mcp_server(
                 definition.name
             )
 
-    visible_names = {definition.name for definition in visible_tools}
-    for definition in prompts.for_tools(visible_names):
+    for definition in visible_prompts:
+        if not definition.dependencies <= visible_names:
+            raise AssertionError(
+                f"Prompt {definition.name!r} depends on tools outside profile "
+                f"{config.profile.value!r}"
+            )
         server.prompt(
             name=definition.name,
             description=definition.description,
         )(definition.handler)
-    if resources is not None:
-        for definition in resources.for_profile(config.profile):
-            server.resource(
-                definition.uri_template,
-                name=definition.name,
-                description=definition.description,
-                mime_type=definition.mime_type,
-            )(definition.handler)
+    for definition in visible_resources:
+        server.resource(
+            definition.uri_template,
+            name=definition.name,
+            description=definition.description,
+            mime_type=definition.mime_type,
+        )(definition.handler)
     return server
 
 

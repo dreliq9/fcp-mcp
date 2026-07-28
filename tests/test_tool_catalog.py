@@ -142,4 +142,4 @@ def test_real_no_environment_default_exposes_workflow_safe_catalog():
     assert "fcpxml_add_marker" not in catalog["tools"]
     assert "fcp_open_library" not in catalog["tools"]
     assert "fcpxml_workflow_prepare" in catalog["tools"]
-    assert catalog["prompts"] == ["qc-check", "youtube-chapters"]
+    assert catalog["prompts"] == ["qc-check", "cleanup", "youtube-chapters"]

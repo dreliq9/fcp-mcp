@@ -7606,52 +7606,58 @@ def prompt_rough_cut(clips_json: str, target_duration: str = "") -> str:
 
 @PROMPTS.prompt(
     name="cleanup",
-    description="Extend flash frames, replace gaps with a chosen asset, then re-run QC.",
-    dependencies={
-        "fcpxml_fix_flash_frames",
-        "fcpxml_fill_gaps",
-        "fcpxml_qc_report",
-    },
+    description="Prepare one reviewable transaction that fixes flash frames and fills gaps.",
+    dependencies={"fcpxml_workflow_prepare"},
 )
 def prompt_cleanup(
     path: str,
     fill_asset_ref: str,
     output_path: str = "",
 ) -> str:
-    """Fix flash frames, fill gaps with a selected asset, and re-run QC."""
-    out_clause = (
-        f" Save the cleaned file to {output_path!r}."
-        if output_path
-        else " Use each tool's returned output path for the next step."
+    """Prepare a transactional flash-frame and gap cleanup for review."""
+    destination = (
+        output_path
+        or "<choose an explicit destination path before preparing>"
     )
-    next_path = output_path or "<path returned by fcpxml_fix_flash_frames>"
-    fix_call = _tool_call_block(
-        "fcpxml_fix_flash_frames",
-        {"path": path, "output_path": output_path},
-    )
-    fill_call = _tool_call_block(
-        "fcpxml_fill_gaps",
+    prepare_call = _tool_call_block(
+        "fcpxml_workflow_prepare",
         {
-            "path": next_path,
-            "fill_asset_ref": fill_asset_ref,
-            "output_path": output_path,
+            "schema_version": "1",
+            "source_path": path,
+            "destination_path": destination,
+            "operations": [
+                {
+                    "kind": "fix_flash_frames",
+                    "min_frames": 3,
+                    "frame_duration": "1001/30000s",
+                },
+                {
+                    "kind": "fill_gaps",
+                    "fill_ref": fill_asset_ref,
+                    "fill_name": "Fill",
+                },
+            ],
         },
     )
-    qc_call = _tool_call_block(
-        "fcpxml_qc_report",
-        {"path": next_path},
+    destination_instruction = (
+        f"Use the explicit destination {destination!r}."
+        if output_path
+        else (
+            "Replace `<choose an explicit destination path before preparing>` "
+            "with a policy-allowed `.fcpxml` destination."
+        )
     )
     return (
-        f"Clean up the FCPXML at {path!r}.{out_clause}\n\n"
-        "1. Extend clips shorter than the configured flash-frame minimum:\n\n"
-        f"{fix_call}\n\n"
-        f"2. Replace gap elements with existing asset resource {fill_asset_ref!r}:\n\n"
-        f"{fill_call}\n\n"
-        "3. Use the actual output path from step 2 in this structural QC call:\n\n"
-        f"{qc_call}\n\n"
-        "Report before/after flash-frame and gap counts plus remaining QC items. "
-        "Do not call these changes non-destructive: they alter clip durations and "
-        "replace gaps with the selected media asset."
+        f"Prepare one transactional cleanup of {path!r} using existing asset "
+        f"resource {fill_asset_ref!r}. {destination_instruction}\n\n"
+        f"{prepare_call}\n\n"
+        "The prepare call changes only private workflow evidence; it does not alter "
+        "the destination. Review the returned summary, warnings, hashes, and `diff_uri`.\n\n"
+        "For CLI approval mode, show that evidence to the user and run "
+        "`fcp-mcp workflow approve RUN_ID` only after explicit confirmation. Then call "
+        "`fcpxml_workflow_commit` with that exact run ID. Never approve or commit "
+        "automatically. In client approval mode, call `fcpxml_workflow_commit` only "
+        "after the user explicitly approves the reviewed evidence."
     )
 
 

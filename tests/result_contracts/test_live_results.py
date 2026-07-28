@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ import fcp_mcp.utils.paths as utility_paths
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import FCPMCPError
+from fcp_mcp.mcp_boundary import build_mcp_server
 from fcp_mcp.media import ffprobe
 from fcp_mcp.result_models.live import (
     CompressorSubmissionRequest,
@@ -645,8 +647,14 @@ async def test_registered_mcp_boundary_preserves_text_and_structured_schema(
         '"libraryCount":2}'
     )
     monkeypatch.setattr(automation, "run_osascript", lambda *_args, **_kwargs: raw)
+    enabled_mcp = build_mcp_server(
+        replace(server.CONFIG, live_control_enabled=True),
+        server.TOOLS,
+        server.PROMPTS,
+        server.RESOURCES,
+    )
 
-    result = await server.mcp.call_tool("fcp_get_app_state", {})
+    result = await enabled_mcp.call_tool("fcp_get_app_state", {})
 
     assert result.content[0].text == raw
     assert result.structuredContent == {

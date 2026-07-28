@@ -12,6 +12,8 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from fcp_mcp.profiles import Profile
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PATHS = (ROOT / "WORKFLOWS.md", ROOT / "LLM_GUIDE.md")
 TOOL_CALL_BLOCK = re.compile(
@@ -92,15 +94,28 @@ def validate_call(
     return errors
 
 
-async def _live_catalog() -> dict[str, Any]:
-    from fcp_mcp.server import mcp
+async def _profile_catalog(profile: Profile) -> dict[str, Any]:
+    from fcp_mcp.mcp_boundary import build_mcp_server
+    from fcp_mcp.server import CONFIG, PROMPTS, RESOURCES, TOOLS
 
-    return {tool.name: tool for tool in await mcp.list_tools()}
+    server = build_mcp_server(
+        CONFIG.with_profile(profile),
+        TOOLS,
+        PROMPTS,
+        RESOURCES,
+    )
+    return {tool.name: tool for tool in await server.list_tools()}
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Validate ```tool-call fences against the live MCP catalog.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=[profile.value for profile in Profile],
+        default=Profile.FULL.value,
+        help="Validate documentation against this capability profile",
     )
     parser.add_argument(
         "paths",
@@ -109,12 +124,12 @@ def _parse_args() -> argparse.Namespace:
         default=list(DEFAULT_PATHS),
         help="Markdown files to validate (defaults to WORKFLOWS.md and LLM_GUIDE.md)",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     args = _parse_args()
-    catalog = asyncio.run(_live_catalog())
+    catalog = asyncio.run(_profile_catalog(Profile(args.profile)))
     failures: list[str] = []
     checked = 0
 

@@ -11,6 +11,7 @@ import pytest
 from fcp_mcp.server import mcp
 from scripts.check_contracts import (
     ContractBlockError,
+    _parse_args,
     extract_tool_call_blocks,
     validate_call,
 )
@@ -85,6 +86,18 @@ def test_validate_call_rejects_unknown_tool_and_shape():
         "name: must be a string",
         "arguments: must be an object",
     ]
+
+
+def test_contract_checker_accepts_explicit_profile(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["check_contracts.py", "--profile", "inspect", "WORKFLOWS.md"],
+    )
+
+    args = _parse_args()
+
+    assert args.profile == "inspect"
+    assert args.paths == [Path("WORKFLOWS.md")]
 
 
 def test_published_tool_calls_match_live_catalog():
