@@ -156,6 +156,36 @@ def _attach_cleanup_errors(
     )
 
 
+def _as_coded(
+    error: BaseException,
+    *,
+    code: ErrorCode,
+    message: str,
+) -> FCPMCPError:
+    if isinstance(error, FCPMCPError):
+        return error
+    return _coded(code, message, error)
+
+
+def _cleanup_failure(description: str, error: OSError) -> str:
+    detail = error.strerror
+    if not detail:
+        detail = str(error) if error.filename is None else type(error).__name__
+    detail = detail.replace("\r", " ").replace("\n", " ")[:160]
+    return f"{description}: {detail}"[:240]
+
+
+def _close_descriptor(
+    fd: int,
+    *,
+    description: str,
+    failures: list[str],
+) -> None:
+    try:
+        os.close(fd)
+    except OSError as error:
+        failures.append(_cleanup_failure(description, error))
+
 
 def _read_opened_payload(fd: int, expected_size: int) -> bytes:
     os.lseek(fd, 0, os.SEEK_SET)
@@ -258,9 +288,9 @@ def _open_directory_at(
     created = False
     try:
         fd = os.open(name, flags, dir_fd=parent_fd)
-    except FileNotFoundError:
+    except FileNotFoundError as error:
         if not create:
-            raise
+            raise _coded(code, f"{description} is missing", error)
         try:
             os.mkdir(name, _DIRECTORY_MODE, dir_fd=parent_fd)
             created = True
@@ -283,15 +313,37 @@ def _open_directory_at(
             description=description,
             require_private_mode=require_private_mode or created,
         )
-    except BaseException:
-        os.close(fd)
-        raise
+    except BaseException as error:  # noqa: BLE001 - close the acquired descriptor
+        primary_error = _as_coded(
+            error,
+            code=code,
+            message=f"cannot validate {description}",
+        )
+        cleanup_failures: list[str] = []
+        _close_descriptor(
+            fd,
+            description="close opened directory",
+            failures=cleanup_failures,
+        )
+        _attach_cleanup_errors(primary_error, cleanup_failures)
+        raise primary_error
     if created:
         try:
             os.fsync(parent_fd)
         except OSError as error:
-            os.close(fd)
-            raise _coded(code, f"cannot durably create {description}", error)
+            primary_error = _coded(
+                code,
+                f"cannot durably create {description}",
+                error,
+            )
+            cleanup_failures = []
+            _close_descriptor(
+                fd,
+                description="close created directory",
+                failures=cleanup_failures,
+            )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
+            raise primary_error
     return fd, created
 
 
@@ -301,6 +353,7 @@ def _open_absolute_directory_chain(
     create: bool,
     code: ErrorCode,
     description: str,
+    require_private_mode: bool = True,
 ) -> int:
     if not path.is_absolute():
         raise _coded(code, f"{description} must be absolute")
@@ -311,29 +364,72 @@ def _open_absolute_directory_chain(
         current_fd = os.open(parts[0], _directory_open_flags())
     except OSError as error:
         raise _coded(code, f"cannot open filesystem root for {description}", error)
-    try:
-        for index, component in enumerate(parts[1:]):
-            is_leaf = index == len(parts[1:]) - 1
+    for index, component in enumerate(parts[1:]):
+        is_leaf = index == len(parts[1:]) - 1
+        try:
             next_fd, _ = _open_directory_at(
                 current_fd,
                 component,
                 create=create,
-                require_private_mode=is_leaf,
+                require_private_mode=is_leaf and require_private_mode,
                 code=code,
                 description=description if is_leaf else "state parent directory",
             )
+        except BaseException as error:  # noqa: BLE001 - close the retained parent
+            primary_error = _as_coded(
+                error,
+                code=code,
+                message=f"cannot open {description}",
+            )
+            cleanup_failures: list[str] = []
+            _close_descriptor(
+                current_fd,
+                description="close directory chain",
+                failures=cleanup_failures,
+            )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
+            raise primary_error
+        try:
             os.close(current_fd)
-            current_fd = next_fd
+        except OSError as error:
+            primary_error = _coded(
+                code,
+                f"cannot release parent while opening {description}",
+                error,
+            )
+            cleanup_failures = [
+                _cleanup_failure("close parent directory", error)
+            ]
+            _close_descriptor(
+                next_fd,
+                description="close acquired child directory",
+                failures=cleanup_failures,
+            )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
+            raise primary_error
+        current_fd = next_fd
+    try:
         _validate_directory_fd(
             current_fd,
             code=code,
             description=description,
-            require_private_mode=True,
+            require_private_mode=require_private_mode,
         )
-        return current_fd
-    except BaseException:
-        os.close(current_fd)
-        raise
+    except BaseException as error:  # noqa: BLE001 - close the retained leaf
+        primary_error = _as_coded(
+            error,
+            code=code,
+            message=f"cannot validate {description}",
+        )
+        cleanup_failures = []
+        _close_descriptor(
+            current_fd,
+            description="close invalid directory",
+            failures=cleanup_failures,
+        )
+        _attach_cleanup_errors(primary_error, cleanup_failures)
+        raise primary_error
+    return current_fd
 
 
 def _validate_entry_at(
@@ -366,6 +462,75 @@ def _validate_entry_at(
     return result
 
 
+def _require_opened_directory_identity(
+    parent_fd: int,
+    name: str,
+    opened_fd: int,
+    *,
+    description: str,
+) -> None:
+    current_result = _validate_entry_at(
+        parent_fd,
+        name,
+        expected="directory",
+        code=ErrorCode.ARTIFACT_CORRUPT,
+        description=description,
+    )
+    try:
+        opened_result = os.fstat(opened_fd)
+    except OSError as error:
+        raise _coded(
+            ErrorCode.ARTIFACT_CORRUPT,
+            f"cannot inspect opened {description}",
+            error,
+        )
+    if current_result is None or not os.path.samestat(opened_result, current_result):
+        raise _coded(
+            ErrorCode.ARTIFACT_CORRUPT,
+            f"{description} changed during artifact access",
+        )
+
+
+def _remove_owned_file_at(
+    parent_fd: int,
+    name: str,
+    owned_fd: int,
+) -> list[str]:
+    failures: list[str] = []
+    try:
+        current_result = os.stat(
+            name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        opened_result = os.fstat(owned_fd)
+    except FileNotFoundError:
+        return failures
+    except OSError as error:
+        failures.append(
+            _cleanup_failure("inspect published artifact for cleanup", error)
+        )
+        return failures
+    if (
+        stat.S_ISLNK(current_result.st_mode)
+        or not stat.S_ISREG(current_result.st_mode)
+        or not os.path.samestat(opened_result, current_result)
+    ):
+        return failures
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return failures
+    except OSError as error:
+        failures.append(_cleanup_failure("remove published artifact", error))
+        return failures
+    try:
+        os.fsync(parent_fd)
+    except OSError as error:
+        failures.append(_cleanup_failure("sync artifact cleanup", error))
+    return failures
+
+
 def _initialize_posix_state(root: Path) -> None:
     root_fd = _open_absolute_directory_chain(
         root,
@@ -393,7 +558,6 @@ def _initialize_posix_state(root: Path) -> None:
             os.close(child_fd)
     finally:
         os.close(root_fd)
-
 
 
 class StatePaths(BaseModel):
@@ -596,10 +760,10 @@ class ArtifactStore:
             )
             return root_fd, artifacts_fd, run_fd
         except BaseException as error:  # noqa: BLE001 - close all acquired descriptors
-            primary_error = (
-                _coded(ErrorCode.ARTIFACT_CORRUPT, "artifact path is missing", error)
-                if isinstance(error, FileNotFoundError)
-                else error
+            primary_error = _as_coded(
+                error,
+                code=ErrorCode.ARTIFACT_CORRUPT,
+                message="artifact path cannot be opened",
             )
             cleanup_failures: list[str] = []
             for description, fd in (
@@ -608,12 +772,11 @@ class ArtifactStore:
             ):
                 if not isinstance(fd, int):
                     continue
-                try:
-                    os.close(fd)
-                except OSError as cleanup_error:
-                    cleanup_failures.append(
-                        f"close {description} fd {fd}: {cleanup_error}"
-                    )
+                _close_descriptor(
+                    fd,
+                    description=f"close {description} directory",
+                    failures=cleanup_failures,
+                )
             _attach_cleanup_errors(primary_error, cleanup_failures)
             raise primary_error
 
@@ -625,11 +788,113 @@ class ArtifactStore:
             ("artifacts", artifacts_fd),
             ("root", root_fd),
         ):
-            try:
-                os.close(fd)
-            except OSError as error:
-                failures.append(f"close {description} fd {fd}: {error}")
+            _close_descriptor(
+                fd,
+                description=f"close {description} directory",
+                failures=failures,
+            )
         _attach_cleanup_errors(None, failures)
+
+    def _revalidate_posix_run(
+        self,
+        run_id: str,
+        *,
+        root_fd: int,
+        artifacts_fd: int,
+        run_fd: int,
+    ) -> None:
+        state_parent_fd: int | None = None
+        current_root_fd: int | None = None
+        current_artifacts_fd: int | None = None
+        current_run_fd: int | None = None
+        primary_error: FCPMCPError | None = None
+        try:
+            state_parent_fd = _open_absolute_directory_chain(
+                self.paths.root.parent,
+                create=False,
+                code=ErrorCode.ARTIFACT_CORRUPT,
+                description="workflow state parent",
+                require_private_mode=False,
+            )
+            current_root_fd, _ = _open_directory_at(
+                state_parent_fd,
+                self.paths.root.name,
+                create=False,
+                require_private_mode=True,
+                code=ErrorCode.ARTIFACT_CORRUPT,
+                description="workflow state root",
+            )
+            current_artifacts_fd, _ = _open_directory_at(
+                current_root_fd,
+                "artifacts",
+                create=False,
+                require_private_mode=True,
+                code=ErrorCode.ARTIFACT_CORRUPT,
+                description="workflow artifacts directory",
+            )
+            current_run_fd, _ = _open_directory_at(
+                current_artifacts_fd,
+                run_id,
+                create=False,
+                require_private_mode=True,
+                code=ErrorCode.ARTIFACT_CORRUPT,
+                description="artifact run directory",
+            )
+            for description, retained_fd, current_fd in (
+                ("workflow state root", root_fd, current_root_fd),
+                ("workflow artifacts directory", artifacts_fd, current_artifacts_fd),
+                ("artifact run directory", run_fd, current_run_fd),
+            ):
+                if not os.path.samestat(
+                    os.fstat(retained_fd),
+                    os.fstat(current_fd),
+                ):
+                    raise _coded(
+                        ErrorCode.ARTIFACT_CORRUPT,
+                        f"{description} changed during artifact access",
+                    )
+            for _ in range(2):
+                _require_opened_directory_identity(
+                    state_parent_fd,
+                    self.paths.root.name,
+                    current_root_fd,
+                    description="workflow state root",
+                )
+                _require_opened_directory_identity(
+                    current_root_fd,
+                    "artifacts",
+                    current_artifacts_fd,
+                    description="workflow artifacts directory",
+                )
+                _require_opened_directory_identity(
+                    current_artifacts_fd,
+                    run_id,
+                    current_run_fd,
+                    description="artifact run directory",
+                )
+        except BaseException as error:  # noqa: BLE001 - close the fresh descriptor chain
+            primary_error = _as_coded(
+                error,
+                code=ErrorCode.ARTIFACT_CORRUPT,
+                message="canonical artifact directory chain cannot be verified",
+            )
+            raise primary_error
+        finally:
+            cleanup_failures: list[str] = []
+            for description, fd in (
+                ("current run", current_run_fd),
+                ("current artifacts", current_artifacts_fd),
+                ("current root", current_root_fd),
+                ("state parent", state_parent_fd),
+            ):
+                if fd is None:
+                    continue
+                _close_descriptor(
+                    fd,
+                    description=f"close {description} directory",
+                    failures=cleanup_failures,
+                )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
 
     def _existing_artifact_sizes_posix(self, run_fd: int) -> dict[ArtifactKind, int]:
         sizes: dict[ArtifactKind, int] = {}
@@ -690,6 +955,7 @@ class ArtifactStore:
         temporary_fd: int | None = None
         temporary_owned = False
         replaced = False
+        published_owned = False
         process_locked = False
         try:
             import fcntl
@@ -749,6 +1015,7 @@ class ArtifactStore:
                 dst_dir_fd=run_fd,
             )
             replaced = True
+            published_owned = True
             temporary_owned = False
             opened_result = os.fstat(temporary_fd)
             current_result = os.stat(
@@ -766,6 +1033,13 @@ class ArtifactStore:
                     "committed artifact identity or bytes changed during replacement",
                 )
             os.fsync(run_fd)
+            self._revalidate_posix_run(
+                run_id,
+                root_fd=root_fd,
+                artifacts_fd=artifacts_fd,
+                run_fd=run_fd,
+            )
+            published_owned = False
         except FCPMCPError:
             raise
         except OSError as error:
@@ -779,6 +1053,18 @@ class ArtifactStore:
             primary_error = sys.exc_info()[1]
             cleanup_failures: list[str] = []
             cleanup_error: OSError | None = None
+            if (
+                primary_error is not None
+                and published_owned
+                and temporary_fd is not None
+            ):
+                cleanup_failures.extend(
+                    _remove_owned_file_at(
+                        run_fd,
+                        target_name,
+                        temporary_fd,
+                    )
+                )
             if (
                 temporary_owned
                 and temporary_name is not None
@@ -812,26 +1098,31 @@ class ArtifactStore:
                                 cleanup_error = None
                                 break
             if temporary_fd is not None:
-                try:
-                    os.close(temporary_fd)
-                except OSError as error:
-                    cleanup_failures.append(f"close temporary artifact: {error}")
+                _close_descriptor(
+                    temporary_fd,
+                    description="close temporary artifact",
+                    failures=cleanup_failures,
+                )
             if process_locked:
                 try:
                     fcntl.flock(run_fd, fcntl.LOCK_UN)
                 except OSError as error:
-                    cleanup_failures.append(f"unlock artifact run: {error}")
+                    cleanup_failures.append(
+                        _cleanup_failure("unlock artifact run", error)
+                    )
             try:
                 self._close_posix_run(root_fd, artifacts_fd, run_fd)
             except FCPMCPError as error:
                 cleanup_failures.append(error.message)
             if cleanup_error is not None:
                 cleanup_failures.append(
-                    f"remove private artifact temporary file: {cleanup_error}"
+                    _cleanup_failure(
+                        "remove private artifact temporary file",
+                        cleanup_error,
+                    )
                 )
             _attach_cleanup_errors(primary_error, cleanup_failures)
         return self._metadata(run_id, kind, payload)
-
 
     @staticmethod
     def _metadata(
@@ -945,6 +1236,12 @@ class ArtifactStore:
                     ErrorCode.ARTIFACT_CORRUPT,
                     "recorded artifact path changed during read",
                 )
+            self._revalidate_posix_run(
+                run_id,
+                root_fd=root_fd,
+                artifacts_fd=artifacts_fd,
+                run_fd=run_fd,
+            )
             return payload
         except FCPMCPError as error:
             if error.code is ErrorCode.ARTIFACT_CORRUPT:
@@ -956,22 +1253,24 @@ class ArtifactStore:
             primary_error = sys.exc_info()[1]
             cleanup_failures: list[str] = []
             if artifact_fd is not None:
-                try:
-                    os.close(artifact_fd)
-                except OSError as error:
-                    cleanup_failures.append(f"close recorded artifact: {error}")
+                _close_descriptor(
+                    artifact_fd,
+                    description="close recorded artifact",
+                    failures=cleanup_failures,
+                )
             if process_locked and run_fd is not None:
                 try:
                     fcntl.flock(run_fd, fcntl.LOCK_UN)
                 except OSError as error:
-                    cleanup_failures.append(f"unlock artifact run: {error}")
+                    cleanup_failures.append(
+                        _cleanup_failure("unlock artifact run", error)
+                    )
             if root_fd is not None and artifacts_fd is not None and run_fd is not None:
                 try:
                     self._close_posix_run(root_fd, artifacts_fd, run_fd)
                 except FCPMCPError as error:
                     cleanup_failures.append(error.message)
             _attach_cleanup_errors(primary_error, cleanup_failures)
-
 
     def verify(self, metadata: ArtifactMetadataV1) -> bool:
         self.read(metadata)

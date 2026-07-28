@@ -51,6 +51,35 @@ def _assert_code(error: pytest.ExceptionInfo[FCPMCPError], code: ErrorCode) -> N
     assert error.value.code is code
 
 
+def _replace_canonical_artifact_chain(
+    store: ArtifactStore,
+    level: str,
+) -> Path:
+    root = store.paths.root
+    artifacts = store.paths.artifacts
+    run_directory = store.paths.run_dir(RUN_ID)
+    if level == "run":
+        detached = artifacts / f"{RUN_ID}.detached"
+        run_directory.rename(detached)
+        run_directory.mkdir(mode=0o700)
+        return detached
+    if level == "artifacts":
+        detached = root / "artifacts.detached"
+        artifacts.rename(detached)
+        artifacts.mkdir(mode=0o700)
+        run_directory.mkdir(mode=0o700)
+        return detached / RUN_ID
+    if level == "root":
+        detached = root.with_name("state.detached")
+        root.rename(detached)
+        root.mkdir(mode=0o700)
+        artifacts.mkdir(mode=0o700)
+        store.paths.locks.mkdir(mode=0o700)
+        run_directory.mkdir(mode=0o700)
+        return detached / "artifacts" / RUN_ID
+    raise AssertionError(f"unknown chain level: {level}")
+
+
 def test_artifact_store_contains_only_the_macos_descriptor_implementation():
     source = Path(artifact_module.__file__).read_text(encoding="utf-8")
     for marker in (
@@ -492,6 +521,78 @@ def test_existing_target_is_atomically_replaced(tmp_path: Path):
     _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
 
 
+@pytest.mark.parametrize("level", ["run", "artifacts", "root"])
+def test_write_rejects_canonical_directory_replacement_and_cleans_detached_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    level: str,
+):
+    store = _store(tmp_path)
+    real_read_opened = artifact_module._read_opened_payload
+    real_fsync = os.fsync
+    detached_run: Path | None = None
+    synced_directories: list[tuple[int, int]] = []
+
+    def replacing_read(fd: int, expected_size: int) -> bytes:
+        nonlocal detached_run
+        if detached_run is None:
+            detached_run = _replace_canonical_artifact_chain(store, level)
+        return real_read_opened(fd, expected_size)
+
+    def recording_fsync(fd: int) -> None:
+        result = os.fstat(fd)
+        if stat.S_ISDIR(result.st_mode):
+            synced_directories.append((result.st_dev, result.st_ino))
+        real_fsync(fd)
+
+    monkeypatch.setattr(artifact_module, "_read_opened_payload", replacing_read)
+    monkeypatch.setattr(artifact_module.os, "fsync", recording_fsync)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert detached_run is not None
+    detached_result = detached_run.stat()
+    detached_identity = (detached_result.st_dev, detached_result.st_ino)
+    assert synced_directories.count(detached_identity) >= 2
+    assert not (detached_run / "candidate.fcpxml").exists()
+    assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
+
+
+def test_swapped_run_inode_cannot_bypass_aggregate_locking_and_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path, limit=5)
+    real_read_opened = artifact_module._read_opened_payload
+    detached_run: Path | None = None
+    canonical_diff: ArtifactMetadataV1 | None = None
+
+    def replacing_read(fd: int, expected_size: int) -> bytes:
+        nonlocal detached_run, canonical_diff
+        if detached_run is None:
+            detached_run = _replace_canonical_artifact_chain(store, "run")
+            canonical_diff = store._write_posix(
+                RUN_ID,
+                ArtifactKind.DIFF,
+                b"123",
+            )
+        return real_read_opened(fd, expected_size)
+
+    monkeypatch.setattr(artifact_module, "_read_opened_payload", replacing_read)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"123")
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert detached_run is not None
+    assert not (detached_run / "candidate.fcpxml").exists()
+    assert canonical_diff is not None
+    assert store.read(canonical_diff) == b"123"
+    assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX cleanup ownership regression")
 def test_posix_exclusive_open_failure_does_not_unlink_preexisting_temp(
     tmp_path: Path,
@@ -802,6 +903,133 @@ def test_open_posix_run_failure_closes_all_acquired_descriptors(
     real_close(failed_fd)
 
 
+def test_absolute_chain_parent_close_failure_closes_acquired_child_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    target = tmp_path / "state"
+    target.mkdir(mode=0o700)
+    real_open = os.open
+    real_close = os.close
+    opened: list[int] = []
+    close_attempts: list[int] = []
+    failed_parent: int | None = None
+
+    def recording_open(*args, **kwargs) -> int:
+        descriptor = real_open(*args, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    def failing_parent_close(descriptor: int) -> None:
+        nonlocal failed_parent
+        close_attempts.append(descriptor)
+        if failed_parent is None:
+            failed_parent = descriptor
+            raise OSError("injected parent close failure")
+        real_close(descriptor)
+
+    monkeypatch.setattr(artifact_module.os, "open", recording_open)
+    monkeypatch.setattr(artifact_module.os, "close", failing_parent_close)
+    with pytest.raises(FCPMCPError) as error:
+        artifact_module._open_absolute_directory_chain(
+            target,
+            create=False,
+            code=ErrorCode.INVALID_CONFIGURATION,
+            description="workflow state root",
+        )
+    monkeypatch.setattr(artifact_module.os, "open", real_open)
+    monkeypatch.setattr(artifact_module.os, "close", real_close)
+
+    _assert_code(error, ErrorCode.INVALID_CONFIGURATION)
+    assert failed_parent is not None
+    assert close_attempts.count(failed_parent) == 1
+    assert len(opened) == 2
+    assert close_attempts.count(opened[1]) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[1])
+    os.fstat(failed_parent)
+    real_close(failed_parent)
+
+
+def test_directory_validation_and_close_failures_preserve_coded_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    child = parent / "child"
+    child.mkdir(mode=0o755)
+    parent_fd = os.open(parent, artifact_module._directory_open_flags())
+    real_close = os.close
+    child_fd: int | None = None
+
+    def failing_child_close(descriptor: int) -> None:
+        nonlocal child_fd
+        child_fd = descriptor
+        raise OSError("injected child close failure")
+
+    monkeypatch.setattr(artifact_module.os, "close", failing_child_close)
+    with pytest.raises(FCPMCPError) as error:
+        artifact_module._open_directory_at(
+            parent_fd,
+            "child",
+            create=False,
+            require_private_mode=True,
+            code=ErrorCode.INVALID_CONFIGURATION,
+            description="workflow child directory",
+        )
+    monkeypatch.setattr(artifact_module.os, "close", real_close)
+
+    _assert_code(error, ErrorCode.INVALID_CONFIGURATION)
+    assert child_fd is not None
+    assert error.value.details["cleanup_errors"]
+    assert str(tmp_path) not in repr(error.value.details["cleanup_errors"])
+    assert len(repr(error.value.details["cleanup_errors"])) < 512
+    real_close(child_fd)
+    real_close(parent_fd)
+
+
+def test_parent_fsync_and_child_close_failures_preserve_coded_primary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    parent = tmp_path / "parent"
+    parent.mkdir(mode=0o700)
+    parent_fd = os.open(parent, artifact_module._directory_open_flags())
+    real_close = os.close
+    child_fd: int | None = None
+
+    def failing_fsync(descriptor: int) -> None:
+        assert descriptor == parent_fd
+        raise OSError("injected parent fsync failure")
+
+    def failing_child_close(descriptor: int) -> None:
+        nonlocal child_fd
+        child_fd = descriptor
+        raise OSError("injected child close failure")
+
+    monkeypatch.setattr(artifact_module.os, "fsync", failing_fsync)
+    monkeypatch.setattr(artifact_module.os, "close", failing_child_close)
+    with pytest.raises(FCPMCPError) as error:
+        artifact_module._open_directory_at(
+            parent_fd,
+            "child",
+            create=True,
+            require_private_mode=True,
+            code=ErrorCode.INVALID_CONFIGURATION,
+            description="workflow child directory",
+        )
+    monkeypatch.setattr(artifact_module.os, "close", real_close)
+
+    _assert_code(error, ErrorCode.INVALID_CONFIGURATION)
+    assert child_fd is not None
+    assert error.value.details["cleanup_errors"]
+    assert str(tmp_path) not in repr(error.value.details["cleanup_errors"])
+    assert len(repr(error.value.details["cleanup_errors"])) < 512
+    real_close(child_fd)
+    real_close(parent_fd)
+
+
 
 def test_complete_diff_artifact_is_not_limited_by_rendered_summary_limit(tmp_path: Path):
     store = _store(tmp_path, limit=100)
@@ -961,6 +1189,34 @@ def test_posix_read_rejects_target_replaced_after_open(
         store.read(metadata)
 
     _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+
+
+@pytest.mark.parametrize("level", ["run", "artifacts", "root"])
+def test_read_rejects_canonical_directory_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    level: str,
+):
+    store = _store(tmp_path)
+    metadata = store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+    real_read_fd = store._read_fd
+    detached_run: Path | None = None
+
+    def replacing_read(fd: int, recorded: ArtifactMetadataV1) -> bytes:
+        nonlocal detached_run
+        payload = real_read_fd(fd, recorded)
+        detached_run = _replace_canonical_artifact_chain(store, level)
+        return payload
+
+    monkeypatch.setattr(store, "_read_fd", replacing_read)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.read(metadata)
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert detached_run is not None
+    assert (detached_run / "candidate.fcpxml").read_bytes() == b"candidate"
+    assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
 
 
 
