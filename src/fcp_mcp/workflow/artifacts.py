@@ -168,10 +168,9 @@ def _as_coded(
 
 
 def _cleanup_failure(description: str, error: OSError) -> str:
-    detail = error.strerror
-    if not detail:
-        detail = str(error) if error.filename is None else type(error).__name__
-    detail = detail.replace("\r", " ").replace("\n", " ")[:160]
+    detail = type(error).__name__
+    if isinstance(error.errno, int):
+        detail = f"{detail} errno {error.errno}"
     return f"{description}: {detail}"[:240]
 
 
@@ -432,6 +431,74 @@ def _open_absolute_directory_chain(
     return current_fd
 
 
+def _open_absolute_directory_lease(
+    path: Path,
+    *,
+    code: ErrorCode,
+    description: str,
+) -> tuple[list[int], list[tuple[int, str, int, str, bool]]]:
+    if not path.is_absolute():
+        raise _coded(code, f"{description} must be absolute")
+    parts = path.parts
+    if not parts:
+        raise _coded(code, f"{description} is empty")
+    try:
+        root_fd = os.open(parts[0], _directory_open_flags())
+    except OSError as error:
+        raise _coded(code, f"cannot open filesystem root for {description}", error)
+    descriptors = [root_fd]
+    edges: list[tuple[int, str, int, str, bool]] = []
+    primary_error: FCPMCPError | None = None
+    try:
+        _validate_directory_fd(
+            root_fd,
+            code=code,
+            description="filesystem root",
+            require_private_mode=False,
+        )
+        for index, component in enumerate(parts[1:]):
+            is_leaf = index == len(parts[1:]) - 1
+            child_description = (
+                description if is_leaf else "canonical ancestor directory"
+            )
+            child_fd, _ = _open_directory_at(
+                descriptors[-1],
+                component,
+                create=False,
+                require_private_mode=is_leaf,
+                code=code,
+                description=child_description,
+            )
+            edges.append(
+                (
+                    descriptors[-1],
+                    component,
+                    child_fd,
+                    child_description,
+                    is_leaf,
+                )
+            )
+            descriptors.append(child_fd)
+        return descriptors, edges
+    except BaseException as error:  # noqa: BLE001 - close the retained lease
+        primary_error = _as_coded(
+            error,
+            code=code,
+            message=f"cannot open {description}",
+        )
+        raise primary_error
+    finally:
+        if primary_error is not None:
+            cleanup_failures: list[str] = []
+            for fd in reversed(descriptors):
+                _close_descriptor(
+                    fd,
+                    description="close canonical directory lease",
+                    failures=cleanup_failures,
+                )
+            _attach_cleanup_errors(primary_error, cleanup_failures)
+
+
 def _validate_entry_at(
     parent_fd: int,
     name: str,
@@ -468,14 +535,8 @@ def _require_opened_directory_identity(
     opened_fd: int,
     *,
     description: str,
+    require_private_mode: bool = True,
 ) -> None:
-    current_result = _validate_entry_at(
-        parent_fd,
-        name,
-        expected="directory",
-        code=ErrorCode.ARTIFACT_CORRUPT,
-        description=description,
-    )
     try:
         opened_result = os.fstat(opened_fd)
     except OSError as error:
@@ -484,6 +545,43 @@ def _require_opened_directory_identity(
             f"cannot inspect opened {description}",
             error,
         )
+    current_result = _validate_entry_at(
+        parent_fd,
+        name,
+        expected="directory",
+        code=ErrorCode.ARTIFACT_CORRUPT,
+        description=description,
+        require_private_mode=require_private_mode,
+    )
+    if current_result is None or not os.path.samestat(opened_result, current_result):
+        raise _coded(
+            ErrorCode.ARTIFACT_CORRUPT,
+            f"{description} changed during artifact access",
+        )
+
+
+def _require_opened_file_identity(
+    parent_fd: int,
+    name: str,
+    opened_fd: int,
+    *,
+    description: str,
+) -> None:
+    try:
+        opened_result = os.fstat(opened_fd)
+    except OSError as error:
+        raise _coded(
+            ErrorCode.ARTIFACT_CORRUPT,
+            f"cannot inspect opened {description}",
+            error,
+        )
+    current_result = _validate_entry_at(
+        parent_fd,
+        name,
+        expected="file",
+        code=ErrorCode.ARTIFACT_CORRUPT,
+        description=description,
+    )
     if current_result is None or not os.path.samestat(opened_result, current_result):
         raise _coded(
             ErrorCode.ARTIFACT_CORRUPT,
@@ -802,28 +900,22 @@ class ArtifactStore:
         root_fd: int,
         artifacts_fd: int,
         run_fd: int,
+        target_name: str,
+        artifact_fd: int,
     ) -> None:
-        state_parent_fd: int | None = None
+        lease_fds: list[int] = []
+        lease_edges: list[tuple[int, str, int, str, bool]] = []
         current_root_fd: int | None = None
         current_artifacts_fd: int | None = None
         current_run_fd: int | None = None
         primary_error: FCPMCPError | None = None
         try:
-            state_parent_fd = _open_absolute_directory_chain(
-                self.paths.root.parent,
-                create=False,
-                code=ErrorCode.ARTIFACT_CORRUPT,
-                description="workflow state parent",
-                require_private_mode=False,
-            )
-            current_root_fd, _ = _open_directory_at(
-                state_parent_fd,
-                self.paths.root.name,
-                create=False,
-                require_private_mode=True,
+            lease_fds, lease_edges = _open_absolute_directory_lease(
+                self.paths.root,
                 code=ErrorCode.ARTIFACT_CORRUPT,
                 description="workflow state root",
             )
+            current_root_fd = lease_fds[-1]
             current_artifacts_fd, _ = _open_directory_at(
                 current_root_fd,
                 "artifacts",
@@ -832,6 +924,16 @@ class ArtifactStore:
                 code=ErrorCode.ARTIFACT_CORRUPT,
                 description="workflow artifacts directory",
             )
+            lease_edges.append(
+                (
+                    current_root_fd,
+                    "artifacts",
+                    current_artifacts_fd,
+                    "workflow artifacts directory",
+                    True,
+                )
+            )
+            lease_fds.append(current_artifacts_fd)
             current_run_fd, _ = _open_directory_at(
                 current_artifacts_fd,
                 run_id,
@@ -840,6 +942,16 @@ class ArtifactStore:
                 code=ErrorCode.ARTIFACT_CORRUPT,
                 description="artifact run directory",
             )
+            lease_edges.append(
+                (
+                    current_artifacts_fd,
+                    run_id,
+                    current_run_fd,
+                    "artifact run directory",
+                    True,
+                )
+            )
+            lease_fds.append(current_run_fd)
             for description, retained_fd, current_fd in (
                 ("workflow state root", root_fd, current_root_fd),
                 ("workflow artifacts directory", artifacts_fd, current_artifacts_fd),
@@ -853,25 +965,46 @@ class ArtifactStore:
                         ErrorCode.ARTIFACT_CORRUPT,
                         f"{description} changed during artifact access",
                     )
-            for _ in range(2):
+            for (
+                parent_fd,
+                name,
+                child_fd,
+                description,
+                require_private_mode,
+            ) in lease_edges:
                 _require_opened_directory_identity(
-                    state_parent_fd,
-                    self.paths.root.name,
-                    current_root_fd,
-                    description="workflow state root",
+                    parent_fd,
+                    name,
+                    child_fd,
+                    description=description,
+                    require_private_mode=require_private_mode,
                 )
+            _require_opened_file_identity(
+                current_run_fd,
+                target_name,
+                artifact_fd,
+                description="artifact target",
+            )
+            for (
+                parent_fd,
+                name,
+                child_fd,
+                description,
+                require_private_mode,
+            ) in reversed(lease_edges):
                 _require_opened_directory_identity(
-                    current_root_fd,
-                    "artifacts",
-                    current_artifacts_fd,
-                    description="workflow artifacts directory",
+                    parent_fd,
+                    name,
+                    child_fd,
+                    description=description,
+                    require_private_mode=require_private_mode,
                 )
-                _require_opened_directory_identity(
-                    current_artifacts_fd,
-                    run_id,
-                    current_run_fd,
-                    description="artifact run directory",
-                )
+            _require_opened_file_identity(
+                current_run_fd,
+                target_name,
+                artifact_fd,
+                description="artifact target",
+            )
         except BaseException as error:  # noqa: BLE001 - close the fresh descriptor chain
             primary_error = _as_coded(
                 error,
@@ -881,17 +1014,10 @@ class ArtifactStore:
             raise primary_error
         finally:
             cleanup_failures: list[str] = []
-            for description, fd in (
-                ("current run", current_run_fd),
-                ("current artifacts", current_artifacts_fd),
-                ("current root", current_root_fd),
-                ("state parent", state_parent_fd),
-            ):
-                if fd is None:
-                    continue
+            for fd in reversed(lease_fds):
                 _close_descriptor(
                     fd,
-                    description=f"close {description} directory",
+                    description="close canonical directory lease",
                     failures=cleanup_failures,
                 )
             _attach_cleanup_errors(primary_error, cleanup_failures)
@@ -1017,20 +1143,10 @@ class ArtifactStore:
             replaced = True
             published_owned = True
             temporary_owned = False
-            opened_result = os.fstat(temporary_fd)
-            current_result = os.stat(
-                target_name,
-                dir_fd=run_fd,
-                follow_symlinks=False,
-            )
-            if (
-                stat.S_ISLNK(current_result.st_mode)
-                or not os.path.samestat(opened_result, current_result)
-                or _read_opened_payload(temporary_fd, len(payload)) != payload
-            ):
+            if _read_opened_payload(temporary_fd, len(payload)) != payload:
                 raise _coded(
                     ErrorCode.ARTIFACT_CORRUPT,
-                    "committed artifact identity or bytes changed during replacement",
+                    "committed artifact bytes changed during replacement",
                 )
             os.fsync(run_fd)
             self._revalidate_posix_run(
@@ -1038,6 +1154,8 @@ class ArtifactStore:
                 root_fd=root_fd,
                 artifacts_fd=artifacts_fd,
                 run_fd=run_fd,
+                target_name=target_name,
+                artifact_fd=temporary_fd,
             )
             published_owned = False
         except FCPMCPError:
@@ -1222,25 +1340,13 @@ class ArtifactStore:
                 dir_fd=run_fd,
             )
             payload = self._read_fd(artifact_fd, metadata)
-            opened_result = os.fstat(artifact_fd)
-            current_result = os.stat(
-                _ARTIFACT_NAMES[kind],
-                dir_fd=run_fd,
-                follow_symlinks=False,
-            )
-            if (
-                stat.S_ISLNK(current_result.st_mode)
-                or not os.path.samestat(opened_result, current_result)
-            ):
-                raise _coded(
-                    ErrorCode.ARTIFACT_CORRUPT,
-                    "recorded artifact path changed during read",
-                )
             self._revalidate_posix_run(
                 run_id,
                 root_fd=root_fd,
                 artifacts_fd=artifacts_fd,
                 run_fd=run_fd,
+                target_name=_ARTIFACT_NAMES[kind],
+                artifact_fd=artifact_fd,
             )
             return payload
         except FCPMCPError as error:

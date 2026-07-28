@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import stat
@@ -43,6 +44,22 @@ def _store(tmp_path: Path, *, limit: int = 1024) -> ArtifactStore:
     return ArtifactStore(paths, max_artifact_bytes=limit)
 
 
+def _store_with_replaceable_ancestors(
+    tmp_path: Path,
+    *,
+    limit: int = 1024,
+) -> ArtifactStore:
+    root = tmp_path / "higher-ancestor" / "state-parent" / "state"
+    config = RuntimeConfig.from_env(
+        {"FCP_MCP_STATE_DIR": str(root)},
+        home=tmp_path,
+    )
+    return ArtifactStore(
+        StatePaths.from_config(config),
+        max_artifact_bytes=limit,
+    )
+
+
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.lstat().st_mode)
 
@@ -78,6 +95,22 @@ def _replace_canonical_artifact_chain(
         run_directory.mkdir(mode=0o700)
         return detached / "artifacts" / RUN_ID
     raise AssertionError(f"unknown chain level: {level}")
+
+
+def _replace_canonical_ancestor(
+    store: ArtifactStore,
+    ancestor: Path,
+) -> Path:
+    run_directory = store.paths.run_dir(RUN_ID)
+    relative_run = run_directory.relative_to(ancestor)
+    detached = ancestor.with_name(f"{ancestor.name}.detached")
+    ancestor.rename(detached)
+    store.paths.root.mkdir(mode=0o700, parents=True)
+    os.chmod(store.paths.root, 0o700)
+    store.paths.artifacts.mkdir(mode=0o700)
+    store.paths.locks.mkdir(mode=0o700)
+    run_directory.mkdir(mode=0o700)
+    return detached / relative_run
 
 
 def test_artifact_store_contains_only_the_macos_descriptor_implementation():
@@ -521,6 +554,32 @@ def test_existing_target_is_atomically_replaced(tmp_path: Path):
     _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
 
 
+def test_write_rejects_target_replaced_during_payload_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store(tmp_path)
+    real_read_opened = artifact_module._read_opened_payload
+    target = store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE)
+    attacker_payload = b"ATTACKER!"
+
+    def replacing_read(fd: int, expected_size: int) -> bytes:
+        payload = real_read_opened(fd, expected_size)
+        replacement = target.with_name("attacker")
+        replacement.write_bytes(attacker_payload)
+        os.chmod(replacement, 0o600)
+        os.replace(replacement, target)
+        return payload
+
+    monkeypatch.setattr(artifact_module, "_read_opened_payload", replacing_read)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert target.read_bytes() == attacker_payload
+
+
 @pytest.mark.parametrize("level", ["run", "artifacts", "root"])
 def test_write_rejects_canonical_directory_replacement_and_cleans_detached_publish(
     tmp_path: Path,
@@ -560,6 +619,42 @@ def test_write_rejects_canonical_directory_replacement_and_cleans_detached_publi
     assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
 
 
+@pytest.mark.parametrize("ancestor_level", ["state-parent", "higher-ancestor"])
+def test_write_rejects_canonical_ancestor_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestor_level: str,
+):
+    store = _store_with_replaceable_ancestors(tmp_path)
+    ancestor = (
+        store.paths.root.parent
+        if ancestor_level == "state-parent"
+        else store.paths.root.parent.parent
+    )
+    real_open_directory = artifact_module._open_directory_at
+    matching_opens = 0
+    detached_run: Path | None = None
+
+    def replacing_open(*args, **kwargs):
+        nonlocal matching_opens, detached_run
+        opened = real_open_directory(*args, **kwargs)
+        if args[1] == ancestor.name:
+            matching_opens += 1
+            if matching_opens == 2:
+                detached_run = _replace_canonical_ancestor(store, ancestor)
+        return opened
+
+    monkeypatch.setattr(artifact_module, "_open_directory_at", replacing_open)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert detached_run is not None
+    assert not (detached_run / "candidate.fcpxml").exists()
+    assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
+
+
 def test_swapped_run_inode_cannot_bypass_aggregate_locking_and_accounting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -581,6 +676,50 @@ def test_swapped_run_inode_cannot_bypass_aggregate_locking_and_accounting(
         return real_read_opened(fd, expected_size)
 
     monkeypatch.setattr(artifact_module, "_read_opened_payload", replacing_read)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.write(RUN_ID, ArtifactKind.CANDIDATE, b"123")
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert detached_run is not None
+    assert not (detached_run / "candidate.fcpxml").exists()
+    assert canonical_diff is not None
+    assert store.read(canonical_diff) == b"123"
+    assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
+
+
+@pytest.mark.parametrize("ancestor_level", ["state-parent", "higher-ancestor"])
+def test_swapped_ancestor_cannot_bypass_aggregate_locking_and_accounting(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestor_level: str,
+):
+    store = _store_with_replaceable_ancestors(tmp_path, limit=5)
+    ancestor = (
+        store.paths.root.parent
+        if ancestor_level == "state-parent"
+        else store.paths.root.parent.parent
+    )
+    real_open_directory = artifact_module._open_directory_at
+    matching_opens = 0
+    detached_run: Path | None = None
+    canonical_diff: ArtifactMetadataV1 | None = None
+
+    def replacing_open(*args, **kwargs):
+        nonlocal matching_opens, detached_run, canonical_diff
+        opened = real_open_directory(*args, **kwargs)
+        if args[1] == ancestor.name:
+            matching_opens += 1
+            if matching_opens == 2:
+                detached_run = _replace_canonical_ancestor(store, ancestor)
+                canonical_diff = store._write_posix(
+                    RUN_ID,
+                    ArtifactKind.DIFF,
+                    b"123",
+                )
+        return opened
+
+    monkeypatch.setattr(artifact_module, "_open_directory_at", replacing_open)
 
     with pytest.raises(FCPMCPError) as error:
         store.write(RUN_ID, ArtifactKind.CANDIDATE, b"123")
@@ -1030,6 +1169,25 @@ def test_parent_fsync_and_child_close_failures_preserve_coded_primary(
     real_close(parent_fd)
 
 
+def test_cleanup_failure_redacts_all_path_bearing_oserror_fields():
+    strerror_secret = "/private/secret/in-strerror"
+    filename_secret = "/private/secret/in-filename"
+    filename2_secret = "/private/secret/in-filename2"
+    error = OSError(
+        errno.EIO,
+        f"injected failure at {strerror_secret}",
+        filename_secret,
+        None,
+        filename2_secret,
+    )
+
+    detail = artifact_module._cleanup_failure("close opened directory", error)
+
+    assert strerror_secret not in detail
+    assert filename_secret not in detail
+    assert filename2_secret not in detail
+    assert len(detail) <= 240
+
 
 def test_complete_diff_artifact_is_not_limited_by_rendered_summary_limit(tmp_path: Path):
     store = _store(tmp_path, limit=100)
@@ -1191,6 +1349,38 @@ def test_posix_read_rejects_target_replaced_after_open(
     _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
 
 
+def test_read_rejects_target_replaced_during_final_chain_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    store = _store_with_replaceable_ancestors(tmp_path)
+    metadata = store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+    target = store.paths.root / metadata.relative_path
+    replacement = target.with_name("attacker")
+    replacement.write_bytes(b"ATTACKER!")
+    os.chmod(replacement, 0o600)
+    state_parent = store.paths.root.parent
+    real_open_directory = artifact_module._open_directory_at
+    matching_opens = 0
+
+    def replacing_open(*args, **kwargs):
+        nonlocal matching_opens
+        opened = real_open_directory(*args, **kwargs)
+        if args[1] == state_parent.name:
+            matching_opens += 1
+            if matching_opens == 2:
+                os.replace(replacement, target)
+        return opened
+
+    monkeypatch.setattr(artifact_module, "_open_directory_at", replacing_open)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.read(metadata)
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert target.read_bytes() == b"ATTACKER!"
+
+
 @pytest.mark.parametrize("level", ["run", "artifacts", "root"])
 def test_read_rejects_canonical_directory_replacement(
     tmp_path: Path,
@@ -1218,6 +1408,42 @@ def test_read_rejects_canonical_directory_replacement(
     assert (detached_run / "candidate.fcpxml").read_bytes() == b"candidate"
     assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
 
+
+@pytest.mark.parametrize("ancestor_level", ["state-parent", "higher-ancestor"])
+def test_read_rejects_canonical_ancestor_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    ancestor_level: str,
+):
+    store = _store_with_replaceable_ancestors(tmp_path)
+    metadata = store.write(RUN_ID, ArtifactKind.CANDIDATE, b"candidate")
+    ancestor = (
+        store.paths.root.parent
+        if ancestor_level == "state-parent"
+        else store.paths.root.parent.parent
+    )
+    real_open_directory = artifact_module._open_directory_at
+    matching_opens = 0
+    detached_run: Path | None = None
+
+    def replacing_open(*args, **kwargs):
+        nonlocal matching_opens, detached_run
+        opened = real_open_directory(*args, **kwargs)
+        if args[1] == ancestor.name:
+            matching_opens += 1
+            if matching_opens == 2:
+                detached_run = _replace_canonical_ancestor(store, ancestor)
+        return opened
+
+    monkeypatch.setattr(artifact_module, "_open_directory_at", replacing_open)
+
+    with pytest.raises(FCPMCPError) as error:
+        store.read(metadata)
+
+    _assert_code(error, ErrorCode.ARTIFACT_CORRUPT)
+    assert detached_run is not None
+    assert (detached_run / "candidate.fcpxml").read_bytes() == b"candidate"
+    assert not store.paths.artifact_path(RUN_ID, ArtifactKind.CANDIDATE).exists()
 
 
 def test_read_rejects_nonregular_artifact(tmp_path: Path):
