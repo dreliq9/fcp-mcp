@@ -9,29 +9,77 @@ from __future__ import annotations
 import copy
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional, Union
 
 from ..utils.safe_xml import parse_fcpxml
 from .time_utils import RationalTime
+from .transaction import FCPXMLTransactionReceipt, commit_fcpxml_bytes
+
+
+def role_attribute_for_element(element: ET.Element) -> str | None:
+    """Return the DTD-valid role attribute for a role-capable clip element."""
+    if element.tag == "asset-clip":
+        return "audioRole"
+    if element.tag in {"audio", "video", "title"}:
+        return "role"
+    return None
+
+
+def assigned_role(element: ET.Element) -> str | None:
+    """Read the role value written by :func:`role_attribute_for_element`."""
+    if element.tag == "asset-clip":
+        return (
+            element.get("audioRole")
+            or element.get("videoRole")
+            or element.get("role")
+        )
+    attribute = role_attribute_for_element(element)
+    return element.get(attribute) if attribute is not None else None
 
 
 class FCPXMLModifier:
     """Load and modify FCPXML files."""
 
-    def __init__(self, path: Union[str, Path]):
+    def __init__(self, path: str | Path):
         self.path = Path(path)
         self.tree = parse_fcpxml(self.path)
         self.root = self.tree.getroot()
 
-    def save(self, output_path: Optional[Union[str, Path]] = None) -> Path:
+    def save(
+        self,
+        output_path: str | Path | None = None,
+        *,
+        event_format: str = "text",
+    ) -> Path:
         """Save modified FCPXML. Defaults to original_name_modified.fcpxml."""
+        return self.save_with_receipt(
+            output_path,
+            event_format=event_format,
+        ).destination
+
+    def save_with_receipt(
+        self,
+        output_path: str | Path | None = None,
+        *,
+        event_format: str = "text",
+    ) -> FCPXMLTransactionReceipt:
+        """Save modified FCPXML and return its complete atomic receipt."""
         if output_path is None:
             stem = self.path.stem
             output_path = self.path.parent / f"{stem}_modified.fcpxml"
         output_path = Path(output_path)
-        ET.indent(self.root, space="    ")
-        self.tree.write(str(output_path), encoding="unicode", xml_declaration=True)
-        return output_path
+        return commit_fcpxml_bytes(
+            source=self.path,
+            destination=output_path,
+            xml_bytes=self.serialize(),
+            event_format=event_format,
+            operation="modifier_save",
+        )
+
+    def serialize(self) -> bytes:
+        """Serialize deterministic UTF-8 candidate bytes without mutating live state."""
+        root = copy.deepcopy(self.root)
+        ET.indent(root, space="    ")
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     # --- Markers ---
 
@@ -76,7 +124,7 @@ class FCPXMLModifier:
                 count += 1
         return count
 
-    def delete_markers(self, clip_name: str, value_filter: Optional[str] = None) -> int:
+    def delete_markers(self, clip_name: str, value_filter: str | None = None) -> int:
         """Remove markers from a clip. If value_filter set, only remove matching."""
         clip_el = self._find_clip_by_name(clip_name)
         if clip_el is None:
@@ -92,7 +140,7 @@ class FCPXMLModifier:
     # --- Keywords ---
 
     def add_keyword(
-        self, clip_name: str, value: str, start: str = "0s", duration: Optional[str] = None,
+        self, clip_name: str, value: str, start: str = "0s", duration: str | None = None,
     ) -> bool:
         """Add a keyword to a clip."""
         clip_el = self._find_clip_by_name(clip_name)
@@ -110,8 +158,8 @@ class FCPXMLModifier:
     def trim_clip(
         self,
         clip_name: str,
-        new_start: Optional[str] = None,
-        new_duration: Optional[str] = None,
+        new_start: str | None = None,
+        new_duration: str | None = None,
     ) -> bool:
         """Trim a clip's source in/out points."""
         clip_el = self._find_clip_by_name(clip_name)
@@ -121,6 +169,7 @@ class FCPXMLModifier:
             clip_el.set("start", new_start)
         if new_duration is not None:
             clip_el.set("duration", new_duration)
+            self._sync_primary_sequence_duration(clip_el)
         return True
 
     def split_clip(self, clip_name: str, split_at: str) -> bool:
@@ -190,7 +239,7 @@ class FCPXMLModifier:
         name_to_el = {}
         for child in list(spine_el):
             name = child.get("name", "")
-            if name in clip_names:
+            if child.tag != "transition" and name in clip_names:
                 name_to_el[name] = child
                 spine_el.remove(child)
 
@@ -276,11 +325,16 @@ class FCPXMLModifier:
     # --- Roles ---
 
     def assign_role(self, clip_name: str, role: str) -> bool:
-        """Set role on a clip."""
+        """Set an audio role using the DTD-valid attribute for the clip type."""
         clip_el = self._find_clip_by_name(clip_name)
         if clip_el is None:
             return False
-        clip_el.set("role", role)
+        attribute = role_attribute_for_element(clip_el)
+        if attribute is None:
+            return False
+        if clip_el.tag == "asset-clip":
+            clip_el.attrib.pop("role", None)
+        clip_el.set(attribute, role)
         return True
 
     # --- Batch Operations ---
@@ -291,12 +345,15 @@ class FCPXMLModifier:
         """
         count = 0
         for clip_el in self.root.iter():
-            if clip_el.tag not in ("asset-clip", "clip", "title", "audio", "video"):
+            attribute = role_attribute_for_element(clip_el)
+            if attribute is None:
                 continue
             name = clip_el.get("name", "")
             for rule in rules:
                 if rule["match"].lower() in name.lower():
-                    clip_el.set("role", rule["role"])
+                    if clip_el.tag == "asset-clip":
+                        clip_el.attrib.pop("role", None)
+                    clip_el.set(attribute, rule["role"])
                     count += 1
                     break
         return count
@@ -386,7 +443,7 @@ class FCPXMLModifier:
 
     # --- Helpers ---
 
-    def _find_clip_by_name(self, name: str) -> Optional[ET.Element]:
+    def _find_clip_by_name(self, name: str) -> ET.Element | None:
         """Find first clip element with matching name."""
         for el in self.root.iter():
             if el.get("name") == name and el.tag in (
@@ -397,13 +454,48 @@ class FCPXMLModifier:
                 return el
         return None
 
-    def _find_parent(self, target: ET.Element) -> Optional[ET.Element]:
+    def _find_parent(self, target: ET.Element) -> ET.Element | None:
         """Find parent of an element."""
         for parent in self.root.iter():
             for child in parent:
                 if child is target:
                     return parent
         return None
+
+    def _primary_sequence_for(self, target: ET.Element) -> ET.Element | None:
+        """Return the sequence when target belongs to its primary storyline."""
+        if target.get("lane", "0") != "0":
+            return None
+        spine = self._find_parent(target)
+        if spine is None or spine.tag != "spine":
+            return None
+        sequence = self._find_parent(spine)
+        if sequence is None or sequence.tag != "sequence":
+            return None
+        return sequence
+
+    def _primary_storyline_duration(self, sequence: ET.Element) -> RationalTime:
+        """Calculate sequence duration from the endpoint of its primary storyline."""
+        spine = sequence.find("spine")
+        tc_start = RationalTime.from_fcpxml(sequence.get("tcStart", "0s"))
+        endpoint = tc_start
+        if spine is not None:
+            for child in spine:
+                if child.get("lane", "0") != "0" or child.get("duration") is None:
+                    continue
+                offset = RationalTime.from_fcpxml(child.get("offset", "0s"))
+                duration = RationalTime.from_fcpxml(child.get("duration", "0s"))
+                endpoint = max(endpoint, offset + duration)
+        return endpoint - tc_start
+
+    def _sync_primary_sequence_duration(self, target: ET.Element) -> None:
+        """Synchronize duplicated sequence duration after a primary-storyline edit."""
+        sequence = self._primary_sequence_for(target)
+        if sequence is not None:
+            duration = self._primary_storyline_duration(sequence)
+            current = sequence.get("duration")
+            if current is None or RationalTime.from_fcpxml(current) != duration:
+                sequence.set("duration", duration.to_fcpxml())
 
     def _recalculate_offsets(self, spine_el: ET.Element) -> None:
         """Recalculate offsets for all clips in a spine sequentially."""

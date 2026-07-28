@@ -16,7 +16,6 @@ import math
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from .generator import FCPXMLGenerator
 from .time_utils import RationalTime
@@ -56,7 +55,7 @@ class PuppetRig:
     def add_part(self, part: PuppetPart) -> None:
         self.parts.append(part)
 
-    def get_part(self, name: str) -> Optional[PuppetPart]:
+    def get_part(self, name: str) -> PuppetPart | None:
         for p in self.parts:
             if p.name == name:
                 return p

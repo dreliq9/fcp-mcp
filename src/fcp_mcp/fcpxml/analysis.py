@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import fsum
 
 from .models import Clip, FCPXMLDocument
 
@@ -102,10 +103,10 @@ def analyze_timeline_stats(doc: FCPXMLDocument) -> list[TimelineStats]:
             marker_count=sum(len(c.markers) for c in clips),
             keyword_count=sum(len(c.keywords) for c in clips),
             connected_clip_count=sum(len(c.connected_clips) for c in clips),
-            roles_used=sorted(set(c.role for c in clips if c.role)),
+            roles_used=sorted({c.role for c in clips if c.role}),
             fps=fps,
             resolution=resolution,
-            average_clip_duration_seconds=sum(durations) / len(durations) if durations else 0,
+            average_clip_duration_seconds=fsum(durations) / len(durations) if durations else 0,
             shortest_clip_seconds=min(durations) if durations else 0,
             longest_clip_seconds=max(durations) if durations else 0,
         )
@@ -130,7 +131,7 @@ def analyze_pacing(doc: FCPXMLDocument) -> list[PacingAnalysis]:
         sorted_durs = sorted(durations)
         n = len(sorted_durs)
         median = sorted_durs[n // 2] if n % 2 == 1 else (sorted_durs[n // 2 - 1] + sorted_durs[n // 2]) / 2
-        avg = sum(durations) / n
+        avg = fsum(durations) / n
         variance = sum((d - avg) ** 2 for d in durations) / n
         std_dev = variance ** 0.5
 

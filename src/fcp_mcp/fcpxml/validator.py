@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Union
 from urllib.parse import unquote as url_unquote
 
+from .models import ClipType, FCPXMLDocument
 from .parser import FCPXMLParser
-from .models import FCPXMLDocument, ClipType
+
+
+def parse_fcpxml_version(value: str) -> tuple[int, ...]:
+    parts = value.split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValueError(value)
+    return tuple(int(part) for part in parts)
 
 
 @dataclass
@@ -54,7 +60,7 @@ class ValidationResult:
 class FCPXMLValidator:
     """Validate FCPXML documents for structural and logical issues."""
 
-    def validate_file(self, path: Union[str, Path]) -> ValidationResult:
+    def validate_file(self, path: str | Path) -> ValidationResult:
         """Validate an FCPXML file."""
         result = ValidationResult()
 
@@ -68,7 +74,7 @@ class FCPXMLValidator:
         try:
             parser = FCPXMLParser()
             doc = parser.parse(path)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - validation converts all parse failures
             result.add("error", f"Parse error: {e}")
             return result
 
@@ -80,8 +86,8 @@ class FCPXMLValidator:
 
         # Check version
         try:
-            version = float(doc.version)
-            if version < 1.6:
+            version = parse_fcpxml_version(doc.version)
+            if version < (1, 6):
                 result.add("warning", f"Old FCPXML version {doc.version} — some features may not be supported")
         except ValueError:
             result.add("error", f"Invalid version: {doc.version}")
@@ -131,9 +137,12 @@ class FCPXMLValidator:
             clip_loc = f"{loc} > Clip #{i+1} '{clip.name}'"
 
             # Check asset reference exists
-            if clip.ref and clip.clip_type not in (ClipType.GAP,):
-                if clip.ref not in doc.resources:
-                    result.add("error", f"References unknown resource '{clip.ref}'", clip_loc)
+            if (
+                clip.ref
+                and clip.clip_type not in (ClipType.GAP,)
+                and clip.ref not in doc.resources
+            ):
+                result.add("error", f"References unknown resource '{clip.ref}'", clip_loc)
 
             # Check duration is positive
             if clip.duration.is_zero and clip.clip_type != ClipType.GAP:

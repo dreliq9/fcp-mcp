@@ -8,22 +8,21 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Union
 
 import defusedxml.ElementTree as SafeET
 
 
-def parse_file(path: Union[str, Path]) -> ET.ElementTree:
+def parse_file(path: str | Path) -> ET.ElementTree:
     """Parse an XML file safely."""
     return SafeET.parse(str(path))
 
 
-def parse_string(xml_string: str) -> ET.Element:
+def parse_string(xml_string: str | bytes) -> ET.Element:
     """Parse an XML string safely, return root element."""
     return SafeET.fromstring(xml_string)
 
 
-def parse_fcpxml(path: Union[str, Path]) -> ET.ElementTree:
+def parse_fcpxml(path: str | Path) -> ET.ElementTree:
     """Parse an FCPXML file or .fcpxmld bundle.
 
     If path points to a .fcpxmld directory, looks for Info.fcpxml inside.
@@ -39,7 +38,7 @@ def parse_fcpxml(path: Union[str, Path]) -> ET.ElementTree:
     return parse_file(path)
 
 
-def write_xml(tree: ET.ElementTree, path: Union[str, Path]) -> Path:
+def write_xml(tree: ET.ElementTree, path: str | Path) -> Path:
     """Write an ElementTree to file with XML declaration."""
     path = Path(path)
     tree.write(str(path), encoding="unicode", xml_declaration=True)

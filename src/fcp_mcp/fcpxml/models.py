@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from .time_utils import RationalTime
 
@@ -108,6 +108,16 @@ class TransformParams:
     rotation: float = 0.0
     anchor_x: float = 0.0
     anchor_y: float = 0.0
+    scale_y: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.scale_y is None:
+            self.scale_y = self.scale
+
+    @property
+    def scale_x(self) -> float:
+        """Horizontal scale, preserving the original scalar API as an alias."""
+        return self.scale
 
 
 @dataclass
@@ -151,8 +161,8 @@ class Clip:
     markers: list[Marker] = field(default_factory=list)
     keywords: list[Keyword] = field(default_factory=list)
     effects: list[AppliedEffect] = field(default_factory=list)
-    transform: Optional[TransformParams] = None
-    volume: Optional[VolumeParams] = None
+    transform: TransformParams | None = None
+    volume: VolumeParams | None = None
     connected_clips: list[Clip] = field(default_factory=list)
     spine_clips: list[Clip] = field(default_factory=list)  # for compound clips
 
@@ -214,7 +224,7 @@ class Sequence:
     spine: Spine = field(default_factory=Spine)
 
     @property
-    def frame_duration(self) -> Optional[RationalTime]:
+    def frame_duration(self) -> RationalTime | None:
         """Get frame duration from format reference (set during parsing)."""
         return getattr(self, "_frame_duration", None)
 
@@ -225,7 +235,7 @@ class Project:
     name: str = ""
     uid: str = ""
     mod_date: str = ""
-    sequence: Optional[Sequence] = None
+    sequence: Sequence | None = None
 
 
 @dataclass
@@ -252,7 +262,7 @@ class FCPXMLDocument:
     formats: dict[str, Format] = field(default_factory=dict)
     assets: dict[str, Asset] = field(default_factory=dict)
     effects: dict[str, Effect] = field(default_factory=dict)
-    library: Optional[Library] = None
+    library: Library | None = None
 
     # If the FCPXML contains standalone events/projects (no library wrapper)
     events: list[Event] = field(default_factory=list)

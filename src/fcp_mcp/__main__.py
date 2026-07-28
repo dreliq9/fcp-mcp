@@ -1,4 +1,5 @@
-"""Allow running as python -m fcp_mcp.server"""
-from fcp_mcp.server import main
+"""Run the fcp-mcp command."""
 
-main()
+from fcp_mcp.cli import main
+
+raise SystemExit(main())

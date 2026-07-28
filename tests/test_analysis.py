@@ -2,14 +2,14 @@
 
 import pytest
 
-from fcp_mcp.fcpxml.models import FCPXMLDocument
 from fcp_mcp.fcpxml.analysis import (
-    analyze_timeline_stats,
     analyze_pacing,
-    detect_gaps,
-    detect_flash_frames,
+    analyze_timeline_stats,
     detect_duplicates,
+    detect_flash_frames,
+    detect_gaps,
 )
+from fcp_mcp.fcpxml.models import FCPXMLDocument
 
 
 class TestTimelineStats:

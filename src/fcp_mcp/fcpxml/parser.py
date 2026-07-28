@@ -7,9 +7,9 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Union
+from typing import ClassVar
 
-from ..utils.safe_xml import parse_fcpxml
+from ..utils.safe_xml import parse_fcpxml, parse_string
 from .models import (
     AppliedEffect,
     Asset,
@@ -37,7 +37,7 @@ class FCPXMLParser:
     """Parse FCPXML files into FCPXMLDocument objects."""
 
     # Map XML tag names to ClipType
-    TAG_TO_CLIP_TYPE = {
+    TAG_TO_CLIP_TYPE: ClassVar[dict[str, ClipType]] = {
         "asset-clip": ClipType.ASSET_CLIP,
         "clip": ClipType.CLIP,
         "gap": ClipType.GAP,
@@ -52,13 +52,20 @@ class FCPXMLParser:
         "ref-clip": ClipType.REF_CLIP,
     }
 
-    CLIP_TAGS = set(TAG_TO_CLIP_TYPE.keys())
+    CLIP_TAGS: ClassVar[frozenset[str]] = frozenset(TAG_TO_CLIP_TYPE)
 
-    def parse(self, path: Union[str, Path]) -> FCPXMLDocument:
+    def parse(self, path: str | Path) -> FCPXMLDocument:
         """Parse an FCPXML file and return a document model."""
         tree = parse_fcpxml(path)
-        root = tree.getroot()
+        return self._parse_root(tree.getroot())
 
+    def parse_bytes(self, payload: bytes) -> FCPXMLDocument:
+        """Parse in-memory FCPXML bytes without creating a temporary file."""
+        if not isinstance(payload, bytes):
+            raise TypeError("FCPXML payload must be bytes")
+        return self._parse_root(parse_string(payload))
+
+    def _parse_root(self, root: ET.Element) -> FCPXMLDocument:
         doc = FCPXMLDocument()
         doc.version = root.get("version", "1.11")
 
@@ -219,7 +226,7 @@ class FCPXMLParser:
             offset=RationalTime.from_fcpxml(el.get("offset", "0s")),
             start=RationalTime.from_fcpxml(el.get("start", "0s")),
             duration=RationalTime.from_fcpxml(el.get("duration", "0s")),
-            role=el.get("role", ""),
+            role=el.get("audioRole") or el.get("videoRole") or el.get("role", ""),
             lane=int(el.get("lane", "0")),
             enabled=el.get("enabled", "1") != "0",
             _raw_attribs=dict(el.attrib),
@@ -286,11 +293,15 @@ class FCPXMLParser:
         """Parse adjust-transform element."""
         position = el.get("position", "0 0").split()
         anchor = el.get("anchor", "0 0").split()
+        scale = el.get("scale", "1 1").split()
+        scale_x = float(scale[0]) if scale else 1.0
+        scale_y = float(scale[1]) if len(scale) > 1 else scale_x
         return TransformParams(
             position_x=float(position[0]) if len(position) > 0 else 0.0,
             position_y=float(position[1]) if len(position) > 1 else 0.0,
-            scale=float(el.get("scale", "1")),
+            scale=scale_x,
             rotation=float(el.get("rotation", "0")),
             anchor_x=float(anchor[0]) if len(anchor) > 0 else 0.0,
             anchor_y=float(anchor[1]) if len(anchor) > 1 else 0.0,
+            scale_y=scale_y,
         )

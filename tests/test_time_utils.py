@@ -1,10 +1,10 @@
 """Tests for rational time math."""
 
 from fcp_mcp.fcpxml.time_utils import (
+    FRAME_DURATIONS,
     RationalTime,
     fps_from_frame_duration,
     frame_duration_from_fps,
-    FRAME_DURATIONS,
 )
 
 

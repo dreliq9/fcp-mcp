@@ -1,0 +1,3691 @@
+{
+  "prompts": [
+    "beat-sync",
+    "cleanup",
+    "qc-check",
+    "rough-cut",
+    "youtube-chapters"
+  ],
+  "tools": {
+    "compressor_encode": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "batch_name": {
+            "default": "MCP Encode",
+            "title": "Batch Name",
+            "type": "string"
+          },
+          "input_path": {
+            "title": "Input Path",
+            "type": "string"
+          },
+          "output_dir": {
+            "default": "",
+            "title": "Output Dir",
+            "type": "string"
+          },
+          "setting_path": {
+            "default": "",
+            "title": "Setting Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "input_path"
+        ],
+        "title": "compressor_encodeArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "compressor_encodeOutput",
+        "type": "object"
+      }
+    },
+    "compressor_list_settings": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "compressor_list_settingsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "compressor_list_settingsOutput",
+        "type": "object"
+      }
+    },
+    "fcp_discover_effects": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_discover_effectsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_discover_effectsOutput",
+        "type": "object"
+      }
+    },
+    "fcp_doctor": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_doctorArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "$defs": {
+          "DoctorCheck": {
+            "properties": {
+              "details": {
+                "additionalProperties": true,
+                "title": "Details",
+                "type": "object"
+              },
+              "id": {
+                "title": "Id",
+                "type": "string"
+              },
+              "remediation": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Remediation"
+              },
+              "status": {
+                "enum": [
+                  "pass",
+                  "warn",
+                  "fail",
+                  "skip"
+                ],
+                "title": "Status",
+                "type": "string"
+              },
+              "summary": {
+                "title": "Summary",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "status",
+              "summary"
+            ],
+            "title": "DoctorCheck",
+            "type": "object"
+          }
+        },
+        "properties": {
+          "checks": {
+            "items": {
+              "$ref": "#/$defs/DoctorCheck"
+            },
+            "title": "Checks",
+            "type": "array"
+          },
+          "mcp_sdk_version": {
+            "title": "Mcp Sdk Version",
+            "type": "string"
+          },
+          "package_version": {
+            "title": "Package Version",
+            "type": "string"
+          },
+          "prompt_count": {
+            "title": "Prompt Count",
+            "type": "integer"
+          },
+          "protocol_target": {
+            "const": "2025-11-25",
+            "default": "2025-11-25",
+            "title": "Protocol Target",
+            "type": "string"
+          },
+          "schema_version": {
+            "const": "1",
+            "default": "1",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "server_name": {
+            "const": "fcp-mcp",
+            "default": "fcp-mcp",
+            "title": "Server Name",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ready",
+              "degraded",
+              "blocked"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "tool_count": {
+            "title": "Tool Count",
+            "type": "integer"
+          },
+          "wire_server_version": {
+            "title": "Wire Server Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "package_version",
+          "mcp_sdk_version",
+          "wire_server_version",
+          "tool_count",
+          "prompt_count",
+          "checks"
+        ],
+        "title": "DoctorReport",
+        "type": "object"
+      }
+    },
+    "fcp_export_xml": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_export_xmlArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_export_xmlOutput",
+        "type": "object"
+      }
+    },
+    "fcp_get_app_state": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_get_app_stateArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_get_app_stateOutput",
+        "type": "object"
+      }
+    },
+    "fcp_get_events": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "library_name": {
+            "default": "",
+            "title": "Library Name",
+            "type": "string"
+          }
+        },
+        "title": "fcp_get_eventsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_get_eventsOutput",
+        "type": "object"
+      }
+    },
+    "fcp_get_libraries": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_get_librariesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_get_librariesOutput",
+        "type": "object"
+      }
+    },
+    "fcp_get_projects": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "event_name": {
+            "default": "",
+            "title": "Event Name",
+            "type": "string"
+          }
+        },
+        "title": "fcp_get_projectsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_get_projectsOutput",
+        "type": "object"
+      }
+    },
+    "fcp_get_timeline_info": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_get_timeline_infoArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_get_timeline_infoOutput",
+        "type": "object"
+      }
+    },
+    "fcp_import_xml": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "fcpxml_path": {
+            "title": "Fcpxml Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fcpxml_path"
+        ],
+        "title": "fcp_import_xmlArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_import_xmlOutput",
+        "type": "object"
+      }
+    },
+    "fcp_is_running": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_is_runningArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_is_runningOutput",
+        "type": "object"
+      }
+    },
+    "fcp_keyboard_shortcut": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "keys": {
+            "title": "Keys",
+            "type": "string"
+          }
+        },
+        "required": [
+          "keys"
+        ],
+        "title": "fcp_keyboard_shortcutArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_keyboard_shortcutOutput",
+        "type": "object"
+      }
+    },
+    "fcp_list_motion_templates": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_list_motion_templatesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_list_motion_templatesOutput",
+        "type": "object"
+      }
+    },
+    "fcp_list_share_destinations": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_list_share_destinationsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_list_share_destinationsOutput",
+        "type": "object"
+      }
+    },
+    "fcp_menu_command": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "menu_path": {
+            "title": "Menu Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "menu_path"
+        ],
+        "title": "fcp_menu_commandArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_menu_commandOutput",
+        "type": "object"
+      }
+    },
+    "fcp_navigate": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "timecode": {
+            "default": "",
+            "title": "Timecode",
+            "type": "string"
+          }
+        },
+        "title": "fcp_navigateArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_navigateOutput",
+        "type": "object"
+      }
+    },
+    "fcp_open_library": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "library_path": {
+            "title": "Library Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "library_path"
+        ],
+        "title": "fcp_open_libraryArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_open_libraryOutput",
+        "type": "object"
+      }
+    },
+    "fcp_playback": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "action": {
+            "default": "toggle",
+            "title": "Action",
+            "type": "string"
+          }
+        },
+        "title": "fcp_playbackArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_playbackOutput",
+        "type": "object"
+      }
+    },
+    "fcp_redo": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_redoArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_redoOutput",
+        "type": "object"
+      }
+    },
+    "fcp_select_tool": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "tool": {
+            "default": "select",
+            "title": "Tool",
+            "type": "string"
+          }
+        },
+        "title": "fcp_select_toolArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_select_toolOutput",
+        "type": "object"
+      }
+    },
+    "fcp_share": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "destination": {
+            "default": "",
+            "title": "Destination",
+            "type": "string"
+          }
+        },
+        "title": "fcp_shareArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_shareOutput",
+        "type": "object"
+      }
+    },
+    "fcp_undo": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "fcp_undoArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcp_undoOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_add_audio": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "audio_src": {
+            "title": "Audio Src",
+            "type": "string"
+          },
+          "duration": {
+            "default": "",
+            "title": "Duration",
+            "type": "string"
+          },
+          "name": {
+            "default": "",
+            "title": "Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "position": {
+            "default": "end",
+            "title": "Position",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "audio_src"
+        ],
+        "title": "fcpxml_add_audioArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_add_audioOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_add_keyword": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_name": {
+            "title": "Clip Name",
+            "type": "string"
+          },
+          "duration": {
+            "default": "",
+            "title": "Duration",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "start": {
+            "default": "0s",
+            "title": "Start",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "clip_name",
+          "value"
+        ],
+        "title": "fcpxml_add_keywordArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_add_keywordOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_add_marker": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_name": {
+            "title": "Clip Name",
+            "type": "string"
+          },
+          "marker_type": {
+            "default": "standard",
+            "title": "Marker Type",
+            "type": "string"
+          },
+          "note": {
+            "default": "",
+            "title": "Note",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "start": {
+            "title": "Start",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "clip_name",
+          "start",
+          "value"
+        ],
+        "title": "fcpxml_add_markerArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_add_markerOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_add_title": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "duration": {
+            "default": "150150/30000s",
+            "title": "Duration",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "position": {
+            "default": "end",
+            "title": "Position",
+            "type": "string"
+          },
+          "text": {
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "text"
+        ],
+        "title": "fcpxml_add_titleArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_add_titleOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_add_transition": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "after_clip_name": {
+            "title": "After Clip Name",
+            "type": "string"
+          },
+          "duration": {
+            "default": "30030/30000s",
+            "title": "Duration",
+            "type": "string"
+          },
+          "name": {
+            "default": "Cross Dissolve",
+            "title": "Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "after_clip_name"
+        ],
+        "title": "fcpxml_add_transitionArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_add_transitionOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_analyze_pacing": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_analyze_pacingArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_analyze_pacingOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_apply_template": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clips_json": {
+            "title": "Clips Json",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "From Template",
+            "title": "Project Name",
+            "type": "string"
+          },
+          "template_path": {
+            "title": "Template Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "template_path",
+          "clips_json"
+        ],
+        "title": "fcpxml_apply_templateArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_apply_templateOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_assign_role": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_name": {
+            "title": "Clip Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "role": {
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "clip_name",
+          "role"
+        ],
+        "title": "fcpxml_assign_roleArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_assign_roleOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_auto_rough_cut": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clips_json": {
+            "title": "Clips Json",
+            "type": "string"
+          },
+          "max_clip_duration": {
+            "default": "150150/30000s",
+            "title": "Max Clip Duration",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "Rough Cut",
+            "title": "Project Name",
+            "type": "string"
+          },
+          "target_duration": {
+            "default": "",
+            "title": "Target Duration",
+            "type": "string"
+          },
+          "transition_duration": {
+            "default": "",
+            "title": "Transition Duration",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clips_json"
+        ],
+        "title": "fcpxml_auto_rough_cutArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_auto_rough_cutOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_batch_add_markers": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "markers_json": {
+            "title": "Markers Json",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "markers_json"
+        ],
+        "title": "fcpxml_batch_add_markersArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_batch_add_markersOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_batch_apply_transition": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "duration": {
+            "default": "30030/30000s",
+            "title": "Duration",
+            "type": "string"
+          },
+          "name": {
+            "default": "Cross Dissolve",
+            "title": "Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_batch_apply_transitionArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_batch_apply_transitionOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_batch_assign_roles": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "rules_json": {
+            "title": "Rules Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "rules_json"
+        ],
+        "title": "fcpxml_batch_assign_rolesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_batch_assign_rolesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_batch_rename_clips": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "pattern": {
+            "title": "Pattern",
+            "type": "string"
+          },
+          "replacement": {
+            "title": "Replacement",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "pattern",
+          "replacement"
+        ],
+        "title": "fcpxml_batch_rename_clipsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_batch_rename_clipsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_change_speed": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_name": {
+            "title": "Clip Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "speed_factor": {
+            "title": "Speed Factor",
+            "type": "number"
+          }
+        },
+        "required": [
+          "path",
+          "clip_name",
+          "speed_factor"
+        ],
+        "title": "fcpxml_change_speedArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_change_speedOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_check_audio_levels": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_check_audio_levelsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_check_audio_levelsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_check_duration": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "target_seconds": {
+            "title": "Target Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "path",
+          "target_seconds"
+        ],
+        "title": "fcpxml_check_durationArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_check_durationOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_check_frame_rates": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_check_frame_ratesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_check_frame_ratesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_check_media_links": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_check_media_linksArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_check_media_linksOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_check_safe_zones": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_check_safe_zonesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_check_safe_zonesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_create_project": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "event_name": {
+            "default": "Default Event",
+            "title": "Event Name",
+            "type": "string"
+          },
+          "format_name": {
+            "default": "FFVideoFormat1080p2997",
+            "title": "Format Name",
+            "type": "string"
+          },
+          "frame_duration": {
+            "default": "1001/30000s",
+            "title": "Frame Duration",
+            "type": "string"
+          },
+          "height": {
+            "default": 1080,
+            "title": "Height",
+            "type": "integer"
+          },
+          "name": {
+            "default": "Untitled Project",
+            "title": "Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "width": {
+            "default": 1920,
+            "title": "Width",
+            "type": "integer"
+          }
+        },
+        "title": "fcpxml_create_projectArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_create_projectOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_create_timeline": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clips_json": {
+            "title": "Clips Json",
+            "type": "string"
+          },
+          "event_name": {
+            "default": "Generated",
+            "title": "Event Name",
+            "type": "string"
+          },
+          "format_name": {
+            "default": "FFVideoFormat1080p2997",
+            "title": "Format Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "Generated Timeline",
+            "title": "Project Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clips_json"
+        ],
+        "title": "fcpxml_create_timelineArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_create_timelineOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_delete_clips": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_names_json": {
+            "title": "Clip Names Json",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "clip_names_json"
+        ],
+        "title": "fcpxml_delete_clipsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_delete_clipsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_detect_duplicates": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_detect_duplicatesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_detect_duplicatesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_detect_flash_frames": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "max_frames": {
+            "default": 2,
+            "title": "Max Frames",
+            "type": "integer"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_detect_flash_framesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_detect_flash_framesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_detect_gaps": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_detect_gapsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_detect_gapsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_diff": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path_a": {
+            "title": "Path A",
+            "type": "string"
+          },
+          "path_b": {
+            "title": "Path B",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path_a",
+          "path_b"
+        ],
+        "title": "fcpxml_diffArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_diffOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_export_edl": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_export_edlArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_export_edlOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_export_fcp7": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_export_fcp7Arguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_export_fcp7Output",
+        "type": "object"
+      }
+    },
+    "fcpxml_export_resolve": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_export_resolveArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_export_resolveOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_fill_gaps": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "fill_asset_ref": {
+            "title": "Fill Asset Ref",
+            "type": "string"
+          },
+          "fill_name": {
+            "default": "Fill",
+            "title": "Fill Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "fill_asset_ref"
+        ],
+        "title": "fcpxml_fill_gapsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_fill_gapsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_fix_flash_frames": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "frame_duration": {
+            "default": "1001/30000s",
+            "title": "Frame Duration",
+            "type": "string"
+          },
+          "min_frames": {
+            "default": 3,
+            "title": "Min Frames",
+            "type": "integer"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_fix_flash_framesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_fix_flash_framesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_generate_montage": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_duration": {
+            "default": "90090/30000s",
+            "title": "Clip Duration",
+            "type": "string"
+          },
+          "clips_json": {
+            "title": "Clips Json",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "Montage",
+            "title": "Project Name",
+            "type": "string"
+          },
+          "transition_duration": {
+            "default": "30030/30000s",
+            "title": "Transition Duration",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clips_json"
+        ],
+        "title": "fcpxml_generate_montageArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_generate_montageOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_import_edl": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "edl_path": {
+            "title": "Edl Path",
+            "type": "string"
+          },
+          "media_dir": {
+            "default": "",
+            "title": "Media Dir",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "EDL Import",
+            "title": "Project Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "edl_path"
+        ],
+        "title": "fcpxml_import_edlArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_import_edlOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_import_srt": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "srt_path": {
+            "title": "Srt Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "srt_path"
+        ],
+        "title": "fcpxml_import_srtArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_import_srtOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_list_clips": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "",
+            "title": "Project Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_list_clipsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_list_clipsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_list_effects": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_list_effectsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_list_effectsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_list_markers": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_list_markersArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_list_markersOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_list_roles": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_list_rolesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_list_rolesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_list_templates": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "templates_dir": {
+            "default": "",
+            "title": "Templates Dir",
+            "type": "string"
+          }
+        },
+        "title": "fcpxml_list_templatesArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_list_templatesOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_parse": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_parseArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_parseOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_qc_report": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_qc_reportArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_qc_reportOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_reformat": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "target_format_name": {
+            "default": "FFVideoFormat1080x1920p2997",
+            "title": "Target Format Name",
+            "type": "string"
+          },
+          "target_height": {
+            "default": 1920,
+            "title": "Target Height",
+            "type": "integer"
+          },
+          "target_width": {
+            "default": 1080,
+            "title": "Target Width",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_reformatArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_reformatOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_remove_silence": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "silence_threshold_seconds": {
+            "default": 2.0,
+            "title": "Silence Threshold Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_remove_silenceArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_remove_silenceOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_reorder_clips": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_names_json": {
+            "title": "Clip Names Json",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "clip_names_json"
+        ],
+        "title": "fcpxml_reorder_clipsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_reorder_clipsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_save_template": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_dir": {
+            "default": "",
+            "title": "Output Dir",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "template_name": {
+            "title": "Template Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "template_name"
+        ],
+        "title": "fcpxml_save_templateArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_save_templateOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_split_clip": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_name": {
+            "title": "Clip Name",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "split_at": {
+            "title": "Split At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "clip_name",
+          "split_at"
+        ],
+        "title": "fcpxml_split_clipArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_split_clipOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_timeline_stats": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_timeline_statsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_timeline_statsOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_trim_clip": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "clip_name": {
+            "title": "Clip Name",
+            "type": "string"
+          },
+          "new_duration": {
+            "default": "",
+            "title": "New Duration",
+            "type": "string"
+          },
+          "new_start": {
+            "default": "",
+            "title": "New Start",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "clip_name"
+        ],
+        "title": "fcpxml_trim_clipArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_trim_clipOutput",
+        "type": "object"
+      }
+    },
+    "fcpxml_validate": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "fcpxml_validateArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "fcpxml_validateOutput",
+        "type": "object"
+      }
+    },
+    "media_audio_to_midi": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_audio_to_midiArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_audio_to_midiOutput",
+        "type": "object"
+      }
+    },
+    "media_detect_beats": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_detect_beatsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_detect_beatsOutput",
+        "type": "object"
+      }
+    },
+    "media_detect_silence": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "min_duration": {
+            "default": 0.5,
+            "title": "Min Duration",
+            "type": "number"
+          },
+          "noise_threshold": {
+            "default": "-30dB",
+            "title": "Noise Threshold",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_detect_silenceArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_detect_silenceOutput",
+        "type": "object"
+      }
+    },
+    "media_extract_audio": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "format": {
+            "default": "wav",
+            "title": "Format",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_extract_audioArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_extract_audioOutput",
+        "type": "object"
+      }
+    },
+    "media_extract_thumbnail": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "time": {
+            "default": 0.0,
+            "title": "Time",
+            "type": "number"
+          },
+          "width": {
+            "default": 320,
+            "title": "Width",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_extract_thumbnailArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_extract_thumbnailOutput",
+        "type": "object"
+      }
+    },
+    "media_extract_thumbnails": {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "interval": {
+            "default": 5.0,
+            "title": "Interval",
+            "type": "number"
+          },
+          "output_dir": {
+            "default": "",
+            "title": "Output Dir",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "width": {
+            "default": 320,
+            "title": "Width",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_extract_thumbnailsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_extract_thumbnailsOutput",
+        "type": "object"
+      }
+    },
+    "media_info": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_infoArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_infoOutput",
+        "type": "object"
+      }
+    },
+    "media_list_streams": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_list_streamsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_list_streamsOutput",
+        "type": "object"
+      }
+    },
+    "media_loudness": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_loudnessArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_loudnessOutput",
+        "type": "object"
+      }
+    },
+    "media_scene_detect": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "threshold": {
+            "default": 0.3,
+            "title": "Threshold",
+            "type": "number"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "media_scene_detectArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "media_scene_detectOutput",
+        "type": "object"
+      }
+    },
+    "puppet_animate": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "animations_json": {
+            "title": "Animations Json",
+            "type": "string"
+          },
+          "duration": {
+            "default": "300300/30000s",
+            "title": "Duration",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "Puppet Animation",
+            "title": "Project Name",
+            "type": "string"
+          },
+          "rigs_json": {
+            "title": "Rigs Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rigs_json",
+          "animations_json"
+        ],
+        "title": "puppet_animateArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "puppet_animateOutput",
+        "type": "object"
+      }
+    },
+    "puppet_build_scene": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "duration": {
+            "default": "300300/30000s",
+            "title": "Duration",
+            "type": "string"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "Puppet Animation",
+            "title": "Project Name",
+            "type": "string"
+          },
+          "rigs_json": {
+            "title": "Rigs Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rigs_json"
+        ],
+        "title": "puppet_build_sceneArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "puppet_build_sceneOutput",
+        "type": "object"
+      }
+    },
+    "puppet_create_humanoid_rig": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "image_dir": {
+            "title": "Image Dir",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "position_x": {
+            "default": 0.0,
+            "title": "Position X",
+            "type": "number"
+          },
+          "position_y": {
+            "default": 0.0,
+            "title": "Position Y",
+            "type": "number"
+          },
+          "scale": {
+            "default": 1.0,
+            "title": "Scale",
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "image_dir"
+        ],
+        "title": "puppet_create_humanoid_rigArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "puppet_create_humanoid_rigOutput",
+        "type": "object"
+      }
+    },
+    "puppet_create_rig": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "rig_json": {
+            "title": "Rig Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rig_json"
+        ],
+        "title": "puppet_create_rigArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "puppet_create_rigOutput",
+        "type": "object"
+      }
+    },
+    "puppet_list_presets": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
+      "input_schema": {
+        "properties": {},
+        "title": "puppet_list_presetsArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "puppet_list_presetsOutput",
+        "type": "object"
+      }
+    },
+    "puppet_multi_scene": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "Puppet Multi-Scene",
+            "title": "Project Name",
+            "type": "string"
+          },
+          "rigs_json": {
+            "title": "Rigs Json",
+            "type": "string"
+          },
+          "scenes_json": {
+            "title": "Scenes Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rigs_json",
+          "scenes_json"
+        ],
+        "title": "puppet_multi_sceneArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "puppet_multi_sceneOutput",
+        "type": "object"
+      }
+    },
+    "puppet_preset_motion": {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
+      "input_schema": {
+        "properties": {
+          "cycles": {
+            "default": 3,
+            "title": "Cycles",
+            "type": "integer"
+          },
+          "duration": {
+            "default": "300300/30000s",
+            "title": "Duration",
+            "type": "string"
+          },
+          "intensity": {
+            "default": 1.0,
+            "title": "Intensity",
+            "type": "number"
+          },
+          "output_path": {
+            "default": "",
+            "title": "Output Path",
+            "type": "string"
+          },
+          "preset": {
+            "default": "idle",
+            "title": "Preset",
+            "type": "string"
+          },
+          "project_name": {
+            "default": "Puppet Animation",
+            "title": "Project Name",
+            "type": "string"
+          },
+          "rig_json": {
+            "title": "Rig Json",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rig_json"
+        ],
+        "title": "puppet_preset_motionArguments",
+        "type": "object"
+      },
+      "output_schema": {
+        "properties": {
+          "result": {
+            "title": "Result",
+            "type": "string"
+          }
+        },
+        "required": [
+          "result"
+        ],
+        "title": "puppet_preset_motionOutput",
+        "type": "object"
+      }
+    }
+  }
+}

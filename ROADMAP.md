@@ -1,44 +1,72 @@
 # fcp-mcp Roadmap
 
-Status as of 2026-04-23: **88 tools across 12 categories.** First
-public release. Planned work below, grouped by priority.
+Status as of 2026-07-28: **v0.3.0 provides up to 93 tools across 13
+functional categories, five prompts, and three workflow resources.** The
+default `workflow` profile is the transactional AI-piloting surface. Planned
+work below is grouped by priority.
 
 ---
 
-## v0.2 — Prompts + CI
+## v0.2 — Prompts + trust baseline
 
-**Goal:** reduce boilerplate for common agent flows and guarantee green
-builds on every change.
+**Goal:** reduce boilerplate for common agent flows and establish a
+reproducible, bounded local execution plane.
 
-### 0.2.1 MCP Prompts (5)
+### 0.2.0 MCP Prompts (shipped)
 
 Pre-built prompts that wrap the most common tool sequences. The client
 sees them in the MCP prompt list and can invoke them by name.
 
 - **`qc-check`** — `fcpxml_qc_report` + interpretation guide for the LLM
-- **`rough-cut`** — `fcpxml_auto_rough_cut` with beat-sync scaffold
+- **`rough-cut`** — `fcpxml_auto_rough_cut` plus structural QC
 - **`cleanup`** — `fix_flash_frames` + `fill_gaps` + re-QC
 - **`youtube-chapters`** — extract markers, emit YouTube timestamp blob
-- **`beat-sync`** — `media_detect_beats` + `auto_rough_cut` at beats
+- **`beat-sync`** — `media_detect_beats` + `auto_rough_cut` using median
+  beat cadence; exact beat cut points are not supported
 
-### 0.2.2 GitHub Actions CI
+### 0.2.1 Trust baseline (shipped)
 
-- Test matrix: Python 3.10 / 3.11 / 3.12 / 3.13
-- `pytest -v` gate on every PR
-- `ruff check` gate on every PR
-- Coverage badge via `pytest-cov`
+- Stable coded MCP failures and structured `fcp_doctor`
+- Allowed-root path policy and symlink containment
+- Validated atomic FCPXML writes with backups and rollback
+- Opt-in live FCP, Accessibility, and Compressor actions
+- AppleScript/JXA argv isolation
+- Explicit MCP annotations on all 89 tools
+- Executable documentation and prompt contracts
+- Python 3.10–3.13 CI on macOS, dependency audit,
+  coverage floors, package checks, and installed-wheel smoke
+- An explicit MCP boundary with package and SDK versions disclosed separately
 
-### 0.2.3 Release automation
+### Release automation
 
-- Tag-triggered workflow → build wheel + sdist → publish to PyPI
-- Post-publish hook → submit to MCP Registry via `mcp-registry` tool
+- Tag-triggered workflow rebuilds and verifies the candidate, then hands its
+  artifact to an isolated PyPI Trusted Publishing job
+- The PyPI environment, required reviewers, trusted-publisher registration,
+  and protected `v*` tags must be configured before release
+- Tags, PyPI upload, GitHub Releases, and MCP Registry submission remain
+  separate maintainer-authorized actions
 
 ---
 
-## v0.3 — Production recipes
+## v0.3 — Transactional workflows
 
-**Goal:** match DareDev256's WORKFLOWS.md depth with a fcp-mcp-specific
-catalog.
+**Goal:** make multi-step FCPXML changes previewable, approvable,
+crash-recoverable, and machine-verifiable.
+
+- Default `workflow` capability profile with explicit `inspect`, `edit`, and
+  `full` alternatives
+- Meaningful typed structured outputs while preserving successful text content
+- Deterministic inspect-plan-dry-run-validate-diff-approve-commit graph
+- Durable SQLite event ledger, private hashed artifacts, and recovery tooling
+- Hash-bound client approval by default with CLI approval as an explicit mode
+- Stable MCP SDK v2 boundary with the package version on the wire
+
+---
+
+## v0.4 — Production recipes
+
+**Goal:** rebuild the fcp-mcp-specific recipe catalog on the transactional
+workflow surface.
 
 - `WORKFLOWS.md` — 8+ production recipes with full tool sequences:
   - Wedding/event highlight reel
@@ -52,7 +80,7 @@ catalog.
 
 ---
 
-## v0.4 — Proxy + offline media awareness
+## v0.5 — Proxy + offline media awareness
 
 **Goal:** make offline/online workflows first-class.
 
@@ -67,18 +95,15 @@ catalog.
 
 ---
 
-## v0.5 — Sandbox + hardening
+## v0.6 — Further policy hardening
 
 **Goal:** safe to run alongside untrusted clients.
 
-- Sandbox the live FCP tools behind an allowlist (opt-in via env var)
-- File-system jail for all `output_path` parameters to a configurable
-  root
+- Extend the v0.3 capability profiles with per-tool path and execution policies
 - Rate-limit live FCP tools (AppleScript is slow; 1 call per 500ms
   naturally, but add an explicit cap)
-- Security posture doc — XXE, billion-laughs, path traversal test
-  matrix documented + `tests/test_security.py` added to the public
-  test surface
+- Publish a consolidated security posture and adversarial trajectory
+  matrix
 
 ---
 
@@ -86,7 +111,7 @@ catalog.
 
 **Goal:** tool names + signatures frozen. Additions only, no renames.
 
-- Freeze the 88 v0.x tools after one full major-version shakedown
+- Freeze the shipped public tool set after one full major-version shakedown
 - Commit to 12-month deprecation window for any future removals
 - Version the MCP Prompts too — existing prompt names become stable
 - Publish `docs/STABILITY.md` stating what's covered by the pact

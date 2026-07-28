@@ -1,3 +1,6 @@
 """FCP-MCP: Final Cut Pro MCP Server."""
 
-__version__ = "0.2.0"
+from fcp_mcp.version import FALLBACK_VERSION
+
+__version__ = FALLBACK_VERSION
+__all__ = ["__version__"]

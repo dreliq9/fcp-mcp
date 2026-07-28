@@ -7,10 +7,10 @@ from __future__ import annotations
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Optional, Union
 from urllib.parse import quote as url_quote
 
-from .time_utils import RationalTime, FORMAT_FRAME_DURATIONS
+from .time_utils import FORMAT_FRAME_DURATIONS, RationalTime
+from .transaction import FCPXMLTransactionReceipt, commit_fcpxml
 
 
 class FCPXMLGenerator:
@@ -67,11 +67,11 @@ class FCPXMLGenerator:
     def add_asset(
         self,
         src: str,
-        name: Optional[str] = None,
+        name: str | None = None,
         duration: str = "0s",
         has_video: bool = True,
         has_audio: bool = True,
-        format_ref: Optional[str] = None,
+        format_ref: str | None = None,
         audio_channels: int = 2,
     ) -> str:
         """Add an asset resource. Returns resource ID.
@@ -128,7 +128,7 @@ class FCPXMLGenerator:
     def create_project(
         self,
         name: str = "Untitled Project",
-        format_ref: Optional[str] = None,
+        format_ref: str | None = None,
         duration: str = "0s",
         tc_start: str = "0s",
         tc_format: str = "NDF",
@@ -169,7 +169,7 @@ class FCPXMLGenerator:
         start: str = "0s",
         duration: str = "0s",
         role: str = "",
-        offset: Optional[str] = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add an asset-clip to a spine. Auto-calculates offset if not provided."""
         if offset is None:
@@ -183,14 +183,14 @@ class FCPXMLGenerator:
         clip.set("start", start)
         clip.set("duration", duration)
         if role:
-            clip.set("role", role)
+            clip.set("audioRole", role)
         return clip
 
     def add_gap_to_spine(
         self,
         spine: ET.Element,
         duration: str,
-        offset: Optional[str] = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add a gap to a spine."""
         if offset is None:
@@ -208,8 +208,8 @@ class FCPXMLGenerator:
         effect_ref: str,
         name: str = "Title",
         duration: str = "150150/30000s",
-        text_params: Optional[dict[str, str]] = None,
-        offset: Optional[str] = None,
+        text_params: dict[str, str] | None = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add a title generator clip to a spine."""
         if offset is None:
@@ -252,7 +252,7 @@ class FCPXMLGenerator:
         clip.set("duration", duration)
         clip.set("lane", str(lane))
         if role:
-            clip.set("role", role)
+            clip.set("audioRole", role)
         return clip
 
     def add_transition(
@@ -261,7 +261,7 @@ class FCPXMLGenerator:
         duration: str = "30030/30000s",
         name: str = "Cross Dissolve",
         effect_ref: str = "",
-        offset: Optional[str] = None,
+        offset: str | None = None,
     ) -> ET.Element:
         """Add a transition to the spine."""
         if offset is None:
@@ -360,17 +360,32 @@ class FCPXMLGenerator:
 
     # --- Output ---
 
-    def save(self, path: Union[str, Path]) -> Path:
+    def save(
+        self,
+        path: str | Path,
+        *,
+        event_format: str = "text",
+    ) -> Path:
         """Write FCPXML to file."""
-        path = Path(path)
-        ET.indent(self.root, space="    ")
-        xml_str = ET.tostring(self.root, encoding="unicode")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-            f.write("<!DOCTYPE fcpxml>\n")
-            f.write(xml_str)
-            f.write("\n")
-        return path
+        return self.save_with_receipt(
+            path,
+            event_format=event_format,
+        ).destination
+
+    def save_with_receipt(
+        self,
+        path: str | Path,
+        *,
+        event_format: str = "text",
+    ) -> FCPXMLTransactionReceipt:
+        """Write FCPXML atomically and return its complete receipt."""
+        return commit_fcpxml(
+            source=None,
+            destination=Path(path),
+            xml_text=f"{self.to_string()}\n",
+            event_format=event_format,
+            operation="generator_save",
+        )
 
     def to_string(self) -> str:
         """Return FCPXML as string."""

@@ -4,19 +4,90 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
-  pypi:
-    runs-on: ubuntu-latest
+  verify:
+    name: Reverify tagged release candidate
+    runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
-      - name: Build
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install release dependencies
         run: |
-          python -m pip install --upgrade pip build
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+      - name: Verify tag matches package
+        run: |
+          test "${GITHUB_REF_NAME}" = "v$(python -c 'from fcp_mcp.version import package_version; print(package_version())')"
+      - name: Re-run release gates
+        run: |
+          ruff check src tests scripts
+          FCP_MCP_PROFILE=full python scripts/check_contracts.py
+          FCP_MCP_PROFILE=full python scripts/check_tool_results.py
+          python -m pytest -q
+          pip-audit --local
+      - name: Enforce macOS-only architecture
+        run: python scripts/check_macos_only.py
+      - name: Rebuild distributions from tag
+        run: |
+          rm -rf build dist
           python -m build
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+          python -m twine check dist/*
+      - name: Smoke-test installed wheel
+        env:
+          FCP_MCP_PROFILE: full
+        run: |
+          python -m venv /tmp/fcp-mcp-wheel-smoke
+          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/fcp-mcp-wheel-smoke/bin/python -m pip install dist/fcp_mcp-0.3.0-py3-none-any.whl
+          mkdir -p "${RUNNER_TEMP}/fcp-mcp-output"
+          mkdir -p "${RUNNER_TEMP}/fcp-mcp-state"
+          chmod 700 "${RUNNER_TEMP}/fcp-mcp-state"
+          FCP_MCP_OUTPUT_DIR="${RUNNER_TEMP}/fcp-mcp-output" \
+          FCP_MCP_ALLOWED_ROOTS="${RUNNER_TEMP}/fcp-mcp-output" \
+          FCP_MCP_STATE_DIR="${RUNNER_TEMP}/fcp-mcp-state" \
+          FCP_MCP_ENABLE_LIVE_CONTROL=0 \
+          /tmp/fcp-mcp-wheel-smoke/bin/python scripts/wheel_smoke.py \
+            --command /tmp/fcp-mcp-wheel-smoke/bin/fcp-mcp
+      - name: Verify installed wheel on Python 3.10
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
+          python-version: "3.10"
+      - name: Import installed workflow package on Python 3.10
+        run: |
+          python -m venv /tmp/fcp-mcp-wheel-py310
+          /tmp/fcp-mcp-wheel-py310/bin/python -m pip install dist/fcp_mcp-0.3.0-py3-none-any.whl
+          /tmp/fcp-mcp-wheel-py310/bin/python -c "import fcp_mcp.workflow.locking"
+      - name: Upload verified distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fcp-mcp-v0.3.0-release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish verified distributions to PyPI
+    needs: verify
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/fcp-mcp
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fcp-mcp-v0.3.0-release-dist
+          path: dist/
+      - name: Publish verified distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
