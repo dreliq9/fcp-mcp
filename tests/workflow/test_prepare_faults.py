@@ -17,6 +17,102 @@ class InjectedCrash(BaseException):
     pass
 
 
+@pytest.mark.parametrize("boundary", ["source_inspected", "plan_normalized"])
+def test_repeated_interruptions_close_source_snapshot_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    descriptors_before = set(engine_module.os.listdir("/dev/fd"))
+    original_open = engine_module.os.open
+    original_close = engine_module.os.close
+    active_snapshot_fds: set[int] = set()
+    snapshot_opens = 0
+    snapshot_closes = 0
+
+    def observe_open(path, *args, **kwargs):
+        nonlocal snapshot_opens
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path).name.startswith(".workflow-snapshot-"):
+            snapshot_opens += 1
+            active_snapshot_fds.add(descriptor)
+        return descriptor
+
+    def observe_close(descriptor: int) -> None:
+        nonlocal snapshot_closes
+        if descriptor in active_snapshot_fds:
+            snapshot_closes += 1
+            active_snapshot_fds.remove(descriptor)
+        original_close(descriptor)
+
+    monkeypatch.setattr(engine_module.os, "open", observe_open)
+    monkeypatch.setattr(engine_module.os, "close", observe_close)
+    for index in range(5):
+        root = tmp_path / str(index)
+        root.mkdir()
+        source = root / "source.fcpxml"
+        destination = root / "destination.fcpxml"
+        source.write_bytes(SOURCE_XML)
+
+        def crash(name: str) -> None:
+            if name == boundary:
+                raise InjectedCrash(name)
+
+        engine, _, _ = _engine(root, fault_hook=crash)
+        with pytest.raises(InjectedCrash):
+            engine.prepare(_request(source, destination))
+
+        assert not any(
+            SOURCE_XML[:32] in path.read_bytes()
+            for path in engine.artifacts.paths.root.rglob("*")
+            if path.is_file()
+        )
+
+    assert set(engine_module.os.listdir("/dev/fd")) == descriptors_before
+    assert snapshot_opens == snapshot_closes == 5
+    assert active_snapshot_fds == set()
+
+
+def test_cleanup_baseexception_never_masks_active_interruption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source.fcpxml"
+    destination = tmp_path / "destination.fcpxml"
+    source.write_bytes(SOURCE_XML)
+    original_open = engine_module.os.open
+    original_close = engine_module.os.close
+    snapshot_fd: int | None = None
+    injected = False
+
+    def observe_open(path, *args, **kwargs):
+        nonlocal snapshot_fd
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path).name.startswith(".workflow-snapshot-"):
+            snapshot_fd = descriptor
+        return descriptor
+
+    def fail_snapshot_close(descriptor: int) -> None:
+        nonlocal injected
+        original_close(descriptor)
+        if descriptor == snapshot_fd:
+            injected = True
+            raise RuntimeError("cleanup secret")
+
+    def crash(name: str) -> None:
+        if name == "source_inspected":
+            raise InjectedCrash(name)
+
+    monkeypatch.setattr(engine_module.os, "open", observe_open)
+    monkeypatch.setattr(engine_module.os, "close", fail_snapshot_close)
+    engine, _, _ = _engine(tmp_path, fault_hook=crash)
+
+    with pytest.raises(InjectedCrash, match="source_inspected"):
+        engine.prepare(_request(source, destination))
+
+    assert injected is True
+
+
 @pytest.mark.parametrize(
     "boundary",
     [
@@ -195,14 +291,17 @@ def test_candidate_named_path_recreation_cannot_replace_open_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine, _, _ = _engine(tmp_path)
-    original_mkstemp = engine_module.tempfile.mkstemp
+    root = engine.artifacts.paths.root
+    original_unlink = engine_module.os.unlink
     raw_path: Path | None = None
 
-    def observe_mkstemp(*args, **kwargs):
+    def observe_unlink(path, *args, **kwargs):
         nonlocal raw_path
-        descriptor, path = original_mkstemp(*args, **kwargs)
-        raw_path = Path(path)
-        return descriptor, path
+        target = _snapshot_attack_path(root, path)
+        result = original_unlink(path, *args, **kwargs)
+        if target.name.startswith(".workflow-snapshot-"):
+            raw_path = target
+        return result
 
     original_validate = engine.validator.validate_file
 
@@ -211,15 +310,101 @@ def test_candidate_named_path_recreation_cannot_replace_open_snapshot(
         raw_path.write_bytes(b"<attacker/>")
         return original_validate(path)
 
-    monkeypatch.setattr(engine_module.tempfile, "mkstemp", observe_mkstemp)
+    monkeypatch.setattr(engine_module.os, "unlink", observe_unlink)
     monkeypatch.setattr(engine.validator, "validate_file", replace_old_name)
     try:
         result = engine._validate_candidate(SOURCE_XML)
     finally:
         if raw_path is not None:
-            raw_path.unlink(missing_ok=True)
+            original_unlink(raw_path)
 
     assert result.valid is True
+
+
+def _snapshot_attack_path(root: Path, raw_path: object) -> Path:
+    path = Path(raw_path)
+    return path if path.is_absolute() else root / path
+
+
+@pytest.mark.parametrize("attack", ["rename", "decoy", "hardlink"])
+def test_snapshot_link_attacks_fail_before_plaintext_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    engine, _, _ = _engine(tmp_path)
+    root = engine.artifacts.paths.root
+    original_unlink = engine_module.os.unlink
+    injected = False
+    retained = root / f"attacker-{attack}.fcpxml"
+
+    def attack_unlink(raw_path, *args, **kwargs):
+        nonlocal injected
+        target = _snapshot_attack_path(root, raw_path)
+        if target.name.startswith(".workflow-snapshot-") and not injected:
+            injected = True
+            if attack == "hardlink":
+                engine_module.os.link(target, retained)
+            else:
+                target.rename(retained)
+                if attack == "decoy":
+                    target.write_bytes(b"attacker-decoy")
+        return original_unlink(raw_path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module.os, "unlink", attack_unlink)
+    try:
+        with pytest.raises(FCPMCPError) as error:
+            engine._validate_candidate(SOURCE_XML)
+        assert error.value.code is ErrorCode.TRANSACTION_FAILED
+        assert retained.exists()
+        assert SOURCE_XML[:32] not in retained.read_bytes()
+        assert not any(
+            SOURCE_XML[:32] in path.read_bytes()
+            for path in root.iterdir()
+            if path.is_file()
+        )
+    finally:
+        retained.unlink(missing_ok=True)
+        for path in root.glob(".workflow-snapshot-*"):
+            path.unlink(missing_ok=True)
+
+    assert injected is True
+
+
+def test_snapshot_unlink_failure_is_coded_and_copies_no_plaintext(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _, _ = _engine(tmp_path)
+    root = engine.artifacts.paths.root
+    original_unlink = engine_module.os.unlink
+    injected = False
+
+    def fail_unlink(raw_path, *args, **kwargs):
+        nonlocal injected
+        target = _snapshot_attack_path(root, raw_path)
+        if target.name.startswith(".workflow-snapshot-"):
+            injected = True
+            raise OSError("injected unlink failure secret")
+        return original_unlink(raw_path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module.os, "unlink", fail_unlink)
+    try:
+        with pytest.raises(FCPMCPError) as error:
+            engine._validate_candidate(SOURCE_XML)
+        assert error.value.code is ErrorCode.TRANSACTION_FAILED
+        assert "secret" not in str(error.value)
+        assert not any(
+            SOURCE_XML[:32] in path.read_bytes()
+            for path in root.iterdir()
+            if path.is_file()
+        )
+    finally:
+        monkeypatch.setattr(engine_module.os, "unlink", original_unlink)
+        for path in root.glob(".workflow-snapshot-*"):
+            path.unlink(missing_ok=True)
+
+    assert injected is True
 
 
 def test_candidate_snapshot_fsync_failure_leaves_no_named_plaintext(
@@ -228,21 +413,22 @@ def test_candidate_snapshot_fsync_failure_leaves_no_named_plaintext(
 ) -> None:
     engine, _, _ = _engine(tmp_path)
     original_fsync = engine_module.os.fsync
-    original_mkstemp = engine_module.tempfile.mkstemp
+    original_open = engine_module.os.open
     target_fd: int | None = None
 
-    def observe_mkstemp(*args, **kwargs):
+    def observe_open(path, *args, **kwargs):
         nonlocal target_fd
-        descriptor, path = original_mkstemp(*args, **kwargs)
-        target_fd = descriptor
-        return descriptor, path
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path).name.startswith(".workflow-snapshot-"):
+            target_fd = descriptor
+        return descriptor
 
     def fail_fsync(descriptor: int) -> None:
         if descriptor == target_fd:
             raise OSError("injected snapshot fsync failure")
         original_fsync(descriptor)
 
-    monkeypatch.setattr(engine_module.tempfile, "mkstemp", observe_mkstemp)
+    monkeypatch.setattr(engine_module.os, "open", observe_open)
     monkeypatch.setattr(engine_module.os, "fsync", fail_fsync)
 
     with pytest.raises(OSError, match="injected snapshot fsync failure"):
@@ -257,15 +443,16 @@ def test_candidate_snapshot_close_failure_preserves_validation_error(
 ) -> None:
     engine, _, _ = _engine(tmp_path)
     original_close = engine_module.os.close
-    original_mkstemp = engine_module.tempfile.mkstemp
+    original_open = engine_module.os.open
     target_fd: int | None = None
     close_fault_injected = False
 
-    def observe_mkstemp(*args, **kwargs):
+    def observe_open(path, *args, **kwargs):
         nonlocal target_fd
-        descriptor, path = original_mkstemp(*args, **kwargs)
-        target_fd = descriptor
-        return descriptor, path
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path).name.startswith(".workflow-snapshot-"):
+            target_fd = descriptor
+        return descriptor
 
     def fail_validation(path: Path):
         raise RuntimeError("injected validator failure")
@@ -277,7 +464,7 @@ def test_candidate_snapshot_close_failure_preserves_validation_error(
             close_fault_injected = True
             raise OSError("injected snapshot close failure")
 
-    monkeypatch.setattr(engine_module.tempfile, "mkstemp", observe_mkstemp)
+    monkeypatch.setattr(engine_module.os, "open", observe_open)
     monkeypatch.setattr(engine.validator, "validate_file", fail_validation)
     monkeypatch.setattr(engine_module.os, "close", fail_close)
 
@@ -294,17 +481,19 @@ def test_snapshot_unlink_retry_never_exposes_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     engine, _, _ = _engine(tmp_path)
-    original_unlink = Path.unlink
+    root = engine.artifacts.paths.root
+    original_unlink = engine_module.os.unlink
     injected = False
 
-    def transient_unlink(path: Path, *args, **kwargs):
+    def transient_unlink(path, *args, **kwargs):
         nonlocal injected
-        if path.name.startswith(".workflow-snapshot-") and not injected:
+        target = _snapshot_attack_path(root, path)
+        if target.name.startswith(".workflow-snapshot-") and not injected:
             injected = True
             raise OSError("injected transient unlink failure")
         return original_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "unlink", transient_unlink)
+    monkeypatch.setattr(engine_module.os, "unlink", transient_unlink)
 
     result = engine._validate_candidate(SOURCE_XML)
 
@@ -321,17 +510,18 @@ def test_candidate_snapshot_write_failure_leaves_no_named_plaintext(
     destination = tmp_path / "destination.fcpxml"
     source.write_bytes(SOURCE_XML)
     engine, _, _ = _engine(tmp_path)
-    original_mkstemp = engine_module.tempfile.mkstemp
+    original_open = engine_module.os.open
     target_fd: int | None = None
     created = 0
 
-    def observe_mkstemp(*args, **kwargs):
+    def observe_open(path, *args, **kwargs):
         nonlocal created, target_fd
-        descriptor, path = original_mkstemp(*args, **kwargs)
-        created += 1
-        if created == 2:
-            target_fd = descriptor
-        return descriptor, path
+        descriptor = original_open(path, *args, **kwargs)
+        if Path(path).name.startswith(".workflow-snapshot-"):
+            created += 1
+            if created == 2:
+                target_fd = descriptor
+        return descriptor
 
     original_write = engine_module.os.write
 
@@ -340,7 +530,7 @@ def test_candidate_snapshot_write_failure_leaves_no_named_plaintext(
             raise OSError("injected candidate snapshot write failure")
         return original_write(descriptor, payload)
 
-    monkeypatch.setattr(engine_module.tempfile, "mkstemp", observe_mkstemp)
+    monkeypatch.setattr(engine_module.os, "open", observe_open)
     monkeypatch.setattr(engine_module.os, "write", fail_diff_write)
 
     with pytest.raises(FCPMCPError):

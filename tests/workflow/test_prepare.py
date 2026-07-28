@@ -380,6 +380,83 @@ def test_failure_evidence_persistence_failure_preserves_primary_without_false_te
     ]
 
 
+class SecondaryAbort(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "secondary_type"),
+    [
+        ("artifact_write", OSError),
+        ("artifact_read", RuntimeError),
+        ("ledger", SecondaryAbort),
+    ],
+)
+def test_any_secondary_failure_preserves_primary_code_and_sanitized_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+    secondary_type: type[BaseException],
+) -> None:
+    source = tmp_path / "source.fcpxml"
+    destination = tmp_path / "destination.fcpxml"
+    source.write_bytes(SOURCE_XML)
+    engine, ledger, artifacts = _engine(tmp_path)
+    secret = "secondary-secret-must-not-escape"
+    original_write = artifacts.write
+    original_read = artifacts.read
+    original_record = ledger.record_prepare_failure
+
+    def fail_write(run_id: str, kind: ArtifactKind, body: bytes):
+        if kind is ArtifactKind.FAILURE_EVIDENCE and failure_point == "artifact_write":
+            raise secondary_type(secret)
+        return original_write(run_id, kind, body)
+
+    def fail_read(metadata: ArtifactMetadataV1):
+        if (
+            metadata.kind is ArtifactKind.FAILURE_EVIDENCE
+            and failure_point == "artifact_read"
+        ):
+            raise secondary_type(secret)
+        return original_read(metadata)
+
+    def fail_record(*args, **kwargs):
+        if failure_point == "ledger":
+            raise secondary_type(secret)
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(artifacts, "write", fail_write)
+    monkeypatch.setattr(artifacts, "read", fail_read)
+    monkeypatch.setattr(ledger, "record_prepare_failure", fail_record)
+
+    with pytest.raises(FCPMCPError) as error:
+        engine.prepare(
+            _request(
+                source,
+                destination,
+                expected_source_sha256="0" * 64,
+            )
+        )
+
+    assert error.value.code is ErrorCode.WORKFLOW_STALE
+    primary = error.value.__cause__
+    assert isinstance(primary, FCPMCPError)
+    assert primary.code is ErrorCode.WORKFLOW_STALE
+    secondary = primary.__context__
+    assert isinstance(secondary, FCPMCPError)
+    assert secondary.code is ErrorCode.TRANSACTION_FAILED
+    assert secret not in str(error.value)
+    assert secret not in str(primary)
+    assert secret not in str(secondary)
+    run = ledger.get_run(RUN_ID)
+    assert run is not None and run.state is WorkflowState.PREPARING
+    assert run.terminal_error_code is None
+    assert [event.event_type for event in ledger.list_events(RUN_ID)] == [
+        "run_created",
+        "source_inspected",
+    ]
+
+
 def test_exact_idempotency_duplicate_rehydrates_without_second_execution(tmp_path: Path):
     source = tmp_path / "source.fcpxml"
     destination = tmp_path / "destination.fcpxml"

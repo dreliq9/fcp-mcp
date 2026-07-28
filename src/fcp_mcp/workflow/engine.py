@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import stat
-import tempfile
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -122,17 +123,20 @@ class _DescriptorSnapshot:
         descriptor, self.descriptor = self.descriptor, -1
         try:
             os.close(descriptor)
-        except OSError as error:
+        except BaseException:  # noqa: BLE001 - sanitize the cleanup boundary
             raise _coded(
                 ErrorCode.TRANSACTION_FAILED,
                 "private snapshot cleanup failed",
-                error,
-            ) from error
+            ) from None
 
     def close_preserving(self, primary: BaseException) -> None:
         try:
             self.close()
-        except FCPMCPError as cleanup:
+        except BaseException:  # noqa: BLE001 - active primary must survive cleanup
+            cleanup = _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot cleanup failed",
+            )
             if primary.__context__ is None:
                 primary.__context__ = cleanup
 
@@ -149,44 +153,148 @@ def _coded(
 
 
 def _new_unlinked_descriptor(root: Path) -> tuple[int, tuple[int, int, int]]:
-    descriptor, raw_path = tempfile.mkstemp(
-        prefix=".workflow-snapshot-",
-        suffix=".fcpxml",
-        dir=root,
-    )
-    path = Path(raw_path)
-    try:
-        os.fchmod(descriptor, 0o600)
-        try:
-            path.unlink()
-        except OSError:
-            # No content has been copied yet. A second unlink closes the narrow
-            # transient-cleanup seam without ever leaving plaintext behind.
-            path.unlink(missing_ok=True)
-        result = os.fstat(descriptor)
-        if not stat.S_ISREG(result.st_mode):
-            raise OSError("private snapshot is not a regular file")
-        return descriptor, _identity(result)
-    except BaseException as primary:
+    directory = -1
+    descriptor = -1
+    name: str | None = None
+    created_identity: tuple[int, int, int] | None = None
+
+    def preserve_cleanup(primary: BaseException) -> None:
         cleanup: FCPMCPError | None = None
-        try:
-            os.close(descriptor)
-        except OSError as error:
-            cleanup = _coded(
-                ErrorCode.TRANSACTION_FAILED,
-                "private snapshot cleanup failed",
-                error,
-            )
-        try:
-            path.unlink(missing_ok=True)
-        except OSError as error:
-            cleanup = cleanup or _coded(
-                ErrorCode.TRANSACTION_FAILED,
-                "private snapshot cleanup failed",
-                error,
-            )
+        if directory >= 0 and name is not None and created_identity is not None:
+            try:
+                entry = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                if _identity(entry) == created_identity:
+                    os.unlink(name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            except BaseException:  # noqa: BLE001 - cleanup cannot mask primary
+                cleanup = _coded(
+                    ErrorCode.TRANSACTION_FAILED,
+                    "private snapshot cleanup failed",
+                )
+        for owned in (descriptor, directory):
+            if owned < 0:
+                continue
+            try:
+                os.close(owned)
+            except BaseException:  # noqa: BLE001 - cleanup cannot mask primary
+                cleanup = cleanup or _coded(
+                    ErrorCode.TRANSACTION_FAILED,
+                    "private snapshot cleanup failed",
+                )
         if cleanup is not None and primary.__context__ is None:
             primary.__context__ = cleanup
+
+    try:
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        directory = os.open(root, directory_flags)
+        directory_result = os.fstat(directory)
+        root_result = root.lstat()
+        if (
+            not stat.S_ISDIR(directory_result.st_mode)
+            or _identity(directory_result) != _identity(root_result)
+        ):
+            raise _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot directory identity changed",
+            )
+        snapshot_flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        for _ in range(16):
+            name = f".workflow-snapshot-{secrets.token_hex(16)}.fcpxml"
+            try:
+                descriptor = os.open(
+                    name,
+                    snapshot_flags,
+                    0o600,
+                    dir_fd=directory,
+                )
+                break
+            except FileExistsError:
+                continue
+        if descriptor < 0:
+            raise _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot name allocation failed",
+            )
+        created = os.fstat(descriptor)
+        created_identity = _identity(created)
+        if (
+            not stat.S_ISREG(created.st_mode)
+            or stat.S_IMODE(created.st_mode) != 0o600
+            or created.st_uid != os.geteuid()
+            or created.st_nlink != 1
+        ):
+            raise _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot creation invariants failed",
+            )
+        unlinked = False
+        for attempt in range(2):
+            entry = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if (
+                _identity(entry) != created_identity
+                or stat.S_IMODE(entry.st_mode) != 0o600
+                or entry.st_uid != os.geteuid()
+                or entry.st_nlink != 1
+            ):
+                raise _coded(
+                    ErrorCode.TRANSACTION_FAILED,
+                    "private snapshot name identity changed",
+                )
+            try:
+                os.unlink(name, dir_fd=directory)
+                unlinked = True
+                break
+            except OSError:
+                if attempt:
+                    raise
+        if not unlinked:
+            raise _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot unlink failed",
+            )
+        os.fsync(directory)
+        retained = os.fstat(descriptor)
+        if (
+            _identity(retained) != created_identity
+            or not stat.S_ISREG(retained.st_mode)
+            or stat.S_IMODE(retained.st_mode) != 0o600
+            or retained.st_uid != os.geteuid()
+            or retained.st_nlink != 0
+        ):
+            raise _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot did not become anonymous",
+            )
+        owned_directory, directory = directory, -1
+        try:
+            os.close(owned_directory)
+        except BaseException:  # noqa: BLE001 - sanitize the cleanup boundary
+            raise _coded(
+                ErrorCode.TRANSACTION_FAILED,
+                "private snapshot cleanup failed",
+            ) from None
+        return descriptor, created_identity
+    except OSError as error:
+        primary = _coded(
+            ErrorCode.TRANSACTION_FAILED,
+            "private snapshot creation failed",
+        )
+        preserve_cleanup(primary)
+        raise primary from error
+    except BaseException as primary:
+        preserve_cleanup(primary)
         raise
 
 
@@ -216,12 +324,11 @@ def _snapshot_bytes(payload: bytes, root: Path) -> _DescriptorSnapshot:
     except BaseException as primary:
         try:
             os.close(descriptor)
-        except OSError as error:
+        except BaseException:  # noqa: BLE001 - cleanup cannot mask primary
             if primary.__context__ is None:
                 primary.__context__ = _coded(
                     ErrorCode.TRANSACTION_FAILED,
                     "private snapshot cleanup failed",
-                    error,
                 )
         raise
 
@@ -286,11 +393,10 @@ def _snapshot_regular(
                 continue
             try:
                 os.close(descriptor)
-            except OSError as error:
+            except BaseException:  # noqa: BLE001 - cleanup cannot mask primary
                 cleanup = cleanup or _coded(
                     ErrorCode.TRANSACTION_FAILED,
                     "private snapshot cleanup failed",
-                    error,
                 )
         if cleanup is not None:
             if primary is None:
@@ -784,9 +890,12 @@ class WorkflowEngine:
                 disposition="failed",
                 error_code=error.code,
             )
-        except FCPMCPError as secondary:
+        except BaseException:  # noqa: BLE001 - secondary must never mask primary
             if error.__context__ is None:
-                error.__context__ = secondary
+                error.__context__ = _coded(
+                    ErrorCode.TRANSACTION_FAILED,
+                    "secondary failure evidence persistence failed",
+                )
 
     def prepare(self, request: WorkflowPrepareRequestV1) -> WorkflowPreviewV1:
         if not isinstance(request, WorkflowPrepareRequestV1):
@@ -1045,9 +1154,6 @@ class WorkflowEngine:
             return self._rehydrate(run)
         except FCPMCPError as error:
             current = self.ledger.get_run(run.run_id)
-            if source_snapshot is not None:
-                source_snapshot.close_preserving(error)
-                source_snapshot = None
             if current is not None and current.state is WorkflowState.PREPARING:
                 self._fail(
                     current,
@@ -1059,9 +1165,6 @@ class WorkflowEngine:
             raise _coded(error.code, "workflow prepare failed", error)
         except Exception as error:  # noqa: BLE001 - normalize the public engine boundary
             coded = _coded(ErrorCode.INTERNAL_ERROR, "workflow prepare failed", error)
-            if source_snapshot is not None:
-                source_snapshot.close_preserving(coded)
-                source_snapshot = None
             current = self.ledger.get_run(run.run_id)
             if current is not None and current.state is WorkflowState.PREPARING:
                 self._fail(
@@ -1072,6 +1175,14 @@ class WorkflowEngine:
                     receipts=failure_receipts,
                 )
             raise coded
+        finally:
+            if source_snapshot is not None:
+                snapshot, source_snapshot = source_snapshot, None
+                primary = sys.exc_info()[1]
+                if primary is None:
+                    snapshot.close()
+                else:
+                    snapshot.close_preserving(primary)
 
     def reconcile_preparing(self, run_id: str) -> LedgerRunRecord:
         run = self.ledger.get_run(run_id)
