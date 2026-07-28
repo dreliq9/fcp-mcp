@@ -3706,12 +3706,12 @@ class WorkflowLedger:
         state = _workflow_state(expected_state)
         revision = _positive_revision(expected_revision)
         closed_decision = _approval_decision(decision)
+        if closed_decision is ApprovalDecision.APPROVED:
+            raise _state_conflict(
+                "approved decisions require record_approval_or_expire"
+            )
         closed_source = _approval_source(source)
-        target = (
-            WorkflowState.APPROVED
-            if closed_decision is ApprovalDecision.APPROVED
-            else WorkflowState.REJECTED
-        )
+        target = WorkflowState.REJECTED
         if not transition_allowed(state, target):
             raise _state_conflict("workflow decision transition is not allowed")
         operator_text = _optional_text(
@@ -3792,9 +3792,6 @@ class WorkflowLedger:
                     expiry,
                 ),
             )
-            approved_at = (
-                timestamp if closed_decision is ApprovalDecision.APPROVED else None
-            )
             cursor = connection.execute(
                 """
                 UPDATE runs SET
@@ -3807,7 +3804,7 @@ class WorkflowLedger:
                     target.value,
                     current.revision + 1,
                     timestamp,
-                    approved_at,
+                    None,
                     expiry,
                     closed_decision.value,
                     closed_source.value,

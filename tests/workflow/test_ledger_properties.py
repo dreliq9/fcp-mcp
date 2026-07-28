@@ -155,21 +155,22 @@ def _create_committed_run(ledger: WorkflowLedger) -> None:
         payload={"expires_at": "2026-07-28T01:02:03Z"},
         projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
     )
-    approved = ledger.record_decision(
+    approved = ledger.record_approval_or_expire(
         RUN_ID,
-        expected_state=WorkflowState.AWAITING_APPROVAL,
         expected_revision=awaiting.run.revision,
-        decision=ApprovalDecision.APPROVED,
-        source=ApprovalSource.CLI,
         operator="editor",
         host="workstation",
         terminal_present=True,
-        binding_sha256=HASH_E,
-        expires_at="2026-07-28T01:02:03Z",
-        approval_summary="Approved",
-        event_type="approval_recorded",
-        event_payload={"binding_sha256": HASH_E},
+        plan_schema_version="1",
     )
+    assert approved.expired is False
+    assert approved.approval is not None
+    assert approved.approval.binding_sha256 == ledger.approval_binding(
+        RUN_ID,
+        plan_schema_version="1",
+    )
+    assert approved.approval.created_at == "2026-07-27T01:02:03Z"
+    assert approved.approval.expires_at == awaiting.run.expires_at
     committing = ledger.transition(
         RUN_ID,
         expected_state=WorkflowState.APPROVED,
@@ -500,21 +501,22 @@ def test_verifier_rejects_valid_to_valid_prepare_projection_mutations(
             projection_patch={"expires_at": "2026-07-28T01:02:03Z"},
         )
         if approved_state:
-            ledger.record_decision(
+            approved = ledger.record_approval_or_expire(
                 RUN_ID,
-                expected_state=WorkflowState.AWAITING_APPROVAL,
                 expected_revision=awaiting.run.revision,
-                decision=ApprovalDecision.APPROVED,
-                source=ApprovalSource.CLI,
                 operator="editor",
                 host="workstation",
                 terminal_present=True,
-                binding_sha256=HASH_E,
-                expires_at="2026-07-28T01:02:03Z",
-                approval_summary="Approved",
-                event_type="approval_recorded",
-                event_payload={"binding_sha256": HASH_E},
+                plan_schema_version="1",
             )
+            assert approved.expired is False
+            assert approved.approval is not None
+            assert approved.approval.binding_sha256 == ledger.approval_binding(
+                RUN_ID,
+                plan_schema_version="1",
+            )
+            assert approved.approval.created_at == "2026-07-27T01:02:03Z"
+            assert approved.approval.expires_at == awaiting.run.expires_at
         assert ledger.verify_integrity(RUN_ID).valid is True
 
         field, value = mutation

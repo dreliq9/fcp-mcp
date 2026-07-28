@@ -27,6 +27,7 @@ from fcp_mcp.workflow.artifacts import (
 )
 from fcp_mcp.workflow.ledger import (
     MIGRATIONS,
+    ApprovalOrExpireResult,
     ApprovalRecord,
     ArtifactMutationResult,
     ArtifactRecord,
@@ -215,23 +216,24 @@ def _approve(
     awaiting: EventMutationResult,
     *,
     run_id: str = RUN_ID,
-    source: ApprovalSource = ApprovalSource.CLI,
-) -> DecisionMutationResult:
-    return ledger.record_decision(
+) -> ApprovalOrExpireResult:
+    result = ledger.record_approval_or_expire(
         run_id,
-        expected_state=WorkflowState.AWAITING_APPROVAL,
         expected_revision=awaiting.run.revision,
-        decision=ApprovalDecision.APPROVED,
-        source=source,
-        operator="editor" if source is ApprovalSource.CLI else None,
-        host="workstation" if source is ApprovalSource.CLI else None,
-        terminal_present=source is ApprovalSource.CLI,
-        binding_sha256=HASH_E,
-        expires_at="2026-07-28T01:02:03Z",
-        approval_summary="Approved",
-        event_type="approval_recorded",
-        event_payload={"binding_sha256": HASH_E},
+        operator="editor",
+        host="workstation",
+        terminal_present=True,
+        plan_schema_version="1",
     )
+    assert result.expired is False
+    assert result.approval is not None
+    assert result.approval.binding_sha256 == ledger.approval_binding(
+        run_id,
+        plan_schema_version="1",
+    )
+    assert result.approval.created_at == result.run.approved_at
+    assert result.approval.expires_at == awaiting.run.expires_at
+    return result
 
 
 @pytest.mark.parametrize(
@@ -335,6 +337,51 @@ def test_record_approval_or_expire_race_has_one_cas_winner(tmp_path: Path):
             if event.event_type in {"approval_recorded", "approval_expired"}
         ]
     ) == 1
+    assert ledger.verify_integrity(RUN_ID).valid
+
+
+@pytest.mark.parametrize(
+    ("clock_offset", "supplied_expiry"),
+    [
+        (timedelta(microseconds=-1), None),
+        (timedelta(0), "2026-07-28T01:02:03Z"),
+    ],
+)
+def test_record_decision_rejects_legacy_approval_api_surface_without_mutation(
+    tmp_path: Path,
+    clock_offset: timedelta,
+    supplied_expiry: str | None,
+) -> None:
+    ledger = _ledger(tmp_path)
+    _create(ledger)
+    awaiting = _complete_prepare(ledger)
+    expiry = datetime.fromisoformat(
+        awaiting.run.expires_at.removesuffix("Z") + "+00:00"
+    )
+    ledger._clock = lambda: expiry + clock_offset
+    events_before = ledger.list_events(RUN_ID, limit=100)
+
+    with pytest.raises(FCPMCPError) as error:
+        ledger.record_decision(
+            RUN_ID,
+            expected_state=WorkflowState.AWAITING_APPROVAL,
+            expected_revision=awaiting.run.revision,
+            decision=ApprovalDecision.APPROVED,
+            source=ApprovalSource.CLI,
+            operator="attacker",
+            host="attacker",
+            terminal_present=True,
+            binding_sha256=HASH_E,
+            expires_at=supplied_expiry,
+            approval_summary="Bypass",
+            event_type="approval_recorded",
+            event_payload={"binding_sha256": HASH_E},
+        )
+
+    _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
+    assert ledger.get_run(RUN_ID) == awaiting.run
+    assert ledger.get_approval(RUN_ID) is None
+    assert ledger.list_events(RUN_ID, limit=100) == events_before
     assert ledger.verify_integrity(RUN_ID).valid
 
 
@@ -1812,35 +1859,38 @@ def test_record_artifact_rolls_back_projection_when_event_insert_fails(
         connection.close()
 
 
-def test_record_decision_is_one_approval_transition_event_transaction(
+def test_record_approval_or_expire_is_one_approval_transition_event_transaction(
     tmp_path: Path,
 ) -> None:
     ledger = _ledger(tmp_path)
     _create(ledger)
     awaiting = _complete_prepare(ledger)
+    decision_at = datetime(2026, 7, 28, 1, 2, 2, 999999, tzinfo=timezone.utc)
+    ledger._clock = lambda: decision_at
 
-    result = ledger.record_decision(
+    result = ledger.record_approval_or_expire(
         RUN_ID,
-        expected_state=WorkflowState.AWAITING_APPROVAL,
         expected_revision=awaiting.run.revision,
-        decision=ApprovalDecision.APPROVED,
-        source=ApprovalSource.CLI,
         operator="editor",
         host="workstation",
         terminal_present=True,
-        binding_sha256=HASH_D,
-        expires_at="2026-07-28T01:02:03Z",
-        approval_summary="Approved in local terminal",
-        event_type="approval_recorded",
-        event_payload={"binding_sha256": HASH_D},
+        plan_schema_version="1",
     )
 
-    assert isinstance(result, DecisionMutationResult)
+    assert isinstance(result, ApprovalOrExpireResult)
+    assert result.expired is False
     assert result.run.state is WorkflowState.APPROVED
     assert result.run.revision == awaiting.run.revision + 1
     assert result.run.approval_decision is ApprovalDecision.APPROVED
+    assert result.approval is not None
     assert result.approval.operator == "editor"
     assert result.approval.terminal_present is True
+    assert result.approval.binding_sha256 == ledger.approval_binding(
+        RUN_ID,
+        plan_schema_version="1",
+    )
+    assert result.approval.created_at == "2026-07-28T01:02:02.999999Z"
+    assert result.approval.expires_at == awaiting.run.expires_at
     assert result.event.sequence == 7
     with pytest.raises(FCPMCPError) as duplicate:
         ledger.record_decision(
@@ -2959,21 +3009,22 @@ def test_restart_read_surface_returns_typed_artifacts_and_approval(
     ledger = _ledger(tmp_path)
     _create(ledger)
     awaiting = _complete_prepare(ledger)
-    decision = ledger.record_decision(
+    decision = ledger.record_approval_or_expire(
         RUN_ID,
-        expected_state=WorkflowState.AWAITING_APPROVAL,
         expected_revision=awaiting.run.revision,
-        decision=ApprovalDecision.APPROVED,
-        source=ApprovalSource.CLI,
         operator="editor",
         host="workstation",
         terminal_present=True,
-        binding_sha256=HASH_E,
-        expires_at="2026-07-28T01:02:03Z",
-        approval_summary="Approved",
-        event_type="approval_recorded",
-        event_payload={"binding_sha256": HASH_E},
+        plan_schema_version="1",
     )
+    assert decision.expired is False
+    assert decision.approval is not None
+    assert decision.approval.binding_sha256 == ledger.approval_binding(
+        RUN_ID,
+        plan_schema_version="1",
+    )
+    assert decision.approval.created_at == decision.run.approved_at
+    assert decision.approval.expires_at == awaiting.run.expires_at
     restarted = WorkflowLedger(
         ledger.paths,
         clock=TickClock(),
@@ -3523,7 +3574,24 @@ def test_decision_source_must_match_run_approval_mode(
     awaiting = _complete_prepare(ledger)
 
     with pytest.raises(FCPMCPError) as error:
-        _approve(ledger, awaiting, source=source)
+        ledger.record_decision(
+            RUN_ID,
+            expected_state=WorkflowState.AWAITING_APPROVAL,
+            expected_revision=awaiting.run.revision,
+            decision=ApprovalDecision.REJECTED,
+            source=source,
+            operator=None,
+            host=None,
+            terminal_present=False,
+            binding_sha256=ledger.approval_binding(
+                RUN_ID,
+                plan_schema_version="1",
+            ),
+            expires_at=awaiting.run.expires_at,
+            approval_summary="Rejected",
+            event_type="approval_rejected",
+            event_payload={},
+        )
 
     _assert_code(error, ErrorCode.WORKFLOW_STATE_CONFLICT)
     assert ledger.get_approval(RUN_ID) is None
@@ -3992,12 +4060,8 @@ def test_integrity_enforces_prepare_approval_commit_and_terminal_invariants(
     tmp_path: Path,
 ) -> None:
     ledger = _ledger(tmp_path)
-    _create(ledger, approval_mode=ApprovalMode.CLIENT)
-    approved = _approve(
-        ledger,
-        _complete_prepare(ledger),
-        source=ApprovalSource.CLIENT,
-    )
+    _create(ledger)
+    approved = _approve(ledger, _complete_prepare(ledger))
     connection = _raw(ledger.paths.database)
     try:
         connection.execute(
@@ -4006,7 +4070,7 @@ def test_integrity_enforces_prepare_approval_commit_and_terminal_invariants(
             "terminal_error_code = ?, terminal_error_summary = ? "
             "WHERE run_id = ?",
             (
-                ApprovalSource.CLI.value,
+                ApprovalSource.CLIENT.value,
                 HASH_A,
                 10,
                 ErrorCode.OPERATION_FAILED.value,
