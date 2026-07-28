@@ -36,10 +36,24 @@ def _load_runtime() -> ModuleType:
     return _runtime
 
 
-def main() -> None:
+def main(profile_override: str | None = None) -> None:
     """Run the MCP server after enforcing the platform boundary."""
     require_macos()
-    _load_runtime().mcp.run()
+    runtime = _load_runtime()
+    if profile_override is None:
+        runtime.mcp.run()
+        return
+
+    from .config import RuntimeConfig
+    from .mcp_boundary import build_mcp_server
+
+    config = RuntimeConfig.from_env(profile_override=profile_override)
+    build_mcp_server(
+        config,
+        runtime.TOOLS,
+        runtime.PROMPTS,
+        runtime.RESOURCES,
+    ).run()
 
 
 def __getattr__(name: str) -> Any:

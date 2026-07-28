@@ -150,6 +150,38 @@ def test_output_probe_failure_is_reported_and_cleaned_up(
     assert list(tmp_path.glob(".fcp-mcp-doctor-*")) == []
 
 
+def test_ledger_check_initializes_missing_database_in_existing_private_state(
+    tmp_path: Path,
+):
+    state_dir = tmp_path / "state"
+    config = RuntimeConfig.from_env(
+        {
+            "FCP_MCP_OUTPUT_DIR": str(tmp_path),
+            "FCP_MCP_STATE_DIR": str(state_dir),
+        },
+        home=tmp_path,
+    )
+    state_dir.mkdir(mode=0o700)
+
+    check = diagnostics.collect_ledger_check(config)
+
+    assert check.id == "workflow_ledger"
+    assert check.status == "pass"
+    assert check.details == {
+        "approval_mode": "client",
+        "state_dir": str(state_dir),
+        "initialized_missing_ledger": True,
+        "integrity_valid": True,
+        "checked_migrations": 1,
+        "checked_runs": 0,
+        "checked_events": 0,
+        "incomplete_count": 0,
+        "recovery_required_count": 0,
+        "counts_truncated": False,
+    }
+    assert state_dir.is_dir()
+
+
 def test_process_probe_timeout_is_not_running(monkeypatch):
     def time_out(*_args, **_kwargs):
         raise subprocess.TimeoutExpired("pgrep", 2)

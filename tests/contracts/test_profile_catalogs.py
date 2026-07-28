@@ -114,7 +114,7 @@ async def test_stdio_profiles_expose_exact_static_catalogs(
         f"catalog={len(tools)} tools/{len(prompts)} prompts/{len(templates)} resources"
         in initialized.instructions
     )
-    assert "approval=cli" in initialized.instructions
+    assert "approval=client" in initialized.instructions
     assert "live_control=disabled" in initialized.instructions
     assert not (tmp_path / "state").exists()
 

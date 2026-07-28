@@ -7653,11 +7653,11 @@ def prompt_cleanup(
         f"{prepare_call}\n\n"
         "The prepare call changes only private workflow evidence; it does not alter "
         "the destination. Review the returned summary, warnings, hashes, and `diff_uri`.\n\n"
-        "For CLI approval mode, show that evidence to the user and run "
-        "`fcp-mcp workflow approve RUN_ID` only after explicit confirmation. Then call "
-        "`fcpxml_workflow_commit` with that exact run ID. Never approve or commit "
-        "automatically. In client approval mode, call `fcpxml_workflow_commit` only "
-        "after the user explicitly approves the reviewed evidence."
+        "Show that evidence and the returned `candidate_sha256` to the user. Only "
+        "after the user explicitly approves that exact candidate, call "
+        "`fcpxml_workflow_commit` with the returned run ID and set "
+        "`expected_candidate_sha256` to that reviewed `candidate_sha256`. Never "
+        "approve or commit automatically."
     )
 
 

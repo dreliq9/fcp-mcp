@@ -252,7 +252,12 @@ class WorkflowRuntime:
             coded.__cause__ = error
             raise coded
 
-    def commit(self, run_id: str) -> WorkflowCommitReceiptV1:
+    def commit(
+        self,
+        run_id: str,
+        *,
+        expected_candidate_sha256: str | None = None,
+    ) -> WorkflowCommitReceiptV1:
         selected = _canonical_run_id(run_id)
         approval = None
         if self.config.workflow_approval is ApprovalMode.CLIENT:
@@ -262,9 +267,19 @@ class WorkflowRuntime:
                     ErrorCode.WORKFLOW_STATE_CONFLICT,
                     "workflow candidate evidence is incomplete",
                 )
+            if expected_candidate_sha256 is None:
+                raise _coded(
+                    ErrorCode.APPROVAL_REQUIRED,
+                    "client commit requires the reviewed candidate hash",
+                )
             approval = self.engine.approve_client(
                 selected,
-                expect_candidate_sha256=run.candidate_sha256,
+                expect_candidate_sha256=expected_candidate_sha256,
+            )
+        elif expected_candidate_sha256 is not None:
+            raise _coded(
+                ErrorCode.WORKFLOW_STATE_CONFLICT,
+                "client candidate hash is not accepted in CLI approval mode",
             )
         return self.engine.commit(selected, client_approval=approval)
 
@@ -359,9 +374,15 @@ def register_workflow_surface(
         result_model=WorkflowCommitReceiptV1,
         description="Commit one exactly approved transactional FCPXML candidate.",
     )
-    def workflow_commit(run_id: str) -> ToolOutcome[WorkflowCommitReceiptV1]:
+    def workflow_commit(
+        run_id: str,
+        expected_candidate_sha256: str | None = None,
+    ) -> ToolOutcome[WorkflowCommitReceiptV1]:
         selected = _canonical_run_id(run_id)
-        receipt = runtime().commit(selected)
+        receipt = runtime().commit(
+            selected,
+            expected_candidate_sha256=expected_candidate_sha256,
+        )
         return _outcome(
             f"Committed workflow {receipt.run_id}: output "
             f"{receipt.output_sha256}.",

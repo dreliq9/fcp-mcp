@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 from pathlib import Path
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.mcp_boundary import build_mcp_server
@@ -15,7 +17,7 @@ from fcp_mcp.workflow.models import (
     WorkflowPreviewV1,
     WorkflowStatusV1,
 )
-from fcp_mcp.workflow.surface import register_workflow_surface
+from fcp_mcp.workflow.surface import WorkflowRuntime, register_workflow_surface
 
 SOURCE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <fcpxml version="1.11">
@@ -70,14 +72,17 @@ EXPECTED_RESOURCE_TEMPLATES = {
 }
 
 
-def _config(tmp_path: Path) -> RuntimeConfig:
+def _config(
+    tmp_path: Path,
+    approval_mode: str = "client",
+) -> RuntimeConfig:
     return RuntimeConfig.from_env(
         {
             "FCP_MCP_OUTPUT_DIR": str(tmp_path),
             "FCP_MCP_ALLOWED_ROOTS": str(tmp_path),
             "FCP_MCP_STATE_DIR": str(tmp_path / "state"),
             "FCP_MCP_PROFILE": "workflow",
-            "FCP_MCP_WORKFLOW_APPROVAL": "client",
+            "FCP_MCP_WORKFLOW_APPROVAL": approval_mode,
             "FCP_MCP_WORKFLOW_MAX_SOURCE_BYTES": str(1024 * 1024),
             "FCP_MCP_WORKFLOW_MAX_ARTIFACT_BYTES": str(4 * 1024 * 1024),
             "FCP_MCP_WORKFLOW_MAX_DIFF_BYTES": str(200 * 1024),
@@ -87,8 +92,8 @@ def _config(tmp_path: Path) -> RuntimeConfig:
     )
 
 
-def _server(tmp_path: Path):
-    config = _config(tmp_path)
+def _server(tmp_path: Path, approval_mode: str = "client"):
+    config = _config(tmp_path, approval_mode)
     tools = ToolRegistry()
     resources = ResourceRegistry()
     register_workflow_surface(config, tools, resources)
@@ -225,7 +230,13 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
     assert status_after_resources.structuredContent["revision"] == revision
 
     committed = asyncio.run(
-        server.call_tool("fcpxml_workflow_commit", {"run_id": preview.run_id})
+        server.call_tool(
+            "fcpxml_workflow_commit",
+            {
+                "run_id": preview.run_id,
+                "expected_candidate_sha256": preview.candidate_sha256,
+            },
+        )
     )
     receipt = WorkflowCommitReceiptV1.model_validate_json(
         json.dumps(committed.structuredContent)
@@ -256,3 +267,87 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
     assert cancel_result.reason == "No longer needed"
     assert len(cancelled.content[0].text) <= 4096
     assert not cancelled_destination.exists()
+
+
+def test_cli_mode_rejects_client_hash_but_consumes_existing_durable_approval(
+    tmp_path: Path,
+):
+    server, config, _ = _server(tmp_path, "cli")
+    source = tmp_path / "source.fcpxml"
+    destination = tmp_path / "destination.fcpxml"
+    source.write_text(SOURCE_XML)
+    prepared = asyncio.run(
+        server.call_tool(
+            "fcpxml_workflow_prepare",
+            _prepare_arguments(source, destination, "cli-mode"),
+        )
+    )
+    run_id = prepared.structuredContent["run_id"]
+    candidate_sha256 = prepared.structuredContent["candidate_sha256"]
+    runtime = WorkflowRuntime(config)
+    runtime.engine.approve_cli(
+        run_id,
+        input_stream=io.StringIO(),
+        output_stream=io.StringIO(),
+        yes=True,
+        expect_candidate_sha256=candidate_sha256,
+    )
+
+    with pytest.raises(ToolError, match="workflow_state_conflict"):
+        asyncio.run(
+            server.call_tool(
+                "fcpxml_workflow_commit",
+                {
+                    "run_id": run_id,
+                    "expected_candidate_sha256": candidate_sha256,
+                },
+            )
+        )
+
+    assert runtime.status(run_id).state.value == "approved"
+    assert not destination.exists()
+
+    committed = asyncio.run(
+        server.call_tool("fcpxml_workflow_commit", {"run_id": run_id})
+    )
+    assert committed.structuredContent["approval_source"] == "cli"
+    assert destination.exists()
+
+
+@pytest.mark.parametrize(
+    ("commit_arguments", "error_code"),
+    [
+        ({}, "approval_required"),
+        ({"expected_candidate_sha256": "0" * 64}, "workflow_stale"),
+    ],
+)
+def test_client_commit_rejects_missing_or_stale_candidate_hash_without_mutation(
+    tmp_path: Path,
+    commit_arguments: dict[str, str],
+    error_code: str,
+):
+    server, _, _ = _server(tmp_path)
+    source = tmp_path / "source.fcpxml"
+    destination = tmp_path / "destination.fcpxml"
+    source.write_text(SOURCE_XML)
+    prepared = asyncio.run(
+        server.call_tool(
+            "fcpxml_workflow_prepare",
+            _prepare_arguments(source, destination, f"reject-{error_code}"),
+        )
+    )
+    run_id = prepared.structuredContent["run_id"]
+
+    with pytest.raises(ToolError, match=error_code):
+        asyncio.run(
+            server.call_tool(
+                "fcpxml_workflow_commit",
+                {"run_id": run_id, **commit_arguments},
+            )
+        )
+
+    status = asyncio.run(
+        server.call_tool("fcpxml_workflow_status", {"run_id": run_id})
+    )
+    assert status.structuredContent["state"] == "awaiting_approval"
+    assert not destination.exists()

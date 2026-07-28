@@ -245,8 +245,83 @@ def _compressor_check() -> DoctorCheck:
     )
 
 
+def collect_ledger_check(config: RuntimeConfig) -> DoctorCheck:
+    from fcp_mcp.workflow.artifacts import StatePaths
+    from fcp_mcp.workflow.models import WorkflowState
+    from fcp_mcp.workflow.surface import WorkflowRuntime
+
+    initialized_missing_ledger = not StatePaths.from_config(config).database.exists()
+    try:
+        runtime = WorkflowRuntime(config)
+        integrity = runtime.ledger.verify_integrity()
+        count_limit = 1000
+        incomplete = 0
+        counts_truncated = False
+        for state in (
+            WorkflowState.PREPARING,
+            WorkflowState.AWAITING_APPROVAL,
+            WorkflowState.APPROVED,
+            WorkflowState.COMMITTING,
+        ):
+            runs = runtime.ledger.list_runs(limit=count_limit, state=state)
+            incomplete += len(runs)
+            counts_truncated = counts_truncated or len(runs) == count_limit
+        recovery_required = runtime.ledger.list_runs(
+            limit=count_limit,
+            state=WorkflowState.RECOVERY_REQUIRED,
+        )
+        counts_truncated = (
+            counts_truncated or len(recovery_required) == count_limit
+        )
+    except FCPMCPError as error:
+        return DoctorCheck(
+            id="workflow_ledger",
+            status="fail",
+            summary="Workflow ledger health could not be established",
+            details={
+                "approval_mode": config.workflow_approval.value,
+                "state_dir": str(config.state_dir),
+                "initialized_missing_ledger": initialized_missing_ledger,
+                "error": str(error),
+            },
+            remediation="Repair the state path or restore a verified ledger backup",
+        )
+
+    return DoctorCheck(
+        id="workflow_ledger",
+        status="pass" if integrity.valid else "fail",
+        summary=(
+            "Workflow ledger passed integrity checks"
+            if integrity.valid
+            else "Workflow ledger has integrity findings"
+        ),
+        details={
+            "approval_mode": config.workflow_approval.value,
+            "state_dir": str(config.state_dir),
+            "initialized_missing_ledger": initialized_missing_ledger,
+            "integrity_valid": integrity.valid,
+            "checked_migrations": integrity.checked_migrations,
+            "checked_runs": integrity.checked_runs,
+            "checked_events": integrity.checked_events,
+            "incomplete_count": incomplete,
+            "recovery_required_count": len(recovery_required),
+            "counts_truncated": counts_truncated,
+        },
+        remediation=(
+            None
+            if integrity.valid
+            else "Inspect the bounded integrity findings before using workflows"
+        ),
+    )
+
+
 def _status(checks: list[DoctorCheck]) -> str:
-    required = {"configuration", "output_writable", "mcp_catalog"}
+    required = {
+        "configuration",
+        "output_writable",
+        "mcp_catalog",
+        "workflow_ledger",
+    }
     if any(check.id in required and check.status == "fail" for check in checks):
         return "blocked"
     if any(check.status in {"warn", "fail"} for check in checks):
@@ -281,8 +356,11 @@ async def collect_doctor(
     *,
     expected_tool_names: Collection[str] | None = None,
     expected_prompt_names: Collection[str] | None = None,
+    ledger_check: DoctorCheck | None = None,
 ) -> DoctorReport:
     checks = [_configuration_check(config), _output_check(config)]
+    if ledger_check is not None:
+        checks.append(ledger_check)
     tool_count = 0
     prompt_count = 0
     tool_names: list[str] = []

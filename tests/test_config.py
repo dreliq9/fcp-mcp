@@ -44,7 +44,7 @@ def test_invalid_log_format_fails(tmp_path: Path):
 def test_workflow_defaults_are_exact(tmp_path: Path):
     config = RuntimeConfig.from_env({}, home=tmp_path)
     assert config.profile.value == "workflow"
-    assert config.workflow_approval.value == "cli"
+    assert config.workflow_approval.value == "client"
     assert config.approval_ttl_seconds == 86400
     assert config.max_operations == 100
     assert config.max_source_bytes == 134217728

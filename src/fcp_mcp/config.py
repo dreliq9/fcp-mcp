@@ -122,7 +122,7 @@ class RuntimeConfig:
         profile = _enum_value(Profile, profile_value, "FCP_MCP_PROFILE")
         workflow_approval = _enum_value(
             ApprovalMode,
-            values.get("FCP_MCP_WORKFLOW_APPROVAL", ApprovalMode.CLI.value),
+            values.get("FCP_MCP_WORKFLOW_APPROVAL", ApprovalMode.CLIENT.value),
             "FCP_MCP_WORKFLOW_APPROVAL",
         )
         state_raw = values.get("FCP_MCP_STATE_DIR")

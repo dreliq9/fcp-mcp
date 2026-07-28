@@ -122,8 +122,9 @@ def test_cleanup_prepares_one_transaction_with_exact_operations():
             },
         )
     ]
-    assert "fcp-mcp workflow approve" in body
     assert "fcpxml_workflow_commit" in body
+    assert "expected_candidate_sha256" in body
+    assert "candidate_sha256" in body
     assert "replace" in body.lower()
 
 
