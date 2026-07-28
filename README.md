@@ -6,11 +6,16 @@
 covering FCPXML editing, opt-in live FCP control, parametric puppets,
 media analysis, transactional edit approval, and runtime diagnostics.
 
+> **v0.3 release candidate:** The transactional workflow release is available
+> on the `codex/v0.3-transactional-workflows` branch. It has completed the
+> [local release review](docs/reviews/v0.3.0-release-review.md), but is not yet
+> tagged or published to PyPI or the MCP Registry.
+
 ```
-You: "Open the library, find flash frames in the hero timeline, fix them, and bounce to ProRes."
-Claude → fcp_open_library → fcpxml_detect_flash_frames → fcpxml_fix_flash_frames
-       → fcp_import_xml → fcp_share → compressor_encode
-Result: validated FCPXML plus an explicitly authorized live export path
+You: "Find and repair flash frames in hero.fcpxml."
+Claude → fcpxml_detect_flash_frames → fcpxml_workflow_prepare
+       → review semantic diff + candidate hash → fcpxml_workflow_commit
+Result: the reviewed candidate is atomically committed with durable evidence
 ```
 
 Where many integrations stop at one layer, fcp-mcp covers the local
@@ -22,6 +27,31 @@ editing stack:
 - **Parametric puppets** — character animation presets in FCPXML — 7 tools
 - **Compressor** — dispatch encodes to Apple Compressor — 2 tools
 - **Runtime diagnostics** — structured offline/live readiness — 1 tool
+
+## v0.3 Release Candidate
+
+v0.3 changes the default AI-piloting contract from direct mutation to a
+bounded, durable workflow:
+
+1. `fcpxml_workflow_prepare` creates and validates a private candidate.
+2. The client reviews the semantic diff and exact candidate SHA-256.
+3. `fcpxml_workflow_commit` accepts only that hash and atomically publishes the
+   approved result.
+4. Durable status, events, cancellation, and reconciliation evidence remain
+   available after the client session ends.
+
+Direct offline mutators remain available through the `edit` and `full`
+profiles. Live Final Cut Pro and Compressor actions require the `full` profile
+and the separate `FCP_MCP_ENABLE_LIVE_CONTROL=1` opt-in.
+
+Current documentation and evidence:
+
+- [Documentation index](docs/README.md)
+- [Agent operating guide](LLM_GUIDE.md)
+- [Production workflow recipes](WORKFLOWS.md)
+- [v0.3 changelog](CHANGELOG.md)
+- [Release-candidate research](docs/research/2026-07-28-v0.3-release-candidate.md)
+- [Local release review](docs/reviews/v0.3.0-release-review.md)
 
 ## Catalog Profiles
 
@@ -101,6 +131,10 @@ fcp-mcp/
 │       └── paths.py             # trusted system path helpers
 ├── tests/                       # complete unit + contract suite
 ├── scripts/                     # docs, coverage, and wheel gates
+├── docs/
+│   ├── README.md                # documentation map and status
+│   ├── research/                # dated research records
+│   └── reviews/                 # release evidence and decisions
 ├── examples/
 │   ├── quickstart.py            # install verification
 │   └── GALLERY.md               # workflow gallery with prompts
@@ -127,8 +161,17 @@ fcp-mcp/
 
 ### Install
 
+Install the current published release from PyPI:
+
 ```bash
 pipx install fcp-mcp
+```
+
+Until v0.3 is tagged and published, install its reviewed candidate directly
+from the GitHub branch:
+
+```bash
+pipx install "git+https://github.com/dreliq9/fcp-mcp.git@codex/v0.3-transactional-workflows"
 ```
 
 Or from source (for contributors):
@@ -366,12 +409,14 @@ Claude Code / Claude Desktop / any MCP client
         │
         │  stdio (JSON-RPC)
         ▼
-   fcp-mcp server (fcp_mcp/server.py, FastMCP)
+   fcp-mcp server (fcp_mcp/server.py, MCP SDK v2)
         │
         ├── fcpxml/parser + writer + models ← rational-arithmetic, defusedxml-hardened
         ├── fcpxml/analysis + validator     ← QC, pacing, flash frames, gaps
         ├── fcpxml/generator + puppet       ← programmatic timeline construction
         ├── fcpxml/diff                     ← A/B timeline comparison
+        ├── workflow/                       ← prepare, verify, approve, commit, recover
+        ├── private workflow ledger         ← candidates, events, hashes, reconciliation
         ├── fcp_control/ (AppleScript)      ← live FCP when available
         ├── media/ffprobe                   ← clip info, loudness, scenes, frames
         └── Compressor (CLI dispatch)       ← automated encodes
