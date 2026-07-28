@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import fnmatch
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,9 +33,17 @@ ARCHITECTURE_GATE = "python scripts/check_macos_only.py"
 DOWNLOAD_ACTION = (
     "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
 )
+UPLOAD_ACTION = (
+    "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
+)
+CHECKOUT_ACTION = "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd"
+SETUP_PYTHON_ACTION = (
+    "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405"
+)
 PUBLISH_ACTION = (
     "pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e"
 )
+RELEASE_ARTIFACT = "fcp-mcp-v0.2.1-release-dist"
 MACOS_CLASSIFIER = "Operating System :: MacOS :: MacOS X"
 
 
@@ -95,7 +105,9 @@ def _load_yaml(path: Path, root: Path, findings: list[str]) -> dict[str, Any] | 
     if text is None:
         return None
     try:
-        loaded = YAML(typ="safe").load(text)
+        yaml = YAML(typ="safe")
+        yaml.version = (1, 2)
+        loaded = yaml.load(text)
     except YAMLError:
         findings.append(f"{_relative(path, root)}: invalid YAML")
         return None
@@ -118,10 +130,47 @@ def _jobs(
 def _has_architecture_gate(job: Any) -> bool:
     if not isinstance(job, dict) or not isinstance(job.get("steps"), list):
         return False
-    return any(
-        isinstance(step, dict) and step.get("run") == ARCHITECTURE_GATE
+    expected = {
+        "name": "Enforce macOS-only architecture",
+        "run": ARCHITECTURE_GATE,
+    }
+    invocations = [
+        step
         for step in job["steps"]
-    )
+        if isinstance(step, dict) and step.get("run") == ARCHITECTURE_GATE
+    ]
+    return invocations == [expected]
+
+
+def _check_gate_job(
+    job: Any, relative: str, job_name: str, findings: list[str]
+) -> None:
+    if isinstance(job, dict) and ({"if", "continue-on-error"} & set(job)):
+        findings.append(f"{relative}: {job_name} job can mask architecture gate failure")
+    if not _has_architecture_gate(job):
+        findings.append(
+            f"{relative}: {job_name} job does not run an unconditional architecture gate"
+        )
+
+
+def _check_workflow_inventory(root: Path, findings: list[str]) -> None:
+    directory = root / ".github" / "workflows"
+    if not directory.is_dir() or directory.is_symlink():
+        findings.append(
+            ".github/workflows: required workflow directory is missing or unsafe"
+        )
+        return
+    expected = {"ci.yml", "publish.yml"}
+    try:
+        entries = sorted(directory.iterdir(), key=lambda path: path.name)
+    except OSError:
+        findings.append(".github/workflows: cannot enumerate workflow directory")
+        return
+    for path in entries:
+        if path.suffix not in {".yml", ".yaml"}:
+            continue
+        if path.name not in expected:
+            findings.append(f"{_relative(path, root)}: unexpected workflow file")
 
 
 def _check_ci(root: Path, findings: list[str]) -> None:
@@ -139,9 +188,12 @@ def _check_ci(root: Path, findings: list[str]) -> None:
             )
     if "quality" not in jobs:
         findings.append(".github/workflows/ci.yml: quality job is missing")
-    elif not _has_architecture_gate(jobs["quality"]):
-        findings.append(
-            ".github/workflows/ci.yml: quality job does not run architecture gate"
+    else:
+        _check_gate_job(
+            jobs["quality"],
+            ".github/workflows/ci.yml",
+            "quality",
+            findings,
         )
 
 
@@ -190,9 +242,7 @@ def _check_publish_job(job: Any, findings: list[str]) -> None:
         if (
             not isinstance(inputs, dict)
             or set(inputs) != {"name", "path"}
-            or not isinstance(inputs.get("name"), str)
-            or not inputs["name"]
-            or "${{" in inputs["name"]
+            or inputs.get("name") != RELEASE_ARTIFACT
             or inputs.get("path") != "dist/"
         ):
             findings.append(f"{prefix} artifact download inputs are not isolated")
@@ -207,11 +257,53 @@ def _check_publish_job(job: Any, findings: list[str]) -> None:
             findings.append(f"{prefix} step 2 is not the pinned PyPA publisher")
 
 
+def _check_verify_producer(verify: Any, findings: list[str]) -> None:
+    prefix = ".github/workflows/publish.yml: verify"
+    if not isinstance(verify, dict) or not isinstance(verify.get("steps"), list):
+        findings.append(f"{prefix} job lacks exact verified artifact upload")
+        return
+    steps = verify["steps"]
+    producers = [
+        step
+        for step in steps
+        if isinstance(step, dict)
+        and isinstance(step.get("uses"), str)
+        and step["uses"].startswith("actions/upload-artifact@")
+    ]
+    if len(producers) != 1:
+        findings.append(f"{prefix} job must contain exactly one artifact producer")
+    expected = {
+        "name": "Upload verified distributions",
+        "uses": UPLOAD_ACTION,
+        "with": {
+            "name": RELEASE_ARTIFACT,
+            "path": "dist/",
+            "if-no-files-found": "error",
+            "retention-days": 1,
+        },
+    }
+    allowed_actions = {CHECKOUT_ACTION, SETUP_PYTHON_ACTION, UPLOAD_ACTION}
+    if any(
+        isinstance(step, dict)
+        and "uses" in step
+        and step.get("uses") not in allowed_actions
+        for step in steps
+    ):
+        findings.append(f"{prefix} job contains unreviewed action")
+    if not steps or steps[-1] != expected:
+        findings.append(f"{prefix} job lacks exact verified artifact upload")
+
+
 def _check_publish(root: Path, findings: list[str]) -> None:
     path = root / ".github" / "workflows" / "publish.yml"
     workflow = _load_yaml(path, root, findings)
     if workflow is None:
         return
+    expected_trigger = {"push": {"tags": ["v*"]}}
+    if workflow.get("on") != expected_trigger:
+        findings.append(
+            ".github/workflows/publish.yml: release trigger is not exact tag-only v*"
+        )
     permissions = workflow.get("permissions")
     if isinstance(permissions, dict) and permissions.get("id-token") == "write":
         findings.append(
@@ -220,16 +312,24 @@ def _check_publish(root: Path, findings: list[str]) -> None:
     jobs = _jobs(workflow, ".github/workflows/publish.yml", findings)
     if jobs is None:
         return
+    if set(jobs) != {"verify", "publish"}:
+        findings.append(
+            ".github/workflows/publish.yml: publish workflow jobs are not exactly verify and publish"
+        )
 
     verify = jobs.get("verify")
     if not isinstance(verify, dict) or verify.get("runs-on") != MACOS_RUNNER:
         findings.append(".github/workflows/publish.yml: tagged verify job is not macOS")
     if verify is None:
         findings.append(".github/workflows/publish.yml: verify job is missing")
-    elif not _has_architecture_gate(verify):
-        findings.append(
-            ".github/workflows/publish.yml: verify job does not run architecture gate"
+    else:
+        _check_gate_job(
+            verify,
+            ".github/workflows/publish.yml",
+            "verify",
+            findings,
         )
+        _check_verify_producer(verify, findings)
 
     for job_name, job in jobs.items():
         if job_name == "publish":
@@ -308,11 +408,63 @@ def _check_support_surfaces(root: Path, findings: list[str]) -> None:
     manifest_path = root / "MANIFEST.in"
     manifest = _read_text(manifest_path, root, findings)
     if manifest is not None:
-        required = ("README.md", "ROADMAP.md", "WORKFLOWS.md", "server.json", "examples", "docs", "scripts")
-        for marker in required:
-            if marker not in manifest:
-                findings.append(f"MANIFEST.in: manifest lacks {marker}")
-        if "smithery.yaml" in manifest:
+        included_files: set[str] = set()
+        excluded_files: set[str] = set()
+        recursive_trees: dict[str, set[str]] = {}
+        recursive_excludes: dict[str, set[str]] = {}
+        pruned_trees: set[str] = set()
+        global_excludes: set[str] = set()
+        manifest_tokens: list[str] = []
+        for line in manifest.splitlines():
+            try:
+                tokens = shlex.split(line, comments=True, posix=True)
+            except ValueError:
+                findings.append("MANIFEST.in: invalid manifest directive")
+                continue
+            if not tokens:
+                continue
+            manifest_tokens.extend(tokens)
+            if tokens[0] == "include":
+                included_files.update(tokens[1:])
+            elif tokens[0] == "exclude":
+                excluded_files.update(tokens[1:])
+            elif tokens[0] == "recursive-include" and len(tokens) >= 3:
+                recursive_trees.setdefault(tokens[1], set()).update(tokens[2:])
+            elif tokens[0] == "recursive-exclude" and len(tokens) >= 3:
+                recursive_excludes.setdefault(tokens[1], set()).update(tokens[2:])
+            elif tokens[0] == "prune":
+                pruned_trees.update(tokens[1:])
+            elif tokens[0] == "global-exclude":
+                global_excludes.update(tokens[1:])
+
+        for required_file in ("README.md", "ROADMAP.md", "WORKFLOWS.md", "server.json"):
+            globally_excluded = any(
+                fnmatch.fnmatch(required_file, pattern) for pattern in global_excludes
+            )
+            if (
+                required_file not in included_files
+                or required_file in excluded_files
+                or globally_excluded
+            ):
+                findings.append(f"MANIFEST.in: manifest lacks {required_file}")
+        required_tree_patterns = {
+            "examples": {"*.py", "*.md"},
+            "docs": {"*.md"},
+            "scripts": {"*.py"},
+        }
+        for required_tree, required_patterns in required_tree_patterns.items():
+            included_patterns = recursive_trees.get(required_tree, set())
+            excluded_patterns = recursive_excludes.get(required_tree, set())
+            if (
+                required_tree in pruned_trees
+                or not required_patterns <= included_patterns
+                or bool(required_patterns & excluded_patterns)
+                or bool(required_patterns & global_excludes)
+            ):
+                findings.append(
+                    f"MANIFEST.in: manifest lacks recursive tree {required_tree}"
+                )
+        if "smithery.yaml" in manifest_tokens:
             findings.append("MANIFEST.in: manifest names smithery.yaml")
 
     smithery = root / "smithery.yaml"
@@ -332,6 +484,7 @@ def check(root: Path) -> list[str]:
 
     findings: list[str] = []
     _scan_source(resolved_root, findings)
+    _check_workflow_inventory(resolved_root, findings)
     _check_ci(resolved_root, findings)
     _check_publish(resolved_root, findings)
     _check_support_surfaces(resolved_root, findings)
