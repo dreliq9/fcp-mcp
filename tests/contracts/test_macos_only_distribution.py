@@ -103,7 +103,7 @@ def test_workflow_parser_contract_rejects_subprocess_import(import_statement: st
 def test_runtime_self_compatibility_dependency_is_direct_and_bounded():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
 
-    assert "typing_extensions>=4.5,<5" in project["project"]["dependencies"]
+    assert "typing_extensions>=4.13,<5" in project["project"]["dependencies"]
 
 
 def _load_workflow(relative: str) -> dict[str, object]:

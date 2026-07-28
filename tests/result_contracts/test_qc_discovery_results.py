@@ -339,13 +339,13 @@ async def test_qc_and_discovery_tools_publish_typed_dual_channel_results(
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
     arguments, expected_text = qc_discovery_cases[tool_name]
 
-    assert set(tools[tool_name].outputSchema["properties"]) != {"result"}
+    assert set(tools[tool_name].output_schema["properties"]) != {"result"}
     result = await server.mcp.call_tool(tool_name, arguments)
 
-    assert result.isError is False
+    assert result.is_error is False
     if expected_text is None:
         assert result.content[0].text == json.dumps(
-            result.structuredContent,
+            result.structured_content,
             indent=2,
         )
     else:
@@ -358,7 +358,7 @@ async def test_qc_and_discovery_tools_publish_typed_dual_channel_results(
         expected_model = getattr(result_models, model_name)
         assert expected_model.model_config["frozen"] is True
         assert expected_model.model_config["extra"] == "forbid"
-    model = expected_model.model_validate(result.structuredContent)
+    model = expected_model.model_validate(result.structured_content)
     assert model.schema_version == "1"
     assert_payload(model)
 
@@ -381,13 +381,13 @@ async def test_metadata_checks_keep_empty_observations_honest(
     )
 
     assert audio.content[0].text == "No audio issues detected."
-    assert audio.structuredContent["observations"] == []
-    assert audio.structuredContent["verified"] is False
-    assert audio.structuredContent["limitations"]
+    assert audio.structured_content["observations"] == []
+    assert audio.structured_content["verified"] is False
+    assert audio.structured_content["limitations"]
     assert safe_zones.content[0].text == "All clips within safe zones."
-    assert safe_zones.structuredContent["observations"] == []
-    assert safe_zones.structuredContent["verified"] is False
-    assert safe_zones.structuredContent["limitations"]
+    assert safe_zones.structured_content["observations"] == []
+    assert safe_zones.structured_content["verified"] is False
+    assert safe_zones.structured_content["limitations"]
 
 
 @pytest.mark.asyncio
@@ -422,7 +422,7 @@ async def test_frame_rate_mismatches_use_the_referenced_sequence_format(
     assert result.content[0].text == (
         "MIXED FRAME RATES DETECTED: 24.00fps, 30.00fps"
     )
-    assert result.structuredContent["mismatches"] == [
+    assert result.structured_content["mismatches"] == [
         {
             "format_id": "r24",
             "expected_fps": 30.0,

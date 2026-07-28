@@ -8,9 +8,11 @@ import json
 import logging
 from typing import Annotated, Any, get_type_hints
 
-from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from mcp import MCPError
+from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import INTERNAL_ERROR, INVALID_PARAMS, CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, ValidationError
 
 from .config import RuntimeConfig
@@ -28,16 +30,17 @@ class _ResultValidationError(RuntimeError):
     """Marks invalid handler output as an internal implementation defect."""
 
 
-class FCPFastMCP(FastMCP):
-    """FastMCP boundary that preserves domain codes and sanitizes defects."""
+class FCPFastMCP(MCPServer):
+    """MCPServer boundary that preserves domain codes and sanitizes defects."""
 
     async def call_tool(
         self,
         name: str,
         arguments: dict[str, Any],
+        context: Context[Any, Any] | None = None,
     ) -> Any:
         try:
-            return await super().call_tool(name, arguments)
+            return await super().call_tool(name, arguments, context)
         except ToolError as error:
             cause = error.__cause__
             if isinstance(cause, FCPMCPError):
@@ -60,10 +63,10 @@ class FCPFastMCP(FastMCP):
 
 def _tool_annotations(hints: SafetyHints) -> ToolAnnotations:
     return ToolAnnotations(
-        readOnlyHint=hints.read_only,
-        destructiveHint=hints.destructive,
-        idempotentHint=hints.idempotent,
-        openWorldHint=hints.open_world,
+        read_only_hint=hints.read_only,
+        destructive_hint=hints.destructive,
+        idempotent_hint=hints.idempotent,
+        open_world_hint=hints.open_world,
     )
 
 
@@ -110,7 +113,7 @@ def _invoker(definition: ToolDefinition, config: RuntimeConfig):
             outcome = coerce_outcome(returned, definition.result_model)
             return CallToolResult(
                 content=[TextContent(type="text", text=outcome.text)],
-                structuredContent=outcome.structured.model_dump(mode="json"),
+                structured_content=outcome.structured.model_dump(mode="json"),
             )
         except ValidationError as error:
             raise _ResultValidationError(
@@ -138,6 +141,47 @@ def _invoker(definition: ToolDefinition, config: RuntimeConfig):
         return_annotation=Annotated[CallToolResult, definition.result_model]
     )
     return invoke
+
+
+def _raise_resource_error(error: FCPMCPError) -> None:
+    code = (
+        INVALID_PARAMS
+        if error.code
+        in {
+            ErrorCode.INVALID_ARGUMENTS,
+            ErrorCode.TARGET_NOT_FOUND,
+        }
+        else INTERNAL_ERROR
+    )
+    raise MCPError(
+        code=code,
+        message=str(error),
+        data=error.details or None,
+    ) from error
+
+
+def _resource_invoker(handler):
+    """Keep coded failures intact without changing v2's threading behavior."""
+
+    if inspect.iscoroutinefunction(handler):
+
+        @functools.wraps(handler)
+        async def async_invoke(**arguments):
+            try:
+                return await handler(**arguments)
+            except FCPMCPError as error:
+                _raise_resource_error(error)
+
+        return async_invoke
+
+    @functools.wraps(handler)
+    def sync_invoke(**arguments):
+        try:
+            return handler(**arguments)
+        except FCPMCPError as error:
+            _raise_resource_error(error)
+
+    return sync_invoke
 
 
 def _legacy_output_schema(name: str) -> dict[str, Any]:
@@ -181,6 +225,7 @@ def build_mcp_server(
 
     server = FCPFastMCP(
         "fcp-mcp",
+        version=package_version(),
         instructions=(
             f"fcp-mcp {package_version()}; profile={config.profile.value}; "
             f"catalog={len(visible_tools)} tools/{len(visible_prompts)} prompts/"
@@ -222,7 +267,7 @@ def build_mcp_server(
             name=definition.name,
             description=definition.description,
             mime_type=definition.mime_type,
-        )(definition.handler)
+        )(_resource_invoker(definition.handler))
     return server
 
 

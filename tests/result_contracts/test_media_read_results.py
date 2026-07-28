@@ -490,15 +490,15 @@ async def test_media_reads_publish_typed_dual_channel_results(
         arguments["path"] = str(source)
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
 
-    assert set(tools[tool_name].outputSchema["properties"]) != {"result"}
+    assert set(tools[tool_name].output_schema["properties"]) != {"result"}
     result = await server.mcp.call_tool(tool_name, arguments)
 
-    assert result.isError is False
+    assert result.is_error is False
     assert result.content[0].text == legacy_text
     module_name = "puppet" if tool_name == "puppet_list_presets" else "media"
     result_models = importlib.import_module(f"fcp_mcp.result_models.{module_name}")
     expected_model = getattr(result_models, model_name)
-    model = expected_model.model_validate(result.structuredContent)
+    model = expected_model.model_validate(result.structured_content)
     assert model.schema_version == "1"
     assert_payload(model)
 
@@ -511,13 +511,13 @@ async def test_media_info_and_stream_list_publish_real_discriminated_unions(
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
 
     for tool_name in ("media_info", "media_list_streams"):
-        schema = tools[tool_name].outputSchema
+        schema = tools[tool_name].output_schema
         stream_items = schema["properties"]["streams"]["items"]
         assert stream_items["discriminator"]["propertyName"] == "codec_type"
         assert len(stream_items["oneOf"]) == 4
         result = await server.mcp.call_tool(tool_name, {"path": str(source)})
         assert [
-            stream["codec_type"] for stream in result.structuredContent["streams"]
+            stream["codec_type"] for stream in result.structured_content["streams"]
         ] == ["video", "audio", "subtitle"]
 
 
@@ -538,7 +538,7 @@ async def test_silence_empty_result_keeps_threshold_context(
     )
 
     assert result.content[0].text == "No silent sections detected."
-    assert result.structuredContent == {
+    assert result.structured_content == {
         "schema_version": "1",
         "noise_threshold": "-42dB",
         "minimum_duration_seconds": 1.25,
@@ -590,20 +590,20 @@ async def test_media_info_bounds_raw_values_when_numbers_do_not_normalize(
     }
   ]
 }"""
-    assert result.structuredContent["duration_seconds"] is None
-    assert result.structuredContent["size_mb"] is None
-    assert result.structuredContent["bitrate_kbps"] is None
-    assert result.structuredContent["raw_summary"] == (
+    assert result.structured_content["duration_seconds"] is None
+    assert result.structured_content["size_mb"] is None
+    assert result.structured_content["bitrate_kbps"] is None
+    assert result.structured_content["raw_summary"] == (
         "duration: N/A\nsize: unknown\nbit_rate: -"
     )
-    stream = result.structuredContent["streams"][0]
+    stream = result.structured_content["streams"][0]
     assert stream["duration_seconds"] is None
     assert stream["bitrate_kbps"] is None
     assert stream["frame_rate"] is None
     assert stream["raw_summary"] == (
         "duration: N/A\nbit_rate: unknown\nr_frame_rate: 0/0"
     )
-    assert len(result.structuredContent["raw_summary"]) <= 2000
+    assert len(result.structured_content["raw_summary"]) <= 2000
     assert len(stream["raw_summary"]) <= 2000
 
 
@@ -652,13 +652,13 @@ async def test_nonfinite_media_numbers_never_reach_structured_content(
     }
   ]
 }"""
-    assert result.structuredContent["duration_seconds"] is None
-    assert result.structuredContent["size_mb"] is None
-    assert result.structuredContent["bitrate_kbps"] is None
-    assert result.structuredContent["raw_summary"] == (
+    assert result.structured_content["duration_seconds"] is None
+    assert result.structured_content["size_mb"] is None
+    assert result.structured_content["bitrate_kbps"] is None
+    assert result.structured_content["raw_summary"] == (
         "duration: NaN\nsize: +inf\nbit_rate: -inf"
     )
-    stream = result.structuredContent["streams"][0]
+    stream = result.structured_content["streams"][0]
     assert stream["index"] == 27
     assert stream["duration_seconds"] is None
     assert stream["bitrate_kbps"] is None
@@ -666,7 +666,7 @@ async def test_nonfinite_media_numbers_never_reach_structured_content(
     assert stream["raw_summary"] == (
         "duration: NaN\nbit_rate: +inf\nsample_rate: -inf"
     )
-    assert len(result.structuredContent["raw_summary"]) <= 2000
+    assert len(result.structured_content["raw_summary"]) <= 2000
     assert len(stream["raw_summary"]) <= 2000
 
 
@@ -689,18 +689,18 @@ async def test_loudness_retains_parsed_values_and_all_parser_warnings(
   "integrated_lufs": -18.2,
   "true_peak_dbfs": -1.1
 }"""
-    assert result.structuredContent["integrated_lufs"] == -18.2
-    assert result.structuredContent["loudness_range_lu"] is None
-    assert result.structuredContent["true_peak_dbfs"] == -1.1
-    assert [warning["kind"] for warning in result.structuredContent["warnings"]] == [
+    assert result.structured_content["integrated_lufs"] == -18.2
+    assert result.structured_content["loudness_range_lu"] is None
+    assert result.structured_content["true_peak_dbfs"] == -1.1
+    assert [warning["kind"] for warning in result.structured_content["warnings"]] == [
         "malformed_value",
         "command_warning",
     ]
-    assert result.structuredContent["warnings"][1]["message"] == (
+    assert result.structured_content["warnings"][1]["message"] == (
         "[Parsed_ebur128_0 @ 0x1] warning: gated measurement unavailable"
     )
-    assert result.structuredContent["raw_summary"] == "LRA:        wide LU"
-    assert len(result.structuredContent["raw_summary"]) <= 2000
+    assert result.structured_content["raw_summary"] == "LRA:        wide LU"
+    assert len(result.structured_content["raw_summary"]) <= 2000
 
 
 @pytest.mark.asyncio
@@ -723,20 +723,20 @@ async def test_loudness_rejects_all_nonfinite_ffmpeg_forms(
   "loudness_range_lu": Infinity,
   "true_peak_dbfs": -Infinity
 }"""
-    assert result.structuredContent["integrated_lufs"] == -18.2
-    assert result.structuredContent["loudness_range_lu"] is None
-    assert result.structuredContent["true_peak_dbfs"] is None
-    assert [warning["field"] for warning in result.structuredContent["warnings"]] == [
+    assert result.structured_content["integrated_lufs"] == -18.2
+    assert result.structured_content["loudness_range_lu"] is None
+    assert result.structured_content["true_peak_dbfs"] is None
+    assert [warning["field"] for warning in result.structured_content["warnings"]] == [
         "integrated_lufs",
         "loudness_range_lu",
         "true_peak_dbfs",
     ]
-    assert result.structuredContent["raw_summary"] == (
+    assert result.structured_content["raw_summary"] == (
         "I:           NaN LUFS\n"
         "LRA:        +inf LU\n"
         "Peak:       -inf dBFS"
     )
-    assert len(result.structuredContent["raw_summary"]) <= 2000
+    assert len(result.structured_content["raw_summary"]) <= 2000
 
 
 @pytest.mark.asyncio
@@ -763,8 +763,8 @@ async def test_scene_detection_retains_scores_and_all_parser_warnings(
     }
   ]
 }"""
-    assert result.structuredContent["threshold"] == 0.45
-    assert result.structuredContent["scene_changes"] == [
+    assert result.structured_content["threshold"] == 0.45
+    assert result.structured_content["scene_changes"] == [
         {
             "time_seconds": 1.25,
             "timecode": "00:00:01.250",
@@ -776,18 +776,18 @@ async def test_scene_detection_retains_scores_and_all_parser_warnings(
             "score": 0.61,
         },
     ]
-    assert [warning["kind"] for warning in result.structuredContent["warnings"]] == [
+    assert [warning["kind"] for warning in result.structured_content["warnings"]] == [
         "malformed_value",
         "command_warning",
     ]
-    assert result.structuredContent["warnings"][1]["message"] == (
+    assert result.structured_content["warnings"][1]["message"] == (
         "[Parsed_showinfo_1 @ 0x1] warning: corrupt timestamp metadata"
     )
-    assert result.structuredContent["raw_summary"] == (
+    assert result.structured_content["raw_summary"] == (
         "[Parsed_showinfo_1 @ 0x1] n:1 pts:bad pts_time:not-a-number "
         "lavfi.scene_score:0.61"
     )
-    assert len(result.structuredContent["raw_summary"]) <= 2000
+    assert len(result.structured_content["raw_summary"]) <= 2000
 
 
 @pytest.mark.asyncio
@@ -820,7 +820,7 @@ async def test_scene_detection_rejects_nonfinite_values_without_losing_finite_sc
     }
   ]
 }"""
-    assert result.structuredContent["scene_changes"] == [
+    assert result.structured_content["scene_changes"] == [
         {
             "time_seconds": 1.5,
             "timecode": "00:00:01.500",
@@ -837,13 +837,13 @@ async def test_scene_detection_rejects_nonfinite_values_without_losing_finite_sc
             "score": None,
         },
     ]
-    assert [warning["field"] for warning in result.structuredContent["warnings"]] == [
+    assert [warning["field"] for warning in result.structured_content["warnings"]] == [
         "score",
         "time_seconds",
         "time_seconds",
         "score",
     ]
-    assert result.structuredContent["raw_summary"] == (
+    assert result.structured_content["raw_summary"] == (
         "[Parsed_showinfo_1 @ 0x1] n:0 pts:1 pts_time:1.5 "
         "lavfi.scene_score:NaN\n"
         "[Parsed_showinfo_1 @ 0x1] n:1 pts:2 pts_time:+inf "
@@ -851,7 +851,7 @@ async def test_scene_detection_rejects_nonfinite_values_without_losing_finite_sc
         "[Parsed_showinfo_1 @ 0x1] n:2 pts:3 pts_time:-inf "
         "lavfi.scene_score:-inf"
     )
-    assert len(result.structuredContent["raw_summary"]) <= 2000
+    assert len(result.structured_content["raw_summary"]) <= 2000
 
 
 @pytest.mark.asyncio
@@ -921,7 +921,7 @@ async def test_streams_preserve_real_indices_and_never_relabel_unsupported_types
     "duration": null
   }
 ]"""
-    streams = result.structuredContent["streams"]
+    streams = result.structured_content["streams"]
     assert [stream["index"] for stream in streams] == [4, 9, 20, 21, 22, 23]
     assert [stream["codec_type"] for stream in streams] == [
         "video",
@@ -995,7 +995,7 @@ async def test_scene_timecodes_round_before_second_minute_and_hour_decomposition
 }"""
     assert [
         change["timecode"]
-        for change in result.structuredContent["scene_changes"]
+        for change in result.structured_content["scene_changes"]
     ] == [
         "00:00:00.999",
         "00:00:01.000",

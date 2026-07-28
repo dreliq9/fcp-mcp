@@ -2,20 +2,23 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import threading
 from typing import Annotated, get_args, get_origin
 
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
-from mcp.types import CallToolResult
+from mcp import Client
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import CallToolResult
 from pydantic import BaseModel, ConfigDict
 
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.mcp_boundary import build_mcp_server
-from fcp_mcp.profiles import ToolClass
-from fcp_mcp.registry import PromptRegistry, ToolRegistry
+from fcp_mcp.profiles import Profile, ToolClass
+from fcp_mcp.registry import PromptRegistry, ResourceRegistry, ToolRegistry
 from fcp_mcp.result_models.common import ToolOutcome
 from fcp_mcp.tool_metadata import OFFLINE_READ
+from fcp_mcp.version import package_version
 
 
 class CountResult(BaseModel):
@@ -46,8 +49,8 @@ def test_boundary_preserves_text_and_validates_structured_content(tmp_path):
     result = asyncio.run(server.call_tool("count", {}))
     assert isinstance(result, CallToolResult)
     assert result.content[0].text == "count=2"
-    assert result.structuredContent == {"schema_version": "1", "count": 2}
-    schema = asyncio.run(server.list_tools())[0].outputSchema
+    assert result.structured_content == {"schema_version": "1", "count": 2}
+    schema = asyncio.run(server.list_tools())[0].output_schema
     assert schema["properties"]["count"]["type"] == "integer"
 
 
@@ -84,11 +87,11 @@ def test_boundary_coerces_legacy_text_without_changing_text(tmp_path):
     server = build_mcp_server(_config(tmp_path), tools, PromptRegistry())
     result = asyncio.run(server.call_tool("legacy", {}))
     assert result.content[0].text == "legacy text"
-    assert result.structuredContent == {
+    assert result.structured_content == {
         "schema_version": "1",
         "result": "legacy text",
     }
-    assert asyncio.run(server.list_tools())[0].outputSchema == {
+    assert asyncio.run(server.list_tools())[0].output_schema == {
         "properties": {
             "result": {"title": "Result", "type": "string"},
         },
@@ -197,6 +200,87 @@ def test_boundary_translates_safety_hints(tmp_path):
         "idempotentHint": True,
         "openWorldHint": False,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_protocol"),
+    [
+        ("auto", "2026-07-28"),
+        ("legacy", "2025-11-25"),
+    ],
+)
+async def test_public_client_preserves_identity_and_dual_channel_across_eras(
+    tmp_path,
+    mode,
+    expected_protocol,
+):
+    tools = ToolRegistry()
+
+    @tools.tool(tool_class=ToolClass.INSPECT, result_model=CountResult)
+    def count() -> ToolOutcome[CountResult]:
+        return ToolOutcome(text="count=2", structured=CountResult(count=2))
+
+    server = build_mcp_server(_config(tmp_path), tools, PromptRegistry())
+    async with Client(server, mode=mode, raise_exceptions=True) as client:
+        result = await client.call_tool("count", {})
+
+        assert str(client.protocol_version) == expected_protocol
+        assert client.server_info.name == "fcp-mcp"
+        assert client.server_info.version == package_version()
+        assert result.content[0].text == "count=2"
+        assert result.structured_content == {"schema_version": "1", "count": 2}
+        assert result.is_error is False
+
+
+@pytest.mark.asyncio
+async def test_python_attributes_are_snake_case_and_wire_json_is_camel_case(tmp_path):
+    tools = ToolRegistry()
+
+    @tools.tool(tool_class=ToolClass.INSPECT, result_model=CountResult)
+    def count() -> ToolOutcome[CountResult]:
+        return ToolOutcome(text="count=2", structured=CountResult(count=2))
+
+    server = build_mcp_server(_config(tmp_path), tools, PromptRegistry())
+    async with Client(server, raise_exceptions=True) as client:
+        listed = await client.list_tools()
+        result = await client.call_tool("count", {})
+
+    assert listed.tools[0].output_schema["properties"]["count"]["type"] == "integer"
+    assert result.structured_content["count"] == 2
+    assert result.model_dump(by_alias=True, mode="json")["structuredContent"][
+        "count"
+    ] == 2
+
+
+@pytest.mark.asyncio
+async def test_sync_resource_handlers_retain_v2_worker_thread_execution(tmp_path):
+    resources = ResourceRegistry()
+    handler_threads: list[int] = []
+
+    @resources.resource(
+        "probe://thread/{name}",
+        name="thread-probe",
+        mime_type="text/plain",
+        profiles={Profile.WORKFLOW},
+    )
+    def thread_probe(name: str) -> str:
+        handler_threads.append(threading.get_ident())
+        return name
+
+    server = build_mcp_server(
+        _config(tmp_path, "workflow"),
+        ToolRegistry(),
+        PromptRegistry(),
+        resources,
+    )
+    event_loop_thread = threading.get_ident()
+    async with Client(server, raise_exceptions=True) as client:
+        result = await client.read_resource("probe://thread/worker")
+
+    assert result.contents[0].text == "worker"
+    assert handler_threads
+    assert handler_threads[0] != event_loop_thread
 
 
 @pytest.mark.asyncio

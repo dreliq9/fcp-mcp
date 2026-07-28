@@ -657,7 +657,7 @@ async def test_registered_mcp_boundary_preserves_text_and_structured_schema(
     result = await enabled_mcp.call_tool("fcp_get_app_state", {})
 
     assert result.content[0].text == raw
-    assert result.structuredContent == {
+    assert result.structured_content == {
         "schema_version": "1",
         "name": "Final Cut Pro",
         "version": "11.1",
@@ -671,7 +671,7 @@ async def test_registered_output_schema_titles_match_all_19_models():
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
 
     assert {
-        name: tools[name].outputSchema["title"]
+        name: tools[name].output_schema["title"]
         for name in EXPECTED_LIVE_RESULT_MODELS
     } == EXPECTED_LIVE_RESULT_MODELS
 
@@ -768,7 +768,7 @@ async def test_fcp_action_output_schemas_admit_only_unverified_evidence():
     ]
 
     for name in action_names:
-        properties = tools[name].outputSchema["properties"]
+        properties = tools[name].output_schema["properties"]
         assert properties["verification_status"] == {
             "const": "unverified",
             "default": "unverified",
@@ -777,7 +777,7 @@ async def test_fcp_action_output_schemas_admit_only_unverified_evidence():
         }
         assert properties["observed_outcome"]["type"] == "null"
         assert properties["warnings"]["minItems"] == 1
-        serialized = json.dumps(tools[name].outputSchema, sort_keys=True)
+        serialized = json.dumps(tools[name].output_schema, sort_keys=True)
         assert '"verified"' not in serialized
         assert '"failed"' not in serialized
 

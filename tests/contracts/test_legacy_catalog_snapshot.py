@@ -31,7 +31,7 @@ def test_v021_snapshot_matches_names_inputs_and_annotations():
         # Output schemas intentionally migrate to typed domain models. The
         # public v0.2.1 names, inputs, and annotations remain frozen.
         assert frozen["output_schema"]
-        assert frozen["input_schema"] == tool.inputSchema
+        assert frozen["input_schema"] == tool.input_schema
         assert frozen["annotations"] == tool.annotations.model_dump(
             by_alias=True, exclude_none=True
         )

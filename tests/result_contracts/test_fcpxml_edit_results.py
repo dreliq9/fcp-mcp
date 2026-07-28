@@ -626,14 +626,14 @@ async def test_core_edits_publish_exact_text_real_receipts_and_verified_entities
         _arguments_for(tool_name, source, destination, audio),
     )
 
-    assert result.isError is False
+    assert result.is_error is False
     assert result.content[0].text == _expected_text(tool_name, destination)
     definitions = {tool.name: tool for tool in await server.mcp.list_tools()}
-    assert set(definitions[tool_name].outputSchema["properties"]) != {"result"}
+    assert set(definitions[tool_name].output_schema["properties"]) != {"result"}
 
     models = importlib.import_module("fcp_mcp.result_models.fcpxml")
     result_model = getattr(models, model_name)
-    model = result_model.model_validate(result.structuredContent)
+    model = result_model.model_validate(result.structured_content)
     assert model.schema_version == "1"
 
     payload = model.model_dump(mode="json")
@@ -710,14 +710,14 @@ async def test_trim_with_no_requested_changes_reports_no_changed_fields(
         },
     )
 
-    assert result.isError is False
+    assert result.is_error is False
     assert result.content[0].text == (
         f"Clip trimmed. Saved to: {destination}"
     )
-    assert result.structuredContent["changed_fields"] == []
-    assert result.structuredContent["clip"]["start"] == "30030/30000s"
-    assert result.structuredContent["clip"]["duration"] == "150150/30000s"
-    assert _sha256(destination) == result.structuredContent["receipt"]["output_sha256"]
+    assert result.structured_content["changed_fields"] == []
+    assert result.structured_content["clip"]["start"] == "30030/30000s"
+    assert result.structured_content["clip"]["duration"] == "150150/30000s"
+    assert _sha256(destination) == result.structured_content["receipt"]["output_sha256"]
 
 
 @pytest.mark.asyncio
@@ -740,13 +740,13 @@ async def test_one_x_speed_has_no_duration_change_and_verified_identity_map(
         },
     )
 
-    assert result.isError is False
+    assert result.is_error is False
     assert result.content[0].text == (
         f"Speed changed to 1.0x. Saved to: {destination}"
     )
-    assert result.structuredContent["changed_fields"] == []
-    assert result.structuredContent["clip"]["duration"] == "120120/30000s"
-    assert result.structuredContent["speed_factor"] == 1.0
+    assert result.structured_content["changed_fields"] == []
+    assert result.structured_content["clip"]["duration"] == "120120/30000s"
+    assert result.structured_content["speed_factor"] == 1.0
     clip = _find_named(
         ET.parse(destination).getroot(),
         "asset-clip",

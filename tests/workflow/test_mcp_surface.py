@@ -6,7 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp import Client, MCPError
+from mcp.server.mcpserver.exceptions import ToolError
 
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.mcp_boundary import build_mcp_server
@@ -133,28 +134,34 @@ def test_surface_registers_exact_tools_annotations_and_resources(tmp_path: Path)
         assert item.annotations.model_dump(by_alias=True, exclude_none=True) == (
             EXPECTED_ANNOTATIONS[item.name]
         )
-        assert item.outputSchema is not None
+        assert item.output_schema is not None
 
     templates = asyncio.run(server.list_resource_templates())
-    assert {str(item.uriTemplate) for item in templates} == EXPECTED_RESOURCE_TEMPLATES
+    assert {str(item.uri_template) for item in templates} == EXPECTED_RESOURCE_TEMPLATES
     assert set(resources.definitions) == EXPECTED_RESOURCE_TEMPLATES
     assert all(definition.read_only for definition in resources.definitions.values())
-    diff = next(item for item in templates if str(item.uriTemplate).endswith("/diff"))
-    assert diff.mimeType == "application/json"
-    assert not any("candidate" in str(item.uriTemplate) for item in templates)
+    diff = next(item for item in templates if str(item.uri_template).endswith("/diff"))
+    assert diff.mime_type == "application/json"
+    assert not any("candidate" in str(item.uri_template) for item in templates)
 
 
-def test_invalid_resource_run_id_fails_before_lazy_ledger_creation(tmp_path: Path):
+@pytest.mark.asyncio
+async def test_invalid_resource_run_id_fails_before_lazy_ledger_creation(
+    tmp_path: Path,
+):
     server, config, _ = _server(tmp_path)
     assert not config.state_dir.exists()
 
-    with pytest.raises(ValueError, match="canonical lowercase UUID"):
-        asyncio.run(
-            server.read_resource(
+    async with Client(server, raise_exceptions=True) as client:
+        with pytest.raises(
+            MCPError,
+            match="canonical lowercase UUID",
+        ) as caught:
+            await client.read_resource(
                 "fcp-workflow://runs/123E4567-E89B-42D3-A456-426614174000"
             )
-        )
 
+    assert caught.value.code == -32602
     assert not config.state_dir.exists()
 
 
@@ -173,7 +180,7 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
         )
     )
     preview = WorkflowPreviewV1.model_validate_json(
-        json.dumps(prepared.structuredContent)
+        json.dumps(prepared.structured_content)
     )
     assert preview.state.value == "awaiting_approval"
     assert preview.run_id in prepared.content[0].text
@@ -184,7 +191,7 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
         server.call_tool("fcpxml_workflow_status", {"run_id": preview.run_id})
     )
     status = WorkflowStatusV1.model_validate_json(
-        json.dumps(status_result.structuredContent)
+        json.dumps(status_result.structured_content)
     )
     revision = status.revision
     assert status.state.value == "awaiting_approval"
@@ -227,7 +234,7 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
     status_after_resources = asyncio.run(
         server.call_tool("fcpxml_workflow_status", {"run_id": preview.run_id})
     )
-    assert status_after_resources.structuredContent["revision"] == revision
+    assert status_after_resources.structured_content["revision"] == revision
 
     committed = asyncio.run(
         server.call_tool(
@@ -239,7 +246,7 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
         )
     )
     receipt = WorkflowCommitReceiptV1.model_validate_json(
-        json.dumps(committed.structuredContent)
+        json.dumps(committed.structured_content)
     )
     assert receipt.run_id == preview.run_id
     assert receipt.output_sha256 == preview.candidate_sha256
@@ -253,7 +260,7 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
             _prepare_arguments(source, cancelled_destination, "surface-cancel"),
         )
     )
-    cancel_run_id = cancel_preview_result.structuredContent["run_id"]
+    cancel_run_id = cancel_preview_result.structured_content["run_id"]
     cancelled = asyncio.run(
         server.call_tool(
             "fcpxml_workflow_cancel",
@@ -261,7 +268,7 @@ def test_workflow_tools_and_resources_round_trip_without_resource_mutation(
         )
     )
     cancel_result = WorkflowCancelResultV1.model_validate_json(
-        json.dumps(cancelled.structuredContent)
+        json.dumps(cancelled.structured_content)
     )
     assert cancel_result.state.value == "cancelled"
     assert cancel_result.reason == "No longer needed"
@@ -282,8 +289,8 @@ def test_cli_mode_rejects_client_hash_but_consumes_existing_durable_approval(
             _prepare_arguments(source, destination, "cli-mode"),
         )
     )
-    run_id = prepared.structuredContent["run_id"]
-    candidate_sha256 = prepared.structuredContent["candidate_sha256"]
+    run_id = prepared.structured_content["run_id"]
+    candidate_sha256 = prepared.structured_content["candidate_sha256"]
     runtime = WorkflowRuntime(config)
     runtime.engine.approve_cli(
         run_id,
@@ -310,7 +317,7 @@ def test_cli_mode_rejects_client_hash_but_consumes_existing_durable_approval(
     committed = asyncio.run(
         server.call_tool("fcpxml_workflow_commit", {"run_id": run_id})
     )
-    assert committed.structuredContent["approval_source"] == "cli"
+    assert committed.structured_content["approval_source"] == "cli"
     assert destination.exists()
 
 
@@ -336,7 +343,7 @@ def test_client_commit_rejects_missing_or_stale_candidate_hash_without_mutation(
             _prepare_arguments(source, destination, f"reject-{error_code}"),
         )
     )
-    run_id = prepared.structuredContent["run_id"]
+    run_id = prepared.structured_content["run_id"]
 
     with pytest.raises(ToolError, match=error_code):
         asyncio.run(
@@ -349,5 +356,5 @@ def test_client_commit_rejects_missing_or_stale_candidate_hash_without_mutation(
     status = asyncio.run(
         server.call_tool("fcpxml_workflow_status", {"run_id": run_id})
     )
-    assert status.structuredContent["state"] == "awaiting_approval"
+    assert status.structured_content["state"] == "awaiting_approval"
     assert not destination.exists()

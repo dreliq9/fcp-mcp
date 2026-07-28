@@ -12,7 +12,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 
 import pytest
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import ValidationError
 
 from fcp_mcp import server
@@ -336,7 +336,7 @@ async def test_exact_write_group_advertises_named_nonlegacy_schemas(
     definition = server.TOOLS.definitions[tool_name]
     assert definition.result_model.__name__ == model_name
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    assert set(tools[tool_name].outputSchema["properties"]) != {"result"}
+    assert set(tools[tool_name].output_schema["properties"]) != {"result"}
 
 
 @pytest.mark.asyncio
@@ -360,7 +360,7 @@ async def test_media_thumbnail_result_binds_real_bytes_and_exact_text(
     )
 
     assert result.content[0].text == f"Thumbnail saved: {destination}"
-    assert result.structuredContent == {
+    assert result.structured_content == {
         "schema_version": "1",
         "operation": "extract_thumbnail",
         "source": _artifact(source, "video/quicktime"),
@@ -419,7 +419,7 @@ async def test_media_thumbnail_list_binds_count_to_verified_artifacts(
         "  ]\n"
         "}"
     )
-    assert result.structuredContent == {
+    assert result.structured_content == {
         "schema_version": "1",
         "operation": "extract_thumbnails",
         "source": _artifact(source, "video/mp4"),
@@ -458,7 +458,7 @@ async def test_media_audio_result_uses_honest_mime_and_exact_text(
         f'  "source": "{source}"\n'
         "}"
     )
-    assert result.structuredContent == {
+    assert result.structured_content == {
         "schema_version": "1",
         "operation": "extract_audio",
         "source": _artifact(source, "video/quicktime"),
@@ -510,7 +510,7 @@ async def test_media_audio_to_midi_binds_written_midi_bytes(
         f'  "source": "{source}"\n'
         "}"
     )
-    assert result.structuredContent == {
+    assert result.structured_content == {
         "schema_version": "1",
         "operation": "audio_to_midi",
         "source": _artifact(source, "audio/wav"),
@@ -790,7 +790,7 @@ async def test_puppet_create_rig_returns_complete_service_data_and_persists_it(
         },
         indent=2,
     )
-    rig = result.structuredContent["rig"]
+    rig = result.structured_content["rig"]
     assert rig["name"] == "Ada"
     assert rig["position"] == [12.5, -4.0]
     assert rig["parts"][0] == {
@@ -807,7 +807,7 @@ async def test_puppet_create_rig_returns_complete_service_data_and_persists_it(
 
     persisted = list((server.CONFIG.state_dir / "puppet_rigs").glob("*.json"))
     assert len(persisted) == 1
-    assert json.loads(persisted[0].read_text()) == result.structuredContent
+    assert json.loads(persisted[0].read_text()) == result.structured_content
 
 
 @pytest.mark.asyncio
@@ -844,7 +844,7 @@ async def test_puppet_humanoid_returns_every_real_part_and_persists_it(
         },
         indent=2,
     )
-    assert [part["name"] for part in result.structuredContent["rig"]["parts"]] == [
+    assert [part["name"] for part in result.structured_content["rig"]["parts"]] == [
         "head",
         "body",
         "left_arm",
@@ -852,10 +852,10 @@ async def test_puppet_humanoid_returns_every_real_part_and_persists_it(
         "left_leg",
         "right_leg",
     ]
-    assert result.structuredContent["rig"]["parts"][0]["image"] == str(images["head"])
+    assert result.structured_content["rig"]["parts"][0]["image"] == str(images["head"])
     persisted = list((server.CONFIG.state_dir / "puppet_rigs").glob("*.json"))
     assert len(persisted) == 1
-    assert json.loads(persisted[0].read_text()) == result.structuredContent
+    assert json.loads(persisted[0].read_text()) == result.structured_content
 
 
 @pytest.mark.asyncio
@@ -884,10 +884,10 @@ async def test_puppet_build_scene_reparses_committed_project_and_has_receipt(
         '  "status": "scene_built"\n'
         "}"
     )
-    assert result.structuredContent["project"] == "Contract Scene"
-    assert len(result.structuredContent["rigs"]) == 1
-    assert result.structuredContent["animations"] == []
-    _assert_receipt(result.structuredContent, destination)
+    assert result.structured_content["project"] == "Contract Scene"
+    assert len(result.structured_content["rigs"]) == 1
+    assert result.structured_content["animations"] == []
+    _assert_receipt(result.structured_content, destination)
 
 
 @pytest.mark.asyncio
@@ -929,7 +929,7 @@ async def test_puppet_animate_returns_typed_service_animations_and_receipt(
         '  "status": "animated_scene_built"\n'
         "}"
     )
-    assert result.structuredContent["animations"] == [
+    assert result.structured_content["animations"] == [
         {
             "rig_name": "Ada",
             "part_name": "head",
@@ -940,7 +940,7 @@ async def test_puppet_animate_returns_typed_service_animations_and_receipt(
             ],
         }
     ]
-    _assert_receipt(result.structuredContent, destination)
+    _assert_receipt(result.structured_content, destination)
 
 
 @pytest.mark.asyncio
@@ -1083,11 +1083,11 @@ async def test_puppet_build_canonicalizes_accepted_duration_without_text_drift(
         '  "status": "scene_built"\n'
         "}"
     )
-    assert result.structuredContent["duration"] == "1s"
+    assert result.structured_content["duration"] == "1s"
     assert ET.parse(destination).find(".//sequence").get("duration") == "1s"
     _assert_expected_transaction_residue(
         destination,
-        backup_path=result.structuredContent["receipt"]["backup_path"],
+        backup_path=result.structured_content["receipt"]["backup_path"],
     )
 
 
@@ -1134,10 +1134,10 @@ async def test_puppet_animate_canonicalizes_duration_and_keyframe_times(
         '  "status": "animated_scene_built"\n'
         "}"
     )
-    assert result.structuredContent["duration"] == "2s"
+    assert result.structured_content["duration"] == "2s"
     assert [
         keyframe["time"]
-        for keyframe in result.structuredContent["animations"][0]["keyframes"]
+        for keyframe in result.structured_content["animations"][0]["keyframes"]
     ] == ["0s", "1s"]
     assert [
         keyframe.get("time")
@@ -1145,7 +1145,7 @@ async def test_puppet_animate_canonicalizes_duration_and_keyframe_times(
     ] == ["0s", "1s"]
     _assert_expected_transaction_residue(
         destination,
-        backup_path=result.structuredContent["receipt"]["backup_path"],
+        backup_path=result.structured_content["receipt"]["backup_path"],
     )
 
 
@@ -1181,10 +1181,10 @@ async def test_puppet_preset_uses_generated_service_animations_and_receipt(
         '  "status": "preset_applied"\n'
         "}"
     )
-    assert result.structuredContent["project"] == "Preset Contract"
-    assert result.structuredContent["animations"][0]["part_name"] == "body"
-    assert result.structuredContent["animations"][0]["property_name"] == "position"
-    _assert_receipt(result.structuredContent, destination)
+    assert result.structured_content["project"] == "Preset Contract"
+    assert result.structured_content["animations"][0]["part_name"] == "body"
+    assert result.structured_content["animations"][0]["property_name"] == "position"
+    _assert_receipt(result.structured_content, destination)
 
 
 @pytest.mark.asyncio
@@ -1217,7 +1217,7 @@ async def test_puppet_preset_canonicalizes_duration_without_text_drift(
         '  "status": "preset_applied"\n'
         "}"
     )
-    assert result.structuredContent["duration"] == "2s"
+    assert result.structured_content["duration"] == "2s"
     assert ET.parse(destination).find(".//sequence").get("duration") == "2s"
 
 
@@ -1268,8 +1268,8 @@ async def test_puppet_multi_scene_has_one_verified_artifact_per_scene(
         '  "status": "multi_scene_built"\n'
         "}"
     )
-    assert result.structuredContent["scene_count"] == 2
-    artifacts = result.structuredContent["artifacts"]
+    assert result.structured_content["scene_count"] == 2
+    artifacts = result.structured_content["artifacts"]
     assert [artifact["scene"] for artifact in artifacts] == ["intro", "greeting"]
     for payload, destination in zip(artifacts, (intro, greeting), strict=True):
         _assert_receipt(payload, destination)
@@ -1313,7 +1313,7 @@ async def test_puppet_multi_scene_canonicalizes_accepted_duration(
         '  "status": "multi_scene_built"\n'
         "}"
     )
-    assert result.structuredContent["artifacts"][0]["duration"] == "2s"
+    assert result.structured_content["artifacts"][0]["duration"] == "2s"
     assert ET.parse(destination).find(".//sequence").get("duration") == "2s"
 
 
@@ -1404,7 +1404,7 @@ async def test_multi_scene_uses_destination_filesystem_alias_semantics(
             "puppet_multi_scene",
             arguments,
         )
-        assert result.structuredContent["scene_count"] == 2
+        assert result.structured_content["scene_count"] == 2
         assert all((tmp_path / basename).is_file() for basename in basenames)
 
     assert list(tmp_path.glob(".puppet-scene-probe-*")) == []
@@ -1552,8 +1552,8 @@ async def test_numeric_multi_scene_name_preserves_legacy_compatibility(
         '  "status": "multi_scene_built"\n'
         "}"
     )
-    assert result.structuredContent["artifacts"][0]["scene"] == "42"
-    _assert_receipt(result.structuredContent["artifacts"][0], destination)
+    assert result.structured_content["artifacts"][0]["scene"] == "42"
+    _assert_receipt(result.structured_content["artifacts"][0], destination)
 
 
 @pytest.mark.asyncio

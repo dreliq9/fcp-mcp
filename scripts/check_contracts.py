@@ -83,7 +83,7 @@ def validate_call(
     if tool is None:
         return [f"name: unknown tool '{name}'"]
 
-    schema = dict(tool.inputSchema)
+    schema = dict(tool.input_schema)
     schema["additionalProperties"] = False
     validator = Draft202012Validator(schema)
     for error in sorted(

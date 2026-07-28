@@ -181,7 +181,7 @@ async def test_exact_offline_write_group_advertises_named_nonlegacy_schemas(
     assert definition.result_model.__name__ == model_name
 
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    assert set(tools[tool_name].outputSchema["properties"]) != {"result"}
+    assert set(tools[tool_name].output_schema["properties"]) != {"result"}
 
 
 @pytest.mark.asyncio
@@ -243,9 +243,9 @@ async def test_generation_results_are_reparsed_from_committed_fcpxml(
             f"Montage created (2 shots): {destination}"
         ),
     }[tool_name]
-    assert result.isError is False
+    assert result.is_error is False
     assert result.content[0].text == expected_text
-    payload = result.structuredContent
+    payload = result.structured_content
     assert payload["project"] == project
     assert payload["selected_clip_count"] == selected_count
     assert payload["target_duration_seconds"] == target_seconds
@@ -293,9 +293,9 @@ async def test_import_results_report_actual_cues_and_events(
     assert subtitle_result.content[0].text == (
         f"2 subtitles added. Saved to: {subtitle_destination}"
     )
-    assert subtitle_result.structuredContent["cue_count"] == 2
+    assert subtitle_result.structured_content["cue_count"] == 2
     _assert_fcpxml_evidence(
-        subtitle_result.structuredContent,
+        subtitle_result.structured_content,
         subtitle_destination,
         source=subtitle_source,
     )
@@ -330,9 +330,9 @@ async def test_import_results_report_actual_cues_and_events(
     assert edl_result.content[0].text == (
         f"EDL imported (1 clips): {edl_destination}"
     )
-    assert edl_result.structuredContent["event_count"] == 1
+    assert edl_result.structured_content["event_count"] == 1
     _assert_fcpxml_evidence(
-        edl_result.structuredContent,
+        edl_result.structured_content,
         edl_destination,
         source=None,
     )
@@ -388,7 +388,7 @@ async def test_subtitle_import_reports_delta_with_preexisting_subtitle(
     assert result.content[0].text == (
         f"2 subtitles added. Saved to: {destination}"
     )
-    assert result.structuredContent["cue_count"] == 2
+    assert result.structured_content["cue_count"] == 2
     assert len(
         ET.parse(destination).getroot().findall(
             ".//title[@role='Titles.Subtitle']"
@@ -418,7 +418,7 @@ async def test_reformat_and_cleanup_report_committed_changes_including_zero(
         f"Reformatted to 1080x1920. Saved to: {reformat_destination}"
     )
     assert {
-        key: reformatted.structuredContent[key]
+        key: reformatted.structured_content[key]
         for key in (
             "source_version",
             "target_version",
@@ -434,7 +434,7 @@ async def test_reformat_and_cleanup_report_committed_changes_including_zero(
         "target_format_name": "Vertical Contract",
     }
     _assert_fcpxml_evidence(
-        reformatted.structuredContent,
+        reformatted.structured_content,
         reformat_destination,
         source=reformat_source,
     )
@@ -478,10 +478,10 @@ async def test_reformat_and_cleanup_report_committed_changes_including_zero(
             ),
         }[tool_name]
         assert result.content[0].text == expected_text
-        assert result.structuredContent["action"] == action
-        assert result.structuredContent["changed_count"] == changed_count
+        assert result.structured_content["action"] == action
+        assert result.structured_content["changed_count"] == changed_count
         _assert_fcpxml_evidence(
-            result.structuredContent,
+            result.structured_content,
             destination,
             source=source,
         )
@@ -508,16 +508,16 @@ async def test_batch_results_use_service_counts_and_committed_values(
         f"5 clips renamed. Saved to: {rename_destination}"
     )
     assert {
-        "pattern": renamed.structuredContent["pattern"],
-        "replacement": renamed.structuredContent["replacement"],
-        "changed_count": renamed.structuredContent["changed_count"],
+        "pattern": renamed.structured_content["pattern"],
+        "replacement": renamed.structured_content["replacement"],
+        "changed_count": renamed.structured_content["changed_count"],
     } == {
         "pattern": "Broll",
         "replacement": "Scenic",
         "changed_count": 5,
     }
     _assert_fcpxml_evidence(
-        renamed.structuredContent,
+        renamed.structured_content,
         rename_destination,
         source=rename_source,
     )
@@ -545,10 +545,10 @@ async def test_batch_results_use_service_counts_and_committed_values(
     assert assigned.content[0].text == (
         f"5 roles assigned. Saved to: {role_destination}"
     )
-    assert assigned.structuredContent["rules"] == rules
-    assert assigned.structuredContent["changed_count"] == 5
+    assert assigned.structured_content["rules"] == rules
+    assert assigned.structured_content["changed_count"] == 5
     _assert_fcpxml_evidence(
-        assigned.structuredContent,
+        assigned.structured_content,
         role_destination,
         source=role_source,
     )
@@ -573,16 +573,16 @@ async def test_batch_results_use_service_counts_and_committed_values(
         f"3 transitions added. Saved to: {transition_destination}"
     )
     assert {
-        "name": transitioned.structuredContent["name"],
-        "duration": transitioned.structuredContent["duration"],
-        "changed_count": transitioned.structuredContent["changed_count"],
+        "name": transitioned.structured_content["name"],
+        "duration": transitioned.structured_content["duration"],
+        "changed_count": transitioned.structured_content["changed_count"],
     } == {
         "name": "Verified Dissolve",
         "duration": "6006/30000s",
         "changed_count": 3,
     }
     _assert_fcpxml_evidence(
-        transitioned.structuredContent,
+        transitioned.structured_content,
         transition_destination,
         source=transition_source,
     )
@@ -645,15 +645,15 @@ async def test_template_result_binds_copy_to_source_hash_and_absolute_backup(
     )
 
     assert result.content[0].text == f"Template saved: {destination}"
-    assert result.structuredContent["template"] == _artifact_payload(destination)
-    assert result.structuredContent["source_path"] == str(source.resolve())
-    assert result.structuredContent["source_sha256"] == _sha256(source)
+    assert result.structured_content["template"] == _artifact_payload(destination)
+    assert result.structured_content["source_path"] == str(source.resolve())
+    assert result.structured_content["source_sha256"] == _sha256(source)
     assert destination.read_bytes() == source.read_bytes()
-    assert result.structuredContent["source_sha256"] == _sha256(destination)
-    backup_path = Path(result.structuredContent["backup_path"])
+    assert result.structured_content["source_sha256"] == _sha256(destination)
+    backup_path = Path(result.structured_content["backup_path"])
     assert backup_path.is_absolute()
     assert backup_path.read_bytes() == prior_bytes
-    receipt = result.structuredContent["receipt"]
+    receipt = result.structured_content["receipt"]
     assert receipt["source"] == str(source.resolve())
     assert receipt["destination"] == str(destination.resolve())
     assert receipt["input_sha256"] == _sha256(source)
@@ -706,16 +706,16 @@ async def test_template_save_preserves_declared_encoding_and_exact_bytes(
 
     assert result.content[0].text == f"Template saved: {destination}"
     assert destination.read_bytes() == source_bytes
-    assert result.structuredContent["source_sha256"] == hashlib.sha256(
+    assert result.structured_content["source_sha256"] == hashlib.sha256(
         source_bytes
     ).hexdigest()
-    assert result.structuredContent["template"]["sha256"] == hashlib.sha256(
+    assert result.structured_content["template"]["sha256"] == hashlib.sha256(
         source_bytes
     ).hexdigest()
-    assert result.structuredContent["receipt"]["input_sha256"] == hashlib.sha256(
+    assert result.structured_content["receipt"]["input_sha256"] == hashlib.sha256(
         source_bytes
     ).hexdigest()
-    assert result.structuredContent["receipt"]["output_sha256"] == hashlib.sha256(
+    assert result.structured_content["receipt"]["output_sha256"] == hashlib.sha256(
         source_bytes
     ).hexdigest()
 
@@ -755,13 +755,13 @@ async def test_exports_bind_source_and_each_actual_output_format(
         "edl": f"EDL exported (5 edits): {destination}",
     }[export_format]
     assert result.content[0].text == expected_text
-    assert result.structuredContent["format"] == export_format
-    assert result.structuredContent["source"] == _artifact_payload(source)
-    assert result.structuredContent["artifact"] == _artifact_payload(
+    assert result.structured_content["format"] == export_format
+    assert result.structured_content["source"] == _artifact_payload(source)
+    assert result.structured_content["artifact"] == _artifact_payload(
         destination,
         media_type,
     )
-    receipt = result.structuredContent["receipt"]
+    receipt = result.structured_content["receipt"]
     assert receipt is not None
     uuid.UUID(receipt["transaction_id"])
     assert receipt["source"] == str(source.resolve())
@@ -808,7 +808,7 @@ async def test_non_fcpxml_export_receipt_captures_overwrite_backup(
         {"path": str(source), "output_path": str(destination)},
     )
 
-    receipt = result.structuredContent["receipt"]
+    receipt = result.structured_content["receipt"]
     assert receipt is not None
     assert receipt["source"] == str(source.resolve())
     assert receipt["destination"] == str(destination.resolve())

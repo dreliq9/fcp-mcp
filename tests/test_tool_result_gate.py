@@ -40,7 +40,7 @@ def test_gate_reports_both_legacy_schema_shapes():
     @dataclass
     class Tool:
         name: str
-        outputSchema: dict
+        output_schema: dict
 
     class FakeServer:
         async def list_tools(self):
@@ -84,7 +84,7 @@ def test_gate_rejects_catalog_count_other_than_93():
     @dataclass
     class Tool:
         name: str
-        outputSchema: dict
+        output_schema: dict
 
     class FakeServer:
         async def list_tools(self):
@@ -104,7 +104,7 @@ def test_gate_rejects_missing_and_invalid_output_schemas():
     @dataclass
     class Tool:
         name: str
-        outputSchema: object
+        output_schema: object
 
     class FakeServer:
         async def list_tools(self):
@@ -130,7 +130,7 @@ def test_gate_resolves_local_refs_and_root_compositions():
     @dataclass
     class Tool:
         name: str
-        outputSchema: dict
+        output_schema: dict
 
     legacy_definition = {
         "type": "object",
@@ -190,7 +190,7 @@ def test_gate_rejects_unresolved_and_external_refs_without_fetching():
     @dataclass
     class Tool:
         name: str
-        outputSchema: dict
+        output_schema: dict
 
     class FakeServer:
         async def list_tools(self):

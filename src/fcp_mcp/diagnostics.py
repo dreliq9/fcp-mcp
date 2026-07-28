@@ -331,11 +331,12 @@ def _status(checks: list[DoctorCheck]) -> str:
 
 def configuration_failure_report(error: FCPMCPError) -> DoctorReport:
     sdk_version = distribution_version("mcp")
+    server_version = package_version()
     return DoctorReport(
         status="blocked",
-        package_version=package_version(),
+        package_version=server_version,
         mcp_sdk_version=sdk_version,
-        wire_server_version=sdk_version,
+        wire_server_version=server_version,
         tool_count=0,
         prompt_count=0,
         checks=[
@@ -451,11 +452,12 @@ async def collect_doctor(
     checks.extend([_binary_check("ffmpeg"), _binary_check("ffprobe")])
     checks.append(_compressor_check())
     sdk_version = distribution_version("mcp")
+    server_version = package_version()
     return DoctorReport(
         status=_status(checks),
-        package_version=package_version(),
+        package_version=server_version,
         mcp_sdk_version=sdk_version,
-        wire_server_version=sdk_version,
+        wire_server_version=server_version,
         tool_count=tool_count,
         prompt_count=prompt_count,
         checks=checks,

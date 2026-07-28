@@ -34,13 +34,15 @@ def test_package_and_module_versions_are_0_2_1():
     assert __version__ == "0.2.1"
 
 
-def test_runtime_dependency_excludes_mcp_v2():
+def test_runtime_dependency_requires_stable_mcp_v2_only():
     requirements = [
         Requirement(value) for value in metadata("fcp-mcp").get_all("Requires-Dist") or []
     ]
     mcp_requirement = next(requirement for requirement in requirements if requirement.name == "mcp")
-    assert Version("1.27") in mcp_requirement.specifier
-    assert Version("2.0") not in mcp_requirement.specifier
+    assert Version("1.29") not in mcp_requirement.specifier
+    assert Version("2.0.0rc1") not in mcp_requirement.specifier
+    assert Version("2.0.0") in mcp_requirement.specifier
+    assert Version("3.0.0") not in mcp_requirement.specifier
 
 
 def test_domain_error_has_stable_code_and_readable_text():

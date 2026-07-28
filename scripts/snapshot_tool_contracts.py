@@ -13,8 +13,8 @@ async def snapshot() -> dict[str, object]:
     tools = {}
     for tool in await mcp.list_tools():
         tools[tool.name] = {
-            "input_schema": tool.inputSchema,
-            "output_schema": tool.outputSchema,
+            "input_schema": tool.input_schema,
+            "output_schema": tool.output_schema,
             "annotations": tool.annotations.model_dump(
                 by_alias=True, exclude_none=True
             ),

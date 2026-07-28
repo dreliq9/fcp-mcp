@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import pytest
-from mcp import ClientSession, StdioServerParameters
+from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 PageT = TypeVar("PageT")
@@ -59,7 +59,7 @@ async def _collect(
     while True:
         page = await fetch(cursor)
         items.extend(getattr(page, field))
-        cursor = page.nextCursor
+        cursor = page.next_cursor
         if cursor is None:
             return items
 
@@ -87,48 +87,49 @@ async def test_stdio_profiles_expose_exact_static_catalogs(
     profile: str,
 ):
     expected = EXPECTED[profile]
-    async with (
-        stdio_client(_parameters(tmp_path, profile)) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        initialized = await session.initialize()
+    async with Client(
+        stdio_client(_parameters(tmp_path, profile)),
+        mode="auto",
+        raise_exceptions=True,
+    ) as client:
         tools = await _collect(
-            lambda cursor: session.list_tools(cursor=cursor),
+            lambda cursor: client.list_tools(cursor=cursor),
             "tools",
         )
         prompts = await _collect(
-            lambda cursor: session.list_prompts(cursor=cursor),
+            lambda cursor: client.list_prompts(cursor=cursor),
             "prompts",
         )
         templates = await _collect(
-            lambda cursor: session.list_resource_templates(cursor=cursor),
-            "resourceTemplates",
+            lambda cursor: client.list_resource_templates(cursor=cursor),
+            "resource_templates",
         )
+        instructions = client.instructions
 
     assert len(tools) == expected["tool_count"]
     assert {prompt.name for prompt in prompts} == expected["prompts"]
     assert len(templates) == expected["resource_count"]
-    assert initialized.instructions is not None
-    assert f"profile={profile}" in initialized.instructions
+    assert instructions is not None
+    assert f"profile={profile}" in instructions
     assert (
         f"catalog={len(tools)} tools/{len(prompts)} prompts/{len(templates)} resources"
-        in initialized.instructions
+        in instructions
     )
-    assert "approval=client" in initialized.instructions
-    assert "live_control=disabled" in initialized.instructions
+    assert "approval=client" in instructions
+    assert "live_control=disabled" in instructions
     assert not (tmp_path / "state").exists()
 
 
 @pytest.mark.asyncio
 async def test_full_profile_exposes_but_gates_live_actions(tmp_path: Path):
-    async with (
-        stdio_client(_parameters(tmp_path, "full")) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        await session.initialize()
-        tools = await session.list_tools()
-        result = await session.call_tool("fcp_is_running")
+    async with Client(
+        stdio_client(_parameters(tmp_path, "full")),
+        mode="auto",
+        raise_exceptions=True,
+    ) as client:
+        tools = await client.list_tools()
+        result = await client.call_tool("fcp_is_running")
 
     assert "fcp_is_running" in {tool.name for tool in tools.tools}
-    assert result.isError is True
+    assert result.is_error is True
     assert "live_control_disabled" in result.content[0].text

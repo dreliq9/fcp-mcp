@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-from mcp import ClientSession, StdioServerParameters
+from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 EXPECTED_VERSION = "0.2.1"
@@ -62,7 +62,7 @@ async def _collect_pages(
     while True:
         page = await fetch(cursor)
         items.extend(getattr(page, field))
-        cursor = page.nextCursor
+        cursor = page.next_cursor
         if cursor is None:
             return items
         if cursor in seen:
@@ -82,24 +82,26 @@ async def inspect_server(
         env=env,
         cwd=cwd,
     )
-    async with (
-        stdio_client(parameters) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        initialized = await session.initialize()
+    async with Client(
+        stdio_client(parameters),
+        mode="auto",
+        raise_exceptions=True,
+    ) as client:
         tools = await _collect_pages(
-            lambda cursor: session.list_tools(cursor=cursor),
+            lambda cursor: client.list_tools(cursor=cursor),
             "tools",
         )
         prompts = await _collect_pages(
-            lambda cursor: session.list_prompts(cursor=cursor),
+            lambda cursor: client.list_prompts(cursor=cursor),
             "prompts",
         )
-        doctor = await session.call_tool("fcp_doctor")
+        doctor = await client.call_tool("fcp_doctor")
+        server_info = client.server_info
+        protocol_version = client.protocol_version
 
-    if initialized.serverInfo.name != "fcp-mcp":
+    if server_info.name != "fcp-mcp":
         raise SmokeFailure(
-            f"server name mismatch: expected fcp-mcp, got {initialized.serverInfo.name}"
+            f"server name mismatch: expected fcp-mcp, got {server_info.name}"
         )
     if len(tools) != EXPECTED_TOOL_COUNT:
         raise SmokeFailure(
@@ -109,12 +111,12 @@ async def inspect_server(
         raise SmokeFailure(
             f"prompt count mismatch: expected {EXPECTED_PROMPT_COUNT}, got {len(prompts)}"
         )
-    if doctor.isError:
+    if doctor.is_error:
         raise SmokeFailure("fcp_doctor returned an MCP tool error")
-    if not isinstance(doctor.structuredContent, dict):
+    if not isinstance(doctor.structured_content, dict):
         raise SmokeFailure("fcp_doctor returned no structured content")
 
-    doctor_report = doctor.structuredContent
+    doctor_report = doctor.structured_content
     expected_doctor_values = {
         "package_version": EXPECTED_VERSION,
         "server_name": "fcp-mcp",
@@ -131,20 +133,20 @@ async def inspect_server(
         raise SmokeFailure(
             f"doctor reported blocked runtime: {doctor_report.get('status')!r}"
         )
-    if doctor_report.get("wire_server_version") != initialized.serverInfo.version:
-        raise SmokeFailure("doctor and initialize disagree on the wire server version")
+    if doctor_report.get("wire_server_version") != server_info.version:
+        raise SmokeFailure("doctor and client disagree on the wire server version")
 
     return {
         "status": "passed",
         "package_version": doctor_report["package_version"],
         "mcp_sdk_version": doctor_report["mcp_sdk_version"],
-        "wire_server_version": initialized.serverInfo.version,
-        "protocol_version": str(initialized.protocolVersion),
-        "server_name": initialized.serverInfo.name,
+        "wire_server_version": server_info.version,
+        "protocol_version": str(protocol_version),
+        "server_name": server_info.name,
         "tool_count": len(tools),
         "prompt_count": len(prompts),
         "doctor_status": doctor_report["status"],
-        "doctor_is_error": bool(doctor.isError),
+        "doctor_is_error": bool(doctor.is_error),
     }
 
 

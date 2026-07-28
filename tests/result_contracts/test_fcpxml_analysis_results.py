@@ -453,13 +453,13 @@ async def test_fcpxml_analysis_tools_publish_typed_domain_results(
 
     result = await server.mcp.call_tool(tool_name, arguments)
 
-    assert result.isError is False
+    assert result.is_error is False
     assert result.content[0].text == LEGACY_TEXT[tool_name]
-    assert set(tools[tool_name].outputSchema["properties"]) != {"result"}
+    assert set(tools[tool_name].output_schema["properties"]) != {"result"}
 
     result_models = importlib.import_module("fcp_mcp.result_models.fcpxml")
     expected_model = getattr(result_models, model_name)
-    model = expected_model.model_validate(result.structuredContent)
+    model = expected_model.model_validate(result.structured_content)
     assert model.schema_version == "1"
     assert_payload(model)
 
@@ -500,10 +500,10 @@ async def test_pacing_types_an_empty_histogram_without_changing_legacy_text(
         {"path": str(empty_timeline)},
     )
 
-    assert result.isError is False
+    assert result.is_error is False
     assert result.content[0].text == json.dumps(legacy_payload, indent=2)
-    assert result.structuredContent["analyses"][0]["pacing_curve"] == []
-    assert result.structuredContent["analyses"][0]["histogram"] == {
+    assert result.structured_content["analyses"][0]["pacing_curve"] == []
+    assert result.structured_content["analyses"][0]["histogram"] == {
         "under_one_second": 0,
         "one_to_three_seconds": 0,
         "three_to_five_seconds": 0,

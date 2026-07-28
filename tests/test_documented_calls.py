@@ -51,7 +51,7 @@ def test_validate_call_uses_strict_draft_2020_12_schema():
     catalog = {
         "inspect": SimpleNamespace(
             name="inspect",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],

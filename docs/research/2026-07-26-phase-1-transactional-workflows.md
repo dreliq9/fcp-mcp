@@ -3,8 +3,9 @@
 **Date:** 2026-07-26
 **Applies to:** `fcp-mcp` v0.3.0 design
 **Repository snapshot:** `0e41c29c5c94605bb39c0b07b2ce18ff6534f3fb`
-**Research status:** Complete for design; mandatory revalidation before the
-MCP SDK v2 migration and before release
+**Research status:** Revalidated against stable MCP Python SDK `2.0.0` and
+stable protocol `2026-07-28` on 2026-07-28; mandatory revalidation remains
+before release
 **Platform amendment:** The 2026-07-27 macOS-only decision supersedes the
 cross-platform premise in this historical research. See
 [`docs/superpowers/specs/2026-07-27-macos-only-runtime-design.md`](../superpowers/specs/2026-07-27-macos-only-runtime-design.md).
@@ -300,3 +301,113 @@ Immediately before the v2 migration and again before any authorized release:
 5. Check SQLite versions across the Python 3.10-3.13 test matrix.
 6. Record any changed decision in this research document before implementation
    or publication proceeds.
+
+## 2026-07-28 stable-v2 revalidation
+
+### Release state
+
+- PyPI reports `mcp==2.0.0` as the latest stable release.
+- The official Python SDK `v2.0.0` release was published at
+  `2026-07-28T13:41:36Z`. It supports protocol `2026-07-28` and all earlier
+  protocol revisions from the same `MCPServer`.
+- The official protocol `2026-07-28` release was published at
+  `2026-07-28T16:47:49Z`.
+- `mcp-types==2.0.0` is an exact runtime dependency of `mcp==2.0.0`.
+- The Python SDK release explicitly excludes the Tasks extension. Task 23
+  therefore preserves fcp-mcp's internal durable-run model and does not add an
+  MCP Tasks adapter.
+
+Primary sources:
+
+- [Python SDK v2.0.0 release](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.0.0)
+- [Protocol 2026-07-28 release](https://github.com/modelcontextprotocol/modelcontextprotocol/releases/tag/2026-07-28)
+- [Stable Python SDK migration guide](https://py.sdk.modelcontextprotocol.io/migration/)
+- [Stable protocol-version negotiation](https://py.sdk.modelcontextprotocol.io/protocol-versions/)
+- [Stable structured-output contract](https://py.sdk.modelcontextprotocol.io/servers/structured-output/)
+- [Stable client testing API](https://py.sdk.modelcontextprotocol.io/get-started/testing/)
+
+### Final API findings
+
+The final SDK differs from the prerelease-based design in these exact ways:
+
+- `FastMCP` is now `MCPServer`, imported from `mcp.server`.
+- `ToolError` moved to `mcp.server.mcpserver.exceptions`.
+- Protocol types are provided by the separately packaged `mcp_types`. The
+  compatibility alias `mcp.types` remains, but fcp-mcp uses the canonical
+  package at its adapter boundary.
+- Python attributes are snake_case (`structured_content`, `output_schema`,
+  `is_error`, `next_cursor`, `server_info`, `protocol_version`); serialized
+  wire JSON remains camelCase when dumped with `by_alias=True`.
+- `MCPServer` must receive `version=package_version()` explicitly. An
+  unversioned v2 server otherwise reports an empty server version.
+- The public `Client` accepts an in-memory `MCPServer` or a stdio transport.
+  Its default `mode="auto"` negotiates `2026-07-28`; `mode="legacy"` negotiates
+  `2025-11-25` against the same server.
+- High-level `MCPServer` list methods intentionally return one complete page.
+  Their public client results use `next_cursor=None`; custom pagination belongs
+  on the low-level server and is not needed for fcp-mcp's bounded catalog.
+- `CallToolResult` still supports exact model-visible text plus validated
+  `structured_content`.
+- Ordinary tool exceptions become `CallToolResult(is_error=True)`. `MCPError`
+  is reserved for top-level JSON-RPC failures. fcp-mcp's recoverable domain
+  failures therefore remain ordinary coded tool errors.
+- v2 runs synchronous handlers on a worker thread. The resource error adapter
+  must preserve whether each registered handler is synchronous or asynchronous;
+  wrapping every resource in one async function would move synchronous SQLite
+  and artifact reads onto the event-loop thread.
+
+### Isolated probes
+
+The probes used a clean virtual environment with `mcp==2.0.0` and
+`mcp-types==2.0.0`.
+
+Observed import behavior:
+
+```text
+from mcp.server.fastmcp import FastMCP
+ModuleNotFoundError: No module named 'mcp.server.fastmcp'
+
+from mcp.server import MCPServer
+OK
+```
+
+Observed constructor and result behavior:
+
+```text
+MCPServer(name=..., instructions=..., version=...)
+CallToolResult(content=[TextContent(...)], structured_content={"value": 2})
+Python dump: structured_content, is_error
+Wire dump: structuredContent, isError
+```
+
+The same in-memory server was exercised through the public `Client`:
+
+```text
+mode=auto   protocol=2026-07-28 server=fcp-mcp version=0.3.0
+mode=legacy protocol=2025-11-25 server=fcp-mcp version=0.3.0
+dual-channel result: text="value=2" structured_content={"value": 2}
+domain failure: is_error=True and target_not_found retained
+invalid input: is_error=True and argument validation reported
+tools next_cursor=None
+```
+
+Local managed-Python SQLite observations:
+
+| Python | SQLite |
+| --- | --- |
+| 3.10.20 | 3.53.0 |
+| 3.11.15 | 3.50.4 |
+| 3.12.13 | 3.50.4 |
+| 3.13.12 | 3.50.4 |
+
+The project still does not enable WAL. These observations do not weaken the
+rollback-journal decision, and no ledger migration is required for the SDK
+boundary change.
+
+### Updated migration decision
+
+Proceed with stable `mcp>=2.0.0,<3`, make the MCP adapter and SDK-facing
+tests/scripts use the final public v2 spelling, and verify both protocol eras
+through `Client`. Do not modify workflow or domain modules, add Tasks, or add
+new orchestration behavior. Preserve v2's worker-thread execution for
+synchronous resource handlers while translating their coded failures.

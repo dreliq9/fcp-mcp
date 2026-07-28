@@ -124,7 +124,7 @@ async def failures(server, *, expected_count: int = 93) -> list[str]:
         problems.extend(
             _schema_failures(
                 tool.name,
-                getattr(tool, "outputSchema", None),
+                getattr(tool, "output_schema", None),
             )
         )
     return problems

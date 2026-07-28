@@ -6,9 +6,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from mcp import ClientSession, StdioServerParameters
+from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.mcpserver.exceptions import ToolError
 
 import fcp_mcp.automation.osascript as automation
 from fcp_mcp import server
@@ -16,7 +16,7 @@ from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import FCPMCPError
 from fcp_mcp.result_models.common import LegacyTextResult, ToolOutcome
 from fcp_mcp.security.paths import PathPolicy
-from fcp_mcp.version import distribution_version
+from fcp_mcp.version import distribution_version, package_version
 
 HOSTILE = 'x" & do shell script "touch /tmp/pwned" & "'
 
@@ -474,12 +474,12 @@ async def test_missing_clip_is_wire_error(tmp_path: Path, sample_fcpxml_path: Pa
         env=environment,
     )
 
-    async with (
-        stdio_client(parameters) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        await session.initialize()
-        result = await session.call_tool(
+    async with Client(
+        stdio_client(parameters),
+        mode="auto",
+        raise_exceptions=True,
+    ) as client:
+        result = await client.call_tool(
             "fcpxml_add_marker",
             {
                 "path": str(source),
@@ -489,7 +489,7 @@ async def test_missing_clip_is_wire_error(tmp_path: Path, sample_fcpxml_path: Pa
             },
         )
 
-    assert result.isError is True
+    assert result.is_error is True
     assert "target_not_found" in result.content[0].text
     assert (tmp_path / "source_modified.fcpxml").exists() is False
 
@@ -674,12 +674,12 @@ async def test_missing_media_is_wire_error_and_creates_no_output(tmp_path: Path)
         env=environment,
     )
 
-    async with (
-        stdio_client(parameters) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        await session.initialize()
-        result = await session.call_tool(
+    async with Client(
+        stdio_client(parameters),
+        mode="auto",
+        raise_exceptions=True,
+    ) as client:
+        result = await client.call_tool(
             "media_extract_thumbnail",
             {
                 "path": str(tmp_path / "missing.mov"),
@@ -687,7 +687,7 @@ async def test_missing_media_is_wire_error_and_creates_no_output(tmp_path: Path)
             },
         )
 
-    assert result.isError is True
+    assert result.is_error is True
     assert output.exists() is False
 
 
@@ -701,16 +701,17 @@ async def test_wire_identity_and_doctor_versions_are_truthful(tmp_path: Path):
         env=environment,
     )
 
-    async with (
-        stdio_client(parameters) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        initialized = await session.initialize()
-        result = await session.call_tool("fcp_doctor")
+    async with Client(
+        stdio_client(parameters),
+        mode="auto",
+        raise_exceptions=True,
+    ) as client:
+        result = await client.call_tool("fcp_doctor")
+        server_info = client.server_info
 
-    assert initialized.serverInfo.name == "fcp-mcp"
-    assert initialized.serverInfo.version == distribution_version("mcp")
-    assert result.isError is False
-    assert result.structuredContent["package_version"] == "0.2.1"
-    assert result.structuredContent["mcp_sdk_version"] == distribution_version("mcp")
-    assert result.structuredContent["wire_server_version"] == distribution_version("mcp")
+    assert server_info.name == "fcp-mcp"
+    assert server_info.version == package_version()
+    assert result.is_error is False
+    assert result.structured_content["package_version"] == "0.2.1"
+    assert result.structured_content["mcp_sdk_version"] == distribution_version("mcp")
+    assert result.structured_content["wire_server_version"] == package_version()
