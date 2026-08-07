@@ -33,6 +33,23 @@ def _load_runtime() -> ModuleType:
     require_macos()
     if _runtime is None:
         _runtime = importlib.import_module(_RUNTIME_MODULE)
+
+        # Editor-neutral source handoff extensions register against the same
+        # SDK-neutral ToolRegistry as the built-in FCPXML surface.  Keep the
+        # large runtime module stable and rebuild the MCP catalog only when the
+        # extension adds a tool.
+        from .mcp_boundary import build_mcp_server
+        from .youtube_clip_plan import register_youtube_clip_plan_tool
+
+        had_tool = "fcpxml_generate_from_clip_plan" in _runtime.TOOLS.definitions
+        register_youtube_clip_plan_tool(_runtime)
+        if not had_tool:
+            _runtime.mcp = build_mcp_server(
+                _runtime.CONFIG,
+                _runtime.TOOLS,
+                _runtime.PROMPTS,
+                _runtime.RESOURCES,
+            )
     return _runtime
 
 
