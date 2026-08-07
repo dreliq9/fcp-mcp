@@ -8,6 +8,7 @@ review evidence.
 - [README](../README.md) — installation, profiles, capabilities, and safety model
 - [LLM guide](../LLM_GUIDE.md) — tool-selection and approval rules for AI clients
 - [Workflow recipes](../WORKFLOWS.md) — bounded prepare/review/commit sequences
+- [YouTube-MCP clip-plan handoff](YOUTUBE_MCP_HANDOFF.md) — generate native FCPXML from provenance-preserving youtube-mcp materialized clip plans
 - [Examples gallery](../examples/GALLERY.md) — representative prompts and calls
 - [Troubleshooting](../README.md#troubleshooting) — runtime and policy failures
 
