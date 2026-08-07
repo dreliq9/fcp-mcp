@@ -39,6 +39,7 @@ EXPECTED_TOOLS = {
     "fcpxml_create_timeline",
     "fcpxml_auto_rough_cut",
     "fcpxml_generate_montage",
+    "fcpxml_generate_from_clip_plan",
     "fcpxml_import_srt",
     "fcpxml_import_edl",
     "fcpxml_reformat",
@@ -107,10 +108,10 @@ EXPECTED_TOOLS = {
 }
 
 
-def test_full_catalog_is_exactly_93_annotated_tools():
+def test_full_catalog_is_exactly_94_annotated_tools():
     tools = asyncio.run(mcp.list_tools())
     assert {tool.name for tool in tools} == EXPECTED_TOOLS
-    assert len(tools) == 93
+    assert len(tools) == 94
     assert all(tool.annotations is not None for tool in tools)
 
 
@@ -140,6 +141,7 @@ def test_real_no_environment_default_exposes_workflow_safe_catalog():
     assert catalog["tools"][0] == "fcp_doctor"
     assert catalog["tools"][-1] == "fcpxml_workflow_cancel"
     assert "fcpxml_add_marker" not in catalog["tools"]
+    assert "fcpxml_generate_from_clip_plan" not in catalog["tools"]
     assert "fcp_open_library" not in catalog["tools"]
     assert "fcpxml_workflow_prepare" in catalog["tools"]
     assert catalog["prompts"] == ["qc-check", "cleanup", "youtube-chapters"]
