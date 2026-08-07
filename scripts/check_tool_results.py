@@ -112,7 +112,7 @@ def _schema_failures(name: str, schema: object) -> list[str]:
     return problems
 
 
-async def failures(server, *, expected_count: int = 93) -> list[str]:
+async def failures(server, *, expected_count: int = 94) -> list[str]:
     """Return deterministic legacy-result violations from a server catalog."""
     problems = []
     tools = await server.list_tools()
