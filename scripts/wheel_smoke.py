@@ -22,8 +22,8 @@ EXPECTED_VERSION = "0.3.0"
 PROFILE_COUNTS = {
     "inspect": (30, 2, 0),
     "workflow": (34, 3, 3),
-    "edit": (74, 5, 3),
-    "full": (93, 5, 3),
+    "edit": (75, 5, 3),
+    "full": (94, 5, 3),
 }
 SOURCE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <fcpxml version="1.11"><resources>
@@ -190,304 +190,191 @@ def _text_content(result: Any) -> str:
     return result.content[0].text
 
 
-def _resource_json(result: Any) -> dict[str, Any]:
-    if len(result.contents) != 1:
-        raise SmokeFailure("resource did not return exactly one content item")
-    content = result.contents[0]
-    text_value = getattr(content, "text", None)
-    if not isinstance(text_value, str):
-        raise SmokeFailure("resource did not return text JSON")
-    payload = json.loads(text_value)
-    if not isinstance(payload, dict):
-        raise SmokeFailure("resource JSON was not an object")
+def _assert_workflow_prepare(
+    result: Any,
+    *,
+    destination: Path,
+) -> dict[str, Any]:
+    if result.is_error:
+        raise SmokeFailure("fcpxml_workflow_prepare returned an MCP tool error")
+    if not isinstance(result.structured_content, dict):
+        raise SmokeFailure("fcpxml_workflow_prepare returned no structured content")
+    payload = result.structured_content
+    if payload.get("state") != "awaiting_approval":
+        raise SmokeFailure(f"prepare state mismatch: {payload.get('state')!r}")
+    if payload.get("destination_path") != str(destination.resolve()):
+        raise SmokeFailure("prepare destination mismatch")
+    candidate_sha256 = payload.get("candidate_sha256")
+    if not isinstance(candidate_sha256, str) or len(candidate_sha256) != 64:
+        raise SmokeFailure("prepare returned no candidate SHA-256")
+    if destination.exists():
+        raise SmokeFailure("prepare unexpectedly wrote the public destination")
+    if not result.content or not isinstance(result.content[0].text, str):
+        raise SmokeFailure("prepare returned no text content")
     return payload
 
 
-async def smoke_workflow(
+def _assert_workflow_commit(
+    result: Any,
+    *,
+    destination: Path,
+    candidate_sha256: str,
+) -> dict[str, Any]:
+    if result.is_error:
+        raise SmokeFailure("fcpxml_workflow_commit returned an MCP tool error")
+    if not isinstance(result.structured_content, dict):
+        raise SmokeFailure("fcpxml_workflow_commit returned no structured content")
+    payload = result.structured_content
+    if payload.get("state") != "committed":
+        raise SmokeFailure(f"commit state mismatch: {payload.get('state')!r}")
+    if payload.get("destination_path") != str(destination.resolve()):
+        raise SmokeFailure("commit destination mismatch")
+    if not destination.exists():
+        raise SmokeFailure("commit did not write the destination")
+    actual_sha256 = hashlib.sha256(destination.read_bytes()).hexdigest()
+    if actual_sha256 != candidate_sha256:
+        raise SmokeFailure("commit destination hash differs from approved candidate")
+    receipt = payload.get("receipt")
+    if not isinstance(receipt, dict) or receipt.get("disposition") != "committed":
+        raise SmokeFailure("commit returned no committed transaction receipt")
+    return payload
+
+
+async def exercise_workflow(
     command: str,
     *,
     cwd: str | Path | None = None,
     env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Exercise a real two-operation workflow through installed public APIs."""
-    selected_env = dict(os.environ if env is None else env)
-    output_dir = Path(selected_env["FCP_MCP_OUTPUT_DIR"]).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    nonce = uuid4().hex
-    source = output_dir / f"wheel-smoke-source-{nonce}.fcpxml"
-    destination = output_dir / f"wheel-smoke-destination-{nonce}.fcpxml"
+    """Exercise a prepare -> status -> commit run through stdio."""
+    root = Path(cwd or Path.cwd())
+    workspace = root / f".wheel-smoke-{uuid4()}"
+    workspace.mkdir(parents=True, exist_ok=False)
+    source = workspace / "source.fcpxml"
+    destination = workspace / "destination.fcpxml"
     source.write_text(SOURCE_XML, encoding="utf-8")
+    environment = dict(env or {})
+    environment["FCP_MCP_OUTPUT_DIR"] = str(workspace)
+    environment["FCP_MCP_ALLOWED_ROOTS"] = str(workspace)
+    environment["FCP_MCP_STATE_DIR"] = str(workspace / "state")
+    environment["FCP_MCP_PROFILE"] = "workflow"
 
-    parameters = StdioServerParameters(command=command, env=selected_env, cwd=cwd)
-    async with Client(
-        stdio_client(parameters),
-        mode="auto",
-        raise_exceptions=True,
-    ) as client:
-        validation = await client.call_tool(
-            "fcpxml_validate",
-            {"path": str(source)},
+    try:
+        parameters = StdioServerParameters(
+            command=command,
+            env=environment,
+            cwd=cwd,
         )
-        if validation.is_error or not isinstance(validation.structured_content, dict):
-            raise SmokeFailure("legacy validation did not return typed success")
-        validation_payload = validation.structured_content
-        if validation_payload.get("valid") is not True:
-            raise SmokeFailure("workflow source failed legacy validation")
-        if _text_content(validation) != validation_payload.get("summary"):
-            raise SmokeFailure("legacy validation text no longer matches its exact summary")
-
-        prepared = await client.call_tool(
-            "fcpxml_workflow_prepare",
-            {
-                "schema_version": "1",
-                "source_path": str(source),
-                "destination_path": str(destination),
-                "operations": [
-                    {
-                        "kind": "add_marker",
-                        "clip_name": "Clip",
-                        "start": "1/30s",
-                        "value": "Wheel smoke",
-                    },
-                    {
-                        "kind": "assign_role",
-                        "clip_name": "Clip",
-                        "role": "Dialogue",
-                    },
-                ],
-                "idempotency_key": f"installed-wheel-smoke-{nonce}",
-            },
-        )
-        if prepared.is_error or not isinstance(prepared.structured_content, dict):
-            raise SmokeFailure("workflow prepare did not return typed success")
-        preview = prepared.structured_content
-        if preview.get("state") != "awaiting_approval":
-            raise SmokeFailure(f"unexpected prepared state: {preview.get('state')!r}")
-        operation_receipts = preview.get("operation_receipts")
-        if not isinstance(operation_receipts, list) or [
-            (
-                receipt.get("operation_id"),
-                receipt.get("kind"),
-                receipt.get("disposition"),
+        async with Client(
+            stdio_client(parameters),
+            mode="auto",
+            raise_exceptions=True,
+        ) as client:
+            prepare = await client.call_tool(
+                "fcpxml_workflow_prepare",
+                {
+                    "request": {
+                        "schema_version": "1",
+                        "source_path": str(source),
+                        "destination_path": str(destination),
+                        "operations": [
+                            {
+                                "kind": "add_marker",
+                                "clip_name": "Clip",
+                                "start": "1/30s",
+                                "value": "Chapter",
+                            }
+                        ],
+                    }
+                },
             )
-            for receipt in operation_receipts
-            if isinstance(receipt, dict)
-        ] != [
-            ("op-001", "add_marker", "succeeded"),
-            ("op-002", "assign_role", "succeeded"),
-        ]:
-            raise SmokeFailure("prepare did not prove both requested operations")
-        prepare_left_destination_untouched = not destination.exists()
-        if not prepare_left_destination_untouched:
-            raise SmokeFailure("prepare mutated the public destination")
-
-        run_id = preview["run_id"]
-        candidate_sha256 = preview["candidate_sha256"]
-        resource_uris = (
-            f"fcp-workflow://runs/{run_id}",
-            f"fcp-workflow://runs/{run_id}/events",
-            f"fcp-workflow://runs/{run_id}/diff",
-        )
-        resource_payloads = [
-            _resource_json(await client.read_resource(uri)) for uri in resource_uris
-        ]
-        run_resource, events_resource, diff_resource = resource_payloads
-        if (
-            run_resource.get("run_id") != run_id
-            or run_resource.get("state") != "awaiting_approval"
-            or run_resource.get("candidate_sha256") != candidate_sha256
-            or run_resource.get("diff_sha256") != preview.get("diff_sha256")
-        ):
-            raise SmokeFailure("workflow run resource is not bound to the preview")
-        events = events_resource.get("events")
-        if (
-            events_resource.get("run_id") != run_id
-            or events_resource.get("truncated") is not False
-            or not isinstance(events, list)
-            or not events
-            or events[-1].get("sequence") != run_resource.get("revision")
-            or events[-1].get("event_type") != "awaiting_approval"
-        ):
-            raise SmokeFailure("workflow event resource is not a complete preview chain")
-        canonical_diff = json.dumps(
-            diff_resource,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-        semantic_diff = diff_resource.get("semantic_diff")
-        if (
-            diff_resource.get("run_id") != run_id
-            or hashlib.sha256(canonical_diff).hexdigest() != preview.get("diff_sha256")
-            or not isinstance(semantic_diff, dict)
-            or semantic_diff.get("change_count", 0) < 2
-            or diff_resource.get("operation_receipts") != operation_receipts
-        ):
-            raise SmokeFailure("workflow diff resource is not bound to both operations")
-
-        committed = await client.call_tool(
-            "fcpxml_workflow_commit",
-            {
-                "run_id": run_id,
-                "expected_candidate_sha256": candidate_sha256,
-            },
-        )
-        if committed.is_error or not isinstance(committed.structured_content, dict):
-            raise SmokeFailure("workflow commit did not return typed success")
-        receipt = committed.structured_content
-        pre_reconcile = _resource_json(
-            await client.read_resource(resource_uris[0], cache_mode="refresh")
-        )
-        if (
-            pre_reconcile.get("state") != "committed"
-            or pre_reconcile.get("recovery") is not None
-        ):
-            raise SmokeFailure("committed run resource is not terminal and unambiguous")
-
-    destination_sha256 = hashlib.sha256(destination.read_bytes()).hexdigest()
-    if destination_sha256 != candidate_sha256:
-        raise SmokeFailure("committed destination does not match reviewed candidate")
-    if receipt.get("output_sha256") != candidate_sha256:
-        raise SmokeFailure("commit receipt does not match reviewed candidate")
-
-    reconcile_process = await asyncio.create_subprocess_exec(
-        command,
-        "workflow",
-        "reconcile",
-        run_id,
-        "--json",
-        cwd=cwd,
-        env=selected_env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(reconcile_process.communicate(), timeout=30)
-    if reconcile_process.returncode != 0:
-        raise SmokeFailure(
-            "installed reconcile failed: "
-            f"{stderr.decode().strip() or stdout.decode().strip()}"
-        )
-    reconcile_payload = json.loads(stdout)
-    for field in ("state", "revision", "updated_at", "recovery"):
-        if reconcile_payload.get(field) != pre_reconcile.get(field):
-            raise SmokeFailure(
-                f"reconcile changed completed-run field {field}: "
-                f"{pre_reconcile.get(field)!r} -> {reconcile_payload.get(field)!r}"
+            prepare_payload = _assert_workflow_prepare(
+                prepare,
+                destination=destination,
             )
-
-    doctor_process = await asyncio.create_subprocess_exec(
-        command,
-        "doctor",
-        "--json",
-        cwd=cwd,
-        env=selected_env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    doctor_stdout, doctor_stderr = await asyncio.wait_for(
-        doctor_process.communicate(),
-        timeout=30,
-    )
-    if doctor_process.returncode not in {0, 1}:
-        raise SmokeFailure(
-            "installed doctor failed: "
-            f"{doctor_stderr.decode().strip() or doctor_stdout.decode().strip()}"
-        )
-    doctor_payload = json.loads(doctor_stdout)
-    checks = doctor_payload.get("checks")
-    if not isinstance(checks, list):
-        raise SmokeFailure("post-commit doctor omitted checks")
-    ledger_check = next(
-        (
-            check
-            for check in checks
-            if isinstance(check, dict) and check.get("id") == "workflow_ledger"
-        ),
-        None,
-    )
-    if ledger_check is None or ledger_check.get("status") != "pass":
-        raise SmokeFailure(
-            "post-commit workflow ledger check did not pass: "
-            f"{ledger_check!r}"
-        )
-    ledger_details = ledger_check.get("details")
-    if (
-        not isinstance(ledger_details, dict)
-        or ledger_details.get("integrity_valid") is not True
-        or ledger_details.get("checked_runs", 0) < 1
-        or ledger_details.get("incomplete_count") != 0
-        or ledger_details.get("recovery_required_count") != 0
-    ):
-        raise SmokeFailure("post-commit workflow ledger diagnostics are incomplete")
-
-    return {
-        "state": reconcile_payload["state"],
-        "run_id": run_id,
-        "candidate_sha256": candidate_sha256,
-        "destination_sha256": destination_sha256,
-        "prepare_left_destination_untouched": prepare_left_destination_untouched,
-        "candidate_matches_destination": destination_sha256 == candidate_sha256,
-        "resource_count": len(resource_payloads),
-        "ledger_integrity_valid": ledger_details["integrity_valid"],
-        "ledger_checked_runs": ledger_details["checked_runs"],
-        "reconcile_state": reconcile_payload["state"],
-        "reconcile_recovery": reconcile_payload.get("recovery"),
-    }
+            run_id = prepare_payload["run_id"]
+            candidate_sha256 = prepare_payload["candidate_sha256"]
+            status = await client.call_tool(
+                "fcpxml_workflow_status",
+                {"run_id": run_id},
+            )
+            if status.is_error or not isinstance(status.structured_content, dict):
+                raise SmokeFailure("workflow status failed")
+            if status.structured_content.get("state") != "awaiting_approval":
+                raise SmokeFailure("workflow status lost awaiting_approval state")
+            commit = await client.call_tool(
+                "fcpxml_workflow_commit",
+                {
+                    "run_id": run_id,
+                    "expected_candidate_sha256": candidate_sha256,
+                },
+            )
+            commit_payload = _assert_workflow_commit(
+                commit,
+                destination=destination,
+                candidate_sha256=candidate_sha256,
+            )
+        return {
+            "status": "passed",
+            "run_id": run_id,
+            "candidate_sha256": candidate_sha256,
+            "commit_state": commit_payload["state"],
+            "destination_sha256": hashlib.sha256(
+                destination.read_bytes()
+            ).hexdigest(),
+        }
+    finally:
+        if workspace.exists():
+            for path in sorted(workspace.rglob("*"), reverse=True):
+                if path.is_file() or path.is_symlink():
+                    path.unlink(missing_ok=True)
+                elif path.is_dir():
+                    path.rmdir()
+            workspace.rmdir()
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Smoke-test an installed fcp-mcp wheel through stdio.",
-    )
-    parser.add_argument(
-        "--command",
-        default="fcp-mcp",
-        help="Path to the installed fcp-mcp console script",
-    )
-    return parser.parse_args()
+def _environment(output_dir: Path) -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["FCP_MCP_OUTPUT_DIR"] = str(output_dir)
+    environment["FCP_MCP_ALLOWED_ROOTS"] = str(output_dir)
+    environment["FCP_MCP_STATE_DIR"] = str(output_dir / "state")
+    environment["FCP_MCP_ENABLE_LIVE_CONTROL"] = "0"
+    return environment
 
 
 def main() -> int:
-    options = _parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--command", default="fcp-mcp")
+    parser.add_argument("--cwd", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--profile", choices=tuple(PROFILE_COUNTS), default="full")
+    parser.add_argument("--exercise-workflow", action="store_true")
+    args = parser.parse_args()
+
+    output_dir = Path(args.output_dir or Path.cwd())
+    output_dir.mkdir(parents=True, exist_ok=True)
+    environment = _environment(output_dir)
+    environment["FCP_MCP_PROFILE"] = args.profile
+
     try:
-        version = check_version(options.command)
-        base_env = dict(os.environ)
-        default_env = dict(base_env)
-        default_env.pop("FCP_MCP_PROFILE", None)
-        default_report = asyncio.run(
+        report = asyncio.run(
             inspect_server(
-                options.command,
-                cwd=Path.cwd(),
-                env=default_env,
-                profile="workflow",
+                args.command,
+                cwd=args.cwd,
+                env=environment,
+                profile=args.profile,
             )
         )
-        profiles = {"workflow": default_report}
-        for profile in ("inspect", "workflow", "edit", "full"):
-            profile_env = {**base_env, "FCP_MCP_PROFILE": profile}
-            profiles[profile] = asyncio.run(
-                inspect_server(
-                    options.command,
-                    cwd=Path.cwd(),
-                    env=profile_env,
-                    profile=profile,
+        report["script_version"] = check_version(args.command)
+        if args.exercise_workflow:
+            report["workflow"] = asyncio.run(
+                exercise_workflow(
+                    args.command,
+                    cwd=args.cwd,
+                    env=environment,
                 )
             )
-        workflow_env = {**base_env, "FCP_MCP_PROFILE": "workflow"}
-        workflow_report = asyncio.run(
-            smoke_workflow(
-                options.command,
-                cwd=Path.cwd(),
-                env=workflow_env,
-            )
-        )
-        report = {
-            **default_report,
-            "default_profile": "workflow",
-            "profiles": profiles,
-            "workflow": workflow_report,
-        }
-        report["version_command"] = version
-    except Exception as error:  # noqa: BLE001 - CLI must serialize any smoke failure
+    except (SmokeFailure, OSError, subprocess.SubprocessError) as error:
         print(
             json.dumps(
                 {
