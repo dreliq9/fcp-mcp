@@ -132,6 +132,98 @@ class TestTimelineBuilder:
         assert spine_clips[0].name == "A"
         assert spine_clips[2].role == "B-Roll"
 
+    def test_nonzero_start_preserves_explicit_full_asset_duration(self, gen):
+        gen.build_timeline_from_clips(
+            [
+                {
+                    "src": "/tmp/source.mov",
+                    "name": "Source range",
+                    "start": "900900/30000s",
+                    "duration": "150150/30000s",
+                    "asset_duration": "5735730/30000s",
+                }
+            ]
+        )
+
+        asset = gen.root.find("./resources/asset")
+        clip = gen.root.find(".//asset-clip")
+        assert asset is not None
+        assert clip is not None
+        assert asset.get("duration") == "5735730/30000s"
+        assert clip.get("start") == "900900/30000s"
+        assert clip.get("duration") == "150150/30000s"
+
+    def test_nonzero_start_derives_asset_duration_from_source_end(self, gen):
+        gen.build_timeline_from_clips(
+            [
+                {
+                    "src": "/tmp/source.mov",
+                    "start": "900900/30000s",
+                    "duration": "150150/30000s",
+                }
+            ]
+        )
+
+        asset = gen.root.find("./resources/asset")
+        assert asset is not None
+        assert asset.get("duration") == "7007/200s"
+
+    def test_repeated_source_uses_maximum_selected_source_end(self, gen):
+        gen.build_timeline_from_clips(
+            [
+                {
+                    "src": "/tmp/source.mov",
+                    "start": "2s",
+                    "duration": "3s",
+                },
+                {
+                    "src": "/tmp/source.mov",
+                    "start": "10s",
+                    "duration": "2s",
+                },
+            ]
+        )
+
+        assets = gen.root.findall("./resources/asset")
+        clips = gen.root.findall(".//asset-clip")
+        assert len(assets) == 1
+        assert assets[0].get("duration") == "12s"
+        assert [clip.get("ref") for clip in clips] == [
+            assets[0].get("id"),
+            assets[0].get("id"),
+        ]
+
+    def test_explicit_asset_duration_rejects_shorter_selected_range(self, gen):
+        with pytest.raises(
+            ValueError,
+            match="asset_duration.*must cover selected source range",
+        ):
+            gen.build_timeline_from_clips(
+                [
+                    {
+                        "src": "/tmp/source.mov",
+                        "start": "10s",
+                        "duration": "2s",
+                        "asset_duration": "11s",
+                    }
+                ]
+            )
+
+    def test_zero_start_keeps_selected_duration_as_asset_duration(self, gen):
+        gen.build_timeline_from_clips(
+            [
+                {
+                    "src": "/tmp/source.mov",
+                    "start": "0s",
+                    "duration": "150150/30000s",
+                }
+            ]
+        )
+
+        asset = gen.root.find("./resources/asset")
+        assert asset is not None
+        assert asset.get("duration") == "150150/30000s"
+
 
 class TestOutput:
     def test_save_creates_file(self, gen, tmp_path):

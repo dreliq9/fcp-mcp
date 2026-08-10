@@ -29,6 +29,12 @@ class FCPXMLGenerator:
         self._resource_counter += 1
         return f"r{self._resource_counter}"
 
+    @staticmethod
+    def _normalize_asset_source(src: str) -> str:
+        if src.startswith("file://"):
+            return src
+        return "file://" + url_quote(str(Path(src).resolve()), safe="/:@")
+
     # --- Resources ---
 
     def add_format(
@@ -79,9 +85,7 @@ class FCPXMLGenerator:
         src should be a file path or file:// URL.
         """
         # Normalize to file:// URL with percent-encoding
-        if not src.startswith("file://"):
-            p = Path(src).resolve()
-            src = "file://" + url_quote(str(p), safe="/:@")
+        src = self._normalize_asset_source(src)
 
         if src in self._assets:
             return self._assets[src]
@@ -310,6 +314,7 @@ class FCPXMLGenerator:
             name: str (optional)
             start: str (source start, optional, default "0s")
             duration: str (required)
+            asset_duration: str (optional full source duration)
             role: str (optional)
             has_video: bool (optional, default True)
             has_audio: bool (optional, default True)
@@ -318,19 +323,65 @@ class FCPXMLGenerator:
         """
         format_ref = self.add_format(name=format_name)
 
-        # Add all assets
-        asset_refs = {}
+        # Resolve one safe asset duration for every source before adding assets.
+        # Keep the original rational spelling for zero-start and explicit values.
+        asset_specs: dict[str, dict] = {}
         for clip_def in clips:
             src = clip_def["src"]
-            if src not in asset_refs:
-                asset_refs[src] = self.add_asset(
-                    src=src,
-                    name=clip_def.get("name"),
-                    duration=clip_def.get("duration", "0s"),
-                    has_video=clip_def.get("has_video", True),
-                    has_audio=clip_def.get("has_audio", True),
-                    format_ref=format_ref,
+            source_key = self._normalize_asset_source(src)
+            start_text = clip_def.get("start", "0s")
+            duration_text = clip_def["duration"]
+            start = RationalTime.from_fcpxml(start_text)
+            duration = RationalTime.from_fcpxml(duration_text)
+            source_end = duration if start.is_zero else start + duration
+            source_end_text = (
+                duration_text if start.is_zero else source_end.to_fcpxml()
+            )
+            spec = asset_specs.setdefault(
+                source_key,
+                {
+                    "clip": clip_def,
+                    "source_end": source_end,
+                    "source_end_text": source_end_text,
+                    "explicit_durations": [],
+                },
+            )
+            if source_end > spec["source_end"]:
+                spec["source_end"] = source_end
+                spec["source_end_text"] = source_end_text
+            if "asset_duration" in clip_def:
+                explicit_text = clip_def["asset_duration"]
+                spec["explicit_durations"].append(
+                    (RationalTime.from_fcpxml(explicit_text), explicit_text)
                 )
+
+        asset_refs: dict[str, str] = {}
+        for source_key, spec in asset_specs.items():
+            explicit_durations = spec["explicit_durations"]
+            for explicit, explicit_text in explicit_durations:
+                if explicit < spec["source_end"]:
+                    raise ValueError(
+                        "asset_duration "
+                        f"{explicit_text} must cover selected source range "
+                        f"ending at {spec['source_end_text']} for "
+                        f"{spec['clip']['src']}"
+                    )
+            if explicit_durations:
+                _, asset_duration = max(
+                    explicit_durations,
+                    key=lambda item: item[0],
+                )
+            else:
+                asset_duration = spec["source_end_text"]
+            first_clip = spec["clip"]
+            asset_refs[source_key] = self.add_asset(
+                src=first_clip["src"],
+                name=first_clip.get("name"),
+                duration=asset_duration,
+                has_video=first_clip.get("has_video", True),
+                has_audio=first_clip.get("has_audio", True),
+                format_ref=format_ref,
+            )
 
         # Calculate total duration
         total = RationalTime.zero()
@@ -349,7 +400,9 @@ class FCPXMLGenerator:
         for clip_def in clips:
             self.add_clip_to_spine(
                 spine=spine,
-                asset_ref=asset_refs[clip_def["src"]],
+                asset_ref=asset_refs[
+                    self._normalize_asset_source(clip_def["src"])
+                ],
                 name=clip_def.get("name", ""),
                 start=clip_def.get("start", "0s"),
                 duration=clip_def["duration"],

@@ -1265,6 +1265,16 @@ def _resolve_clip_sources(
                     f"clips_json[{index}].start must be a string",
                 )
             _parse_time(str(resolved["start"]), "clip start")
+        if "asset_duration" in resolved:
+            if not isinstance(resolved["asset_duration"], str):
+                raise FCPMCPError(
+                    ErrorCode.INVALID_ARGUMENTS,
+                    f"clips_json[{index}].asset_duration must be a string",
+                )
+            _parse_time(
+                str(resolved["asset_duration"]),
+                "clip asset_duration",
+            )
         resolved_clips.append(resolved)
     return resolved_clips
 
@@ -2990,7 +3000,7 @@ def fcpxml_create_timeline(
     """Build a timeline from a list of clip definitions.
 
     Args:
-        clips_json: JSON array of clips, each: {"src": "/path/to/file.mov", "name"?: str, "duration": "FCPXML_time", "start"?: str, "role"?: str}
+        clips_json: JSON array of clips, each: {"src": "/path/to/file.mov", "name"?: str, "duration": "FCPXML_time", "start"?: str, "asset_duration"?: "full_source_FCPXML_time", "role"?: str}
         project_name: Project name
         format_name: Video format name
         event_name: Event name
@@ -3000,8 +3010,18 @@ def fcpxml_create_timeline(
         _load_json_list(clips_json, "clips_json")
     )
     gen = FCPXMLGenerator()
-    gen.build_timeline_from_clips(clips, project_name=project_name,
-                                   format_name=format_name, event_name=event_name)
+    try:
+        gen.build_timeline_from_clips(
+            clips,
+            project_name=project_name,
+            format_name=format_name,
+            event_name=event_name,
+        )
+    except ValueError as error:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            str(error),
+        ) from error
     receipt, structured = _save_generation_result(
         gen,
         output_path,

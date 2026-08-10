@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 
@@ -376,6 +377,63 @@ def test_generator_rejects_embedded_media_outside_read_roots(
         assert output.exists() is False
     finally:
         outside.unlink(missing_ok=True)
+
+
+def test_create_timeline_accepts_explicit_asset_duration(
+    tmp_path: Path,
+    scoped_server_paths,
+):
+    media = tmp_path / "source.mov"
+    media.write_bytes(b"media")
+    output = tmp_path / "timeline.fcpxml"
+
+    server.fcpxml_create_timeline(
+        json.dumps(
+            [
+                {
+                    "src": str(media),
+                    "start": "900900/30000s",
+                    "duration": "150150/30000s",
+                    "asset_duration": "5735730/30000s",
+                }
+            ]
+        ),
+        output_path=str(output),
+    )
+
+    root = ET.parse(output).getroot()
+    asset = root.find("./resources/asset")
+    assert asset is not None
+    assert asset.get("duration") == "5735730/30000s"
+
+
+def test_create_timeline_rejects_short_explicit_asset_duration(
+    tmp_path: Path,
+    scoped_server_paths,
+):
+    media = tmp_path / "source.mov"
+    media.write_bytes(b"media")
+    output = tmp_path / "timeline.fcpxml"
+
+    with pytest.raises(
+        FCPMCPError,
+        match="invalid_arguments: asset_duration.*must cover selected source range",
+    ):
+        server.fcpxml_create_timeline(
+            json.dumps(
+                [
+                    {
+                        "src": str(media),
+                        "start": "10s",
+                        "duration": "2s",
+                        "asset_duration": "11s",
+                    }
+                ]
+            ),
+            output_path=str(output),
+        )
+
+    assert output.exists() is False
 
 
 def test_puppet_rig_rejects_embedded_image_outside_read_roots(

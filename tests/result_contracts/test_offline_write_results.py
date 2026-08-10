@@ -264,6 +264,49 @@ async def test_generation_results_are_reparsed_from_committed_fcpxml(
 
 
 @pytest.mark.asyncio
+async def test_timeline_tool_preserves_explicit_full_source_duration(
+    tmp_path: Path,
+) -> None:
+    media = tmp_path / "source.mov"
+    media.write_bytes(b"media")
+    destination = tmp_path / "explicit-source-duration.fcpxml"
+    result = await server.mcp.call_tool(
+        "fcpxml_create_timeline",
+        {
+            "clips_json": json.dumps(
+                [
+                    {
+                        "src": str(media),
+                        "name": "Source range",
+                        "start": "900900/30000s",
+                        "duration": "150150/30000s",
+                        "asset_duration": "5735730/30000s",
+                    }
+                ]
+            ),
+            "project_name": "Explicit Source Duration",
+            "output_path": str(destination),
+        },
+    )
+
+    assert result.is_error is False
+    assert result.structured_content["selected_clip_count"] == 1
+    _assert_fcpxml_evidence(
+        result.structured_content,
+        destination,
+        source=None,
+    )
+    root = ET.parse(destination).getroot()
+    asset = root.find("./resources/asset")
+    clip = root.find(".//asset-clip")
+    assert asset is not None
+    assert clip is not None
+    assert asset.get("duration") == "5735730/30000s"
+    assert clip.get("start") == "900900/30000s"
+    assert clip.get("duration") == "150150/30000s"
+
+
+@pytest.mark.asyncio
 async def test_import_results_report_actual_cues_and_events(
     sample_fcpxml_path: Path,
     tmp_path: Path,
