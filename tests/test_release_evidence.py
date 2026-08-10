@@ -6,7 +6,6 @@ import re
 import struct
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 PROVENANCE_PATH = ROOT / "docs/releases/v0.3.0-provenance.json"
 NOTE_PATH = ROOT / "docs/releases/v0.3.0.md"
