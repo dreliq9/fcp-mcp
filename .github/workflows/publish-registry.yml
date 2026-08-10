@@ -1,0 +1,89 @@
+name: Publish MCP Registry metadata
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  registry:
+    name: Publish immutable v0.3.0 Registry metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout immutable v0.3.0
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: v0.3.0
+          persist-credentials: false
+      - name: Verify immutable release metadata
+        run: |
+          set -euo pipefail
+          test "$(jq -r '.name' server.json)" = "io.github.dreliq9/fcp-mcp"
+          test "$(jq -r '.version' server.json)" = "0.3.0"
+          test "$(jq -r '.packages | length' server.json)" = "1"
+          test "$(jq -r '.packages[0].registryType' server.json)" = "pypi"
+          test "$(jq -r '.packages[0].identifier' server.json)" = "fcp-mcp"
+          test "$(jq -r '.packages[0].version' server.json)" = "0.3.0"
+          test "$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')" = "0.3.0"
+      - name: Wait for public PyPI 0.3.0
+        run: |
+          set -euo pipefail
+          package_json="$RUNNER_TEMP/pypi-fcp-mcp-0.3.0.json"
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error --location --max-time 20 --retry 0 \
+              --output "$package_json" \
+              https://pypi.org/pypi/fcp-mcp/0.3.0/json && \
+              jq -e --arg name "fcp-mcp" --arg version "0.3.0" \
+                '.info.name == $name and .info.version == $version and ([.urls[] | select(.filename == "fcp_mcp-0.3.0-py3-none-any.whl")] | length == 1)' \
+                "$package_json"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 12 ]; then
+              sleep 10
+            fi
+          done
+          echo "PyPI fcp-mcp 0.3.0 was not publicly available" >&2
+          exit 1
+      - name: Download verified mcp-publisher
+        run: |
+          set -euo pipefail
+          publisher_archive="$RUNNER_TEMP/mcp-publisher_linux_amd64.tar.gz"
+          publisher_dir="$RUNNER_TEMP/mcp-publisher"
+          curl --fail --silent --show-error --location --max-time 60 --retry 0 \
+            --output "$publisher_archive" \
+            https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+          printf '%s  %s\n' \
+            a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc \
+            "$publisher_archive" | sha256sum -c -
+          mkdir -p "$publisher_dir"
+          tar --extract --gzip --file "$publisher_archive" --directory "$publisher_dir" --no-same-owner
+          test -x "$publisher_dir/mcp-publisher"
+      - name: Publish through GitHub OIDC
+        run: |
+          set -euo pipefail
+          publisher="$RUNNER_TEMP/mcp-publisher/mcp-publisher"
+          "$publisher" login github-oidc
+          "$publisher" publish
+      - name: Verify Registry response
+        run: |
+          set -euo pipefail
+          registry_json="$RUNNER_TEMP/registry-fcp-mcp-0.3.0.json"
+          registry_url="https://registry.modelcontextprotocol.io/v0.1/servers/io.github.dreliq9%2Ffcp-mcp/versions/0.3.0"
+          for attempt in $(seq 1 6); do
+            if curl --fail --silent --show-error --location --max-time 20 --retry 0 \
+              --output "$registry_json" "$registry_url" && \
+              jq -e --arg name "io.github.dreliq9/fcp-mcp" --arg package "fcp-mcp" --arg version "0.3.0" \
+                '.server.name == $name and .server.version == $version and ([.server.packages[] | select(.registryType == "pypi" and .identifier == $package and .version == $version)] | length == 1)' \
+                "$registry_json"; then
+              exit 0
+            fi
+            if [ "$attempt" -lt 6 ]; then
+              sleep 10
+            fi
+          done
+          echo "Registry response did not confirm fcp-mcp 0.3.0" >&2
+          exit 1

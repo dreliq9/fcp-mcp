@@ -58,3 +58,30 @@ def test_publish_workflow_isolates_trusted_publishing():
     assert "actions/download-artifact@" in workflow
     assert "environment:" in workflow
     assert "name: pypi" in workflow
+
+
+def test_registry_workflow_is_manual_oidc_only_and_verifies_public_metadata():
+    workflow = Path(".github/workflows/publish-registry.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "workflow_dispatch:" in workflow
+    assert "id-token: write" in workflow
+    assert "contents: read" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "ref: v0.3.0" in workflow
+    assert "mcp-publisher_linux_amd64.tar.gz" in workflow
+    assert "v1.8.1" in workflow
+    assert (
+        "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
+        in workflow
+    )
+    assert "https://pypi.org/pypi/fcp-mcp/0.3.0/json" in workflow
+    assert "registry.modelcontextprotocol.io/v0.1/servers/" in workflow
+    assert "io.github.dreliq9/fcp-mcp" in workflow
+    assert '"fcp-mcp"' in workflow
+    assert '"0.3.0"' in workflow
+    assert "login github-oidc" in workflow
+    assert '"$publisher" publish' in workflow
+    assert "MCP_GITHUB_TOKEN" not in workflow
+    assert "github --token" not in workflow

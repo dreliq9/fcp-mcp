@@ -126,6 +126,22 @@ verified distributions. Only the separate two-step publish job receives
 Apple-DTD and live-import checks remain local macOS release gates because CI
 runners do not contain the licensed Final Cut Pro application bundle.
 
+## MCP Registry publication
+
+Registry metadata is published only after PyPI `fcp-mcp` `0.3.0` is publicly
+available. Do not move or recreate the `v0.3.0` tag, and do not rerun PyPI
+publication for this version. Instead, manually dispatch
+`.github/workflows/publish-registry.yml`; it checks out the immutable
+`v0.3.0` tag and uses a separate short-lived GitHub OIDC credential for the
+MCP Registry. It never publishes a Python distribution.
+
+The workflow downloads the pinned MCP publisher, verifies its SHA-256 before
+execution, verifies both `server.json` versions and the package version, then
+waits (with bounded retries) for PyPI's `0.3.0` JSON response. It fails closed
+unless the Registry detail response confirms
+`io.github.dreliq9/fcp-mcp`, PyPI package `fcp-mcp`, and version `0.3.0`.
+Do not add a Registry PAT or any long-lived Registry token to this workflow.
+
 ## What not to contribute
 
 - Scripting escape hatches that run arbitrary Python in the server

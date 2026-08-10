@@ -45,6 +45,10 @@ PUBLISH_ACTION = (
     "pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e"
 )
 RELEASE_ARTIFACT = "fcp-mcp-v0.3.0-release-dist"
+REGISTRY_WORKFLOW = ".github/workflows/publish-registry.yml"
+REGISTRY_PUBLISHER_DIGEST = (
+    "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
+)
 MACOS_CLASSIFIER = "Operating System :: MacOS :: MacOS X"
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 
@@ -165,7 +169,7 @@ def _check_workflow_inventory(root: Path, findings: list[str]) -> None:
             ".github/workflows: required workflow directory is missing or unsafe"
         )
         return
-    expected = {"ci.yml", "publish.yml"}
+    expected = {"ci.yml", "publish.yml", "publish-registry.yml"}
     try:
         entries = sorted(directory.iterdir(), key=lambda path: path.name)
     except OSError:
@@ -523,6 +527,93 @@ def _check_publish(root: Path, findings: list[str]) -> None:
         _check_publish_job(jobs["publish"], findings)
 
 
+def _check_registry_publish(root: Path, findings: list[str]) -> None:
+    path = root / REGISTRY_WORKFLOW
+    workflow = _load_yaml(path, root, findings)
+    if workflow is None:
+        return
+    prefix = f"{REGISTRY_WORKFLOW}: registry"
+    if "defaults" in workflow or "env" in workflow:
+        findings.append(f"{REGISTRY_WORKFLOW}: workflow may alter registry publishing")
+    if workflow.get("on") != {"workflow_dispatch": None}:
+        findings.append(f"{REGISTRY_WORKFLOW}: trigger is not manual-only")
+    if workflow.get("permissions") != WORKFLOW_PERMISSIONS:
+        findings.append(f"{REGISTRY_WORKFLOW}: workflow permissions are not exactly contents read")
+    jobs = _jobs(workflow, REGISTRY_WORKFLOW, findings)
+    if jobs is None:
+        return
+    if set(jobs) != {"registry"}:
+        findings.append(f"{REGISTRY_WORKFLOW}: jobs are not exactly the Registry exception")
+        return
+    job = jobs["registry"]
+    if not isinstance(job, dict):
+        findings.append(f"{prefix} job is not a mapping")
+        return
+    allowed_job_keys = {"name", "runs-on", "permissions", "steps"}
+    if set(job) - allowed_job_keys:
+        findings.append(f"{prefix} job contains forbidden keys")
+    if job.get("runs-on") != PUBLISH_RUNNER:
+        findings.append(f"{prefix} job is not the isolated Ubuntu metadata exception")
+    if job.get("permissions") != {"contents": "read", "id-token": "write"}:
+        findings.append(f"{prefix} permissions are not isolated GitHub OIDC")
+    steps = job.get("steps")
+    if not isinstance(steps, list) or len(steps) != 6:
+        findings.append(f"{prefix} must contain exactly six reviewed steps")
+        return
+    checkout = steps[0]
+    if not isinstance(checkout, dict) or checkout != {
+        "name": "Checkout immutable v0.3.0",
+        "uses": CHECKOUT_ACTION,
+        "with": {"ref": "v0.3.0", "persist-credentials": False},
+    }:
+        findings.append(f"{prefix} checkout is not the pinned immutable tag")
+    expected_names = [
+        "Verify immutable release metadata",
+        "Wait for public PyPI 0.3.0",
+        "Download verified mcp-publisher",
+        "Publish through GitHub OIDC",
+        "Verify Registry response",
+    ]
+    remaining = steps[1:]
+    if any(
+        not isinstance(step, dict)
+        or set(step) != {"name", "run"}
+        or step.get("name") != expected_name
+        or not isinstance(step.get("run"), str)
+        for step, expected_name in zip(remaining, expected_names, strict=True)
+    ):
+        findings.append(f"{prefix} steps are not the isolated reviewed commands")
+        return
+    command = "\n".join(step["run"] for step in remaining)
+    required_markers = (
+        "set -euo pipefail",
+        "server.json",
+        "pyproject.toml",
+        "https://pypi.org/pypi/fcp-mcp/0.3.0/json",
+        "mcp-publisher_linux_amd64.tar.gz",
+        "releases/download/v1.8.1/",
+        REGISTRY_PUBLISHER_DIGEST,
+        "sha256sum -c -",
+        "tar --extract",
+        "login github-oidc",
+        "\"$publisher\" publish",
+        "https://registry.modelcontextprotocol.io/v0.1/servers/",
+        ".server.name == $name",
+        ".server.version == $version",
+        ".identifier == $package",
+    )
+    if any(marker not in command for marker in required_markers):
+        findings.append(f"{prefix} lacks a required pinned publication guard")
+    forbidden_markers = (
+        "MCP_GITHUB_TOKEN",
+        "github --token",
+        "secrets.",
+        "ACTIONS_RUNTIME_TOKEN",
+    )
+    if any(marker in command for marker in forbidden_markers):
+        findings.append(f"{prefix} contains a forbidden long-lived token path")
+
+
 def _check_pyproject(root: Path, findings: list[str]) -> None:
     path = root / "pyproject.toml"
     text = _read_text(path, root, findings)
@@ -793,6 +884,7 @@ def check(root: Path) -> list[str]:
     _check_workflow_inventory(resolved_root, findings)
     _check_ci(resolved_root, findings)
     _check_publish(resolved_root, findings)
+    _check_registry_publish(resolved_root, findings)
     _check_support_surfaces(resolved_root, findings)
     return sorted(set(findings))
 

@@ -155,6 +155,15 @@ jobs:
 """.lstrip(),
         encoding="utf-8",
     )
+    (workflows / "publish-registry.yml").write_text(
+        (
+            Path(__file__).resolve().parents[2]
+            / ".github"
+            / "workflows"
+            / "publish-registry.yml"
+        ).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
 
     (root / "pyproject.toml").write_text(
         """
@@ -203,6 +212,11 @@ recursive-include scripts *.py
 
 def test_repository_satisfies_macos_only_architecture_contract():
     assert check(Path(__file__).resolve().parents[2]) == []
+
+
+def test_checker_allows_the_pinned_registry_metadata_exception(tmp_path):
+    _write_valid_repository(tmp_path)
+    assert check(tmp_path) == []
 
 
 def test_checker_reports_windows_source_and_linux_product_job(tmp_path):
