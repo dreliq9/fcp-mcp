@@ -1,0 +1,53 @@
+name: Bug report
+description: Report a reproducible fcp-mcp problem without private media or paths.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private media, or unredacted local paths.
+        For security-sensitive reports, use SECURITY.md instead of this form.
+  - type: input
+    id: version
+    attributes:
+      label: fcp-mcp version and installation method
+      placeholder: "0.3.0 via pipx"
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client and version
+      placeholder: "Claude Code 1.x"
+    validations:
+      required: true
+  - type: dropdown
+    id: profile
+    attributes:
+      label: Selected profile
+      options: [inspect, workflow, edit, full]
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: macOS, Final Cut Pro, Python, and live-control state
+      description: Include Final Cut Pro only when relevant. State whether FCP_MCP_ENABLE_LIVE_CONTROL was enabled.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Redacted doctor output
+      description: Paste fcp-mcp doctor --json after redacting private paths and media names.
+      render: json
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include expected result, actual result, exact tool or command, and error or receipt fields.
+    validations:
+      required: true

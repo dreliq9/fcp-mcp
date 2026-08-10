@@ -15,7 +15,11 @@ from jsonschema import Draft202012Validator
 from fcp_mcp.profiles import Profile
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PATHS = (ROOT / "WORKFLOWS.md", ROOT / "LLM_GUIDE.md")
+DEFAULT_PATHS = (
+    ROOT / "WORKFLOWS.md",
+    ROOT / "LLM_GUIDE.md",
+    ROOT / "docs" / "FIRST_RUN.md",
+)
 TOOL_CALL_BLOCK = re.compile(
     r"^```tool-call[ \t]*\r?\n(.*?)^```[ \t]*$",
     re.DOTALL | re.MULTILINE,

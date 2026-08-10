@@ -1,0 +1,31 @@
+name: Feature request
+description: Propose a bounded FCPXML workflow improvement.
+title: "feature: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the editing or interchange problem, not private media or credentials.
+        Security-sensitive reports belong in SECURITY.md, not this form.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What cannot be accomplished with the current inspect, prepare, review, hash approval, and commit workflow?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Smallest useful outcome
+      description: Describe the reviewable FCPXML result and evidence you need.
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and safety constraints
+      description: Include FCPXML, Final Cut Pro, client, or permission constraints if known.
+    validations:
+      required: true

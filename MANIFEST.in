@@ -1,4 +1,4 @@
-include LICENSE README.md CHANGELOG.md ROADMAP.md LLM_GUIDE.md WORKFLOWS.md
+include LICENSE README.md CHANGELOG.md ROADMAP.md LLM_GUIDE.md WORKFLOWS.md SUPPORT.md SECURITY.md
 include server.json
 recursive-include examples *.py *.md
 recursive-include docs *.md

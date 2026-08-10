@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability privately
+    about: Do not file a public issue for security-sensitive reports.
+    url: https://github.com/dreliq9/fcp-mcp/blob/main/SECURITY.md

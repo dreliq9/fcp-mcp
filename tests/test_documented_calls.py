@@ -105,7 +105,7 @@ def test_published_tool_calls_match_live_catalog():
     counts: dict[str, int] = {}
     failures: list[str] = []
 
-    for relative_path in ("WORKFLOWS.md", "LLM_GUIDE.md"):
+    for relative_path in ("WORKFLOWS.md", "LLM_GUIDE.md", "docs/FIRST_RUN.md"):
         blocks = extract_tool_call_blocks((ROOT / relative_path).read_text())
         counts[relative_path] = len(blocks)
         for block_number, call in blocks:
@@ -114,4 +114,5 @@ def test_published_tool_calls_match_live_catalog():
 
     assert counts["WORKFLOWS.md"] >= 25
     assert counts["LLM_GUIDE.md"] >= 10
+    assert counts["docs/FIRST_RUN.md"] >= 3
     assert failures == []
