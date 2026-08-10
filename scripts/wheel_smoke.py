@@ -70,6 +70,41 @@ def check_version(command: str) -> str:
     return version
 
 
+def smoke_sample(command: str, output: Path) -> dict[str, Any]:
+    """Materialize and verify the installed package's first-run sample."""
+    result = subprocess.run(
+        [command, "sample", "--output", str(output)],
+        text=True,
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SmokeFailure(
+            f"{command} sample exited {result.returncode}: "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise SmokeFailure(
+            f"sample output was not JSON: {result.stdout.strip()!r}"
+        ) from error
+    if not isinstance(payload, dict):
+        raise SmokeFailure("sample output was not a JSON object")
+    if payload.get("sample_path") != str(output.absolute()):
+        raise SmokeFailure(f"sample path mismatch: {payload!r}")
+    if not isinstance(payload.get("next_prompt"), str) or not payload[
+        "next_prompt"
+    ].startswith("Inspect"):
+        raise SmokeFailure(f"sample next prompt is missing: {payload!r}")
+    if not output.is_file():
+        raise SmokeFailure("sample command did not create its requested output")
+    if '<fcpxml version="1.11">' not in output.read_text(encoding="utf-8"):
+        raise SmokeFailure("sample output was not the packaged FCPXML fixture")
+    return payload
+
+
 async def _collect_pages(
     fetch: Callable[[str | None], Awaitable[Page]],
     field: str,
@@ -451,6 +486,11 @@ def main() -> int:
     try:
         version = check_version(options.command)
         base_env = dict(os.environ)
+        sample_report = smoke_sample(
+            options.command,
+            Path(base_env["FCP_MCP_OUTPUT_DIR"])
+            / f"wheel-smoke-first-run-{uuid4().hex}.fcpxml",
+        )
         default_env = dict(base_env)
         default_env.pop("FCP_MCP_PROFILE", None)
         default_report = asyncio.run(
@@ -484,6 +524,7 @@ def main() -> int:
             **default_report,
             "default_profile": "workflow",
             "profiles": profiles,
+            "sample": sample_report,
             "workflow": workflow_report,
         }
         report["version_command"] = version

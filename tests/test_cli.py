@@ -45,6 +45,26 @@ def test_sample_command_refuses_to_overwrite(tmp_path, capsys):
     assert "destination_exists" in capsys.readouterr().err
 
 
+def test_sample_command_refuses_dangling_destination_symlink(tmp_path, capsys):
+    target = tmp_path / "missing-target.fcpxml"
+    output = tmp_path / "dangling-link.fcpxml"
+    output.symlink_to(target)
+
+    assert main(["sample", "--output", str(output)]) == 2
+    assert output.is_symlink()
+    assert not target.exists()
+    assert "destination_exists" in capsys.readouterr().err
+
+
+def test_sample_command_refuses_missing_parent_without_creating_it(tmp_path, capsys):
+    parent = tmp_path / "missing-parent"
+    output = parent / "first-run.fcpxml"
+
+    assert main(["sample", "--output", str(output)]) == 2
+    assert not parent.exists()
+    assert "destination_parent_missing" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "arguments",
     [[], ["serve"], ["doctor"], ["doctor", "--json"]],

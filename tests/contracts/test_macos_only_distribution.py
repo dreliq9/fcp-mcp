@@ -246,7 +246,8 @@ def test_sdist_inventory_uses_runner_builtin_search_tool():
     command = _step_named(steps, "Verify source-distribution support files")["run"]
 
     assert "rg -q" not in command
-    assert command.count("grep -q") == 4
+    assert command.count("grep -q") == 5
+    assert "src/fcp_mcp/samples/first_run.fcpxml" in command
 
 
 @pytest.mark.parametrize(

@@ -135,6 +135,7 @@ jobs:
           grep -q 'docs/research/' /tmp/fcp-mcp-sdist-files
           grep -q 'WORKFLOWS.md' /tmp/fcp-mcp-sdist-files
           grep -q 'server.json' /tmp/fcp-mcp-sdist-files
+          grep -q 'src/fcp_mcp/samples/first_run.fcpxml' /tmp/fcp-mcp-sdist-files
       - name: Smoke-test installed wheel
         env:
           FCP_MCP_PROFILE: full

@@ -10,6 +10,7 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from scripts import wheel_smoke
 from scripts.wheel_smoke import (
     PROFILE_COUNTS,
     SOURCE_XML,
@@ -41,6 +42,16 @@ def _environment(tmp_path: Path) -> dict[str, str]:
 
 def test_installed_command_reports_release_version():
     assert check_version(str(_command())) == "0.3.0"
+
+
+def test_installed_command_materializes_packaged_first_run_sample(tmp_path: Path):
+    output = tmp_path / "first-run.fcpxml"
+
+    payload = wheel_smoke.smoke_sample(str(_command()), output)
+
+    assert payload["sample_path"] == str(output.absolute())
+    assert payload["next_prompt"].startswith("Inspect")
+    assert '<fcpxml version="1.11">' in output.read_text(encoding="utf-8")
 
 
 def test_real_stdio_initialize_catalog_and_doctor(tmp_path: Path):

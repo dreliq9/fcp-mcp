@@ -108,12 +108,16 @@ def _workflow_error_exit(error: FCPMCPError) -> int:
     return 1
 
 
+def _absolute_destination(destination: Path) -> Path:
+    return destination if destination.is_absolute() else Path.cwd() / destination
+
+
 def _materialize_sample(destination: Path) -> Path:
     sample = resources.files("fcp_mcp.samples").joinpath("first_run.fcpxml")
-    resolved_destination = destination.resolve()
-    with resolved_destination.open("xb") as output:
+    absolute_destination = _absolute_destination(destination)
+    with absolute_destination.open("xb") as output:
         output.write(sample.read_bytes())
-    return resolved_destination
+    return absolute_destination
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -173,11 +177,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return {"ready": 0, "degraded": 1, "blocked": 2}[report.status]
     if options.command == "sample":
+        destination = _absolute_destination(options.output)
+        if not destination.parent.is_dir():
+            print(
+                "destination_parent_missing: refusing to create parent directory "
+                f"{destination.parent}",
+                file=sys.stderr,
+            )
+            return 2
         try:
             sample_path = _materialize_sample(options.output)
         except FileExistsError:
             print(
-                f"destination_exists: refusing to overwrite {options.output.resolve()}",
+                f"destination_exists: refusing to overwrite {destination}",
+                file=sys.stderr,
+            )
+            return 2
+        except FileNotFoundError:
+            print(
+                "destination_parent_missing: refusing to create parent directory "
+                f"{destination.parent}",
                 file=sys.stderr,
             )
             return 2
