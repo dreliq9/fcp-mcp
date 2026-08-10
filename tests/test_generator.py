@@ -209,6 +209,44 @@ class TestTimelineBuilder:
                 ]
             )
 
+    def test_repeated_source_rejects_conflicting_asset_durations(self, gen):
+        with pytest.raises(
+            ValueError,
+            match="conflicting asset_duration values for shared source",
+        ):
+            gen.build_timeline_from_clips(
+                [
+                    {
+                        "src": "/tmp/source.mov",
+                        "duration": "1s",
+                        "asset_duration": "20s",
+                    },
+                    {
+                        "src": "/tmp/source.mov",
+                        "duration": "1s",
+                        "asset_duration": "30s",
+                    },
+                ]
+            )
+
+    def test_cached_asset_is_extended_to_cover_new_selected_range(self, gen):
+        asset_ref = gen.add_asset("/tmp/source.mov", duration="2s")
+
+        gen.build_timeline_from_clips(
+            [
+                {
+                    "src": "/tmp/source.mov",
+                    "start": "10s",
+                    "duration": "2s",
+                }
+            ]
+        )
+
+        assets = gen.root.findall("./resources/asset")
+        assert len(assets) == 1
+        assert assets[0].get("id") == asset_ref
+        assert assets[0].get("duration") == "12s"
+
     def test_zero_start_keeps_selected_duration_as_asset_duration(self, gen):
         gen.build_timeline_from_clips(
             [

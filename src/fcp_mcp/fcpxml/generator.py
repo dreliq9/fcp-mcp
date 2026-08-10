@@ -88,7 +88,16 @@ class FCPXMLGenerator:
         src = self._normalize_asset_source(src)
 
         if src in self._assets:
-            return self._assets[src]
+            rid = self._assets[src]
+            existing = self.resources.find(f"./asset[@id='{rid}']")
+            if existing is not None:
+                existing_duration = RationalTime.from_fcpxml(
+                    existing.get("duration", "0s")
+                )
+                requested_duration = RationalTime.from_fcpxml(duration)
+                if requested_duration > existing_duration:
+                    existing.set("duration", duration)
+            return rid
 
         rid = self._next_id()
         if name is None:
@@ -367,10 +376,15 @@ class FCPXMLGenerator:
                         f"{spec['clip']['src']}"
                     )
             if explicit_durations:
-                _, asset_duration = max(
-                    explicit_durations,
-                    key=lambda item: item[0],
-                )
+                explicit_value, asset_duration = explicit_durations[0]
+                if any(
+                    value != explicit_value
+                    for value, _ in explicit_durations[1:]
+                ):
+                    raise ValueError(
+                        "conflicting asset_duration values for shared source "
+                        f"{spec['clip']['src']}"
+                    )
             else:
                 asset_duration = spec["source_end_text"]
             first_clip = spec["clip"]
