@@ -81,7 +81,7 @@ fcp-mcp = "fcp_mcp.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-fcp_mcp = ["py.typed"]
+fcp_mcp = ["py.typed", "samples/*.fcpxml"]
 
 [tool.ruff]
 line-length = 100

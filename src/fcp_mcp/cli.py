@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import sys
 from collections.abc import Sequence
+from importlib import resources
+from pathlib import Path
 
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import DoctorReport, ErrorCode, FCPMCPError
@@ -105,6 +108,14 @@ def _workflow_error_exit(error: FCPMCPError) -> int:
     return 1
 
 
+def _materialize_sample(destination: Path) -> Path:
+    sample = resources.files("fcp_mcp.samples").joinpath("first_run.fcpxml")
+    resolved_destination = destination.resolve()
+    with resolved_destination.open("xb") as output:
+        output.write(sample.read_bytes())
+    return resolved_destination
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="fcp-mcp")
     parser.add_argument("--version", action="store_true")
@@ -116,6 +127,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     doctor = commands.add_parser("doctor")
     doctor.add_argument("--json", action="store_true", dest="as_json")
+    sample = commands.add_parser("sample")
+    sample.add_argument("--output", required=True, type=Path)
     workflow = commands.add_parser("workflow")
     workflow_commands = workflow.add_subparsers(
         dest="workflow_command",
@@ -159,6 +172,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             else _render_doctor(report)
         )
         return {"ready": 0, "degraded": 1, "blocked": 2}[report.status]
+    if options.command == "sample":
+        try:
+            sample_path = _materialize_sample(options.output)
+        except FileExistsError:
+            print(
+                f"destination_exists: refusing to overwrite {options.output.resolve()}",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            json.dumps(
+                {
+                    "next_prompt": (
+                        "Inspect the FCPXML first; then prepare, review, approve "
+                        "the hash, and commit."
+                    ),
+                    "sample_path": str(sample_path),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
     if options.command == "workflow" and options.workflow_command == "reconcile":
         try:
             config = RuntimeConfig.from_env()

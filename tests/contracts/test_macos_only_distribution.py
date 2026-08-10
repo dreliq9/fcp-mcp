@@ -156,6 +156,18 @@ def test_package_and_active_docs_claim_only_macos():
     assert "smithery.yaml" not in (ROOT / "MANIFEST.in").read_text()
 
 
+def test_first_run_sample_is_included_in_release_inventories():
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    package_data = project["tool"]["setuptools"]["package-data"]
+
+    assert package_data["fcp_mcp"] == ["py.typed", "samples/*.fcpxml"]
+    assert (
+        "recursive-include src/fcp_mcp/samples *.fcpxml"
+        in (ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    )
+    assert (ROOT / "src/fcp_mcp/samples/first_run.fcpxml").is_file()
+
+
 def test_only_macos_jobs_execute_product():
     ci = _load_workflow(".github/workflows/ci.yml")
     ci_jobs = ci["jobs"]

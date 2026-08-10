@@ -28,6 +28,23 @@ def test_version_prints_package_version(capsys):
     assert capsys.readouterr().out.strip() == "fcp-mcp 0.3.0"
 
 
+def test_sample_command_materializes_packaged_fcpxml(tmp_path, capsys):
+    output = tmp_path / "first-run.fcpxml"
+    assert main(["sample", "--output", str(output)]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["sample_path"] == str(output.resolve())
+    assert payload["next_prompt"].startswith("Inspect")
+    assert '<fcpxml version="1.11">' in output.read_text()
+
+
+def test_sample_command_refuses_to_overwrite(tmp_path, capsys):
+    output = tmp_path / "existing.fcpxml"
+    output.write_text("owned", encoding="utf-8")
+    assert main(["sample", "--output", str(output)]) == 2
+    assert output.read_text() == "owned"
+    assert "destination_exists" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "arguments",
     [[], ["serve"], ["doctor"], ["doctor", "--json"]],

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r1" name="FFVideoFormat1080p30" width="1920" height="1080" frameDuration="1/30s" colorSpace="1-1-1 (Rec. 709)"/>
+    <asset id="r2" name="Demo Clip" start="0s" duration="180/30s" hasVideo="1" hasAudio="1" format="r1" audioSources="1" audioChannels="2">
+      <media-rep kind="original-media" src="file:///REPLACE_WITH_LOCAL_MEDIA.mov"/>
+    </asset>
+  </resources>
+  <event name="First Run">
+    <project name="First Run">
+      <sequence format="r1" duration="180/30s" tcStart="0s" tcFormat="NDF">
+        <spine>
+          <asset-clip ref="r2" name="Demo Clip" offset="0s" start="0s" duration="180/30s"/>
+        </spine>
+      </sequence>
+    </project>
+  </event>
+</fcpxml>
