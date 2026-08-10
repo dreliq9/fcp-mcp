@@ -21,8 +21,7 @@ review evidence.
 - [Changelog](../CHANGELOG.md) — release-level behavior changes
 - [Roadmap](../ROADMAP.md) — planned work
 - [Contributing](../CONTRIBUTING.md) — development and verification process
-- [v0.3.0 release notes](releases/v0.3.0.md) — release identity and known boundaries
-- [Fresh v0.3.0 product evidence](releases/v0.3.0.md) — built-wheel and live-import record
+- [v0.3.0 release and fresh product evidence](releases/v0.3.0.md) — release identity, built-wheel and live-import record, and known boundaries
 - [v0.3.0 review evidence](reviews/v0.3.0-release-review.md) — exact gates,
   artifact hashes, tested Final Cut Pro handoff evidence, and residual risks
 
