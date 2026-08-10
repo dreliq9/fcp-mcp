@@ -3,7 +3,7 @@
 All notable changes to fcp-mcp are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/).
 
-## v0.3.0 — 2026-07-28 — Transactional AI piloting
+## v0.3.0 — 2026-08-09 — Transactional AI piloting
 
 ### Added
 
@@ -17,11 +17,15 @@ All notable changes to fcp-mcp are documented here. Format based on
   two-operation prepare/commit/reconcile trajectory.
 - A macOS release gate that validates candidates against the matching DTD
   bundled with the locally installed Final Cut Pro.
+- `fcpxml_generate_from_clip_plan`, the provenance-preserving adapter for
+  `youtube-mcp.materialized-clip-plan/v1` manifests. It is available only in
+  the `edit` and `full` profiles.
 
 ### Changed
 
-- The full profile now contains 93 tools, five prompts, and three resource
-  templates; `inspect`, `edit`, and `full` remain explicit alternatives.
+- Profile counts are `inspect=30`, `workflow=34`, `edit=75`, and `full=94`
+  tools; `inspect`, `edit`, and `full` remain explicit alternatives, and all
+  profiles retain their existing prompt and resource contracts.
 - The MCP boundary now uses the stable Python SDK v2 line and reports the
   fcp-mcp package version as its wire server version.
 - Client commits must repeat the exact candidate SHA-256 returned by prepare.

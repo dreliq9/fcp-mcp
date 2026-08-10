@@ -1,6 +1,6 @@
 # fcp-mcp Roadmap
 
-Status as of 2026-07-28: **v0.3.0 provides up to 93 tools across 13
+Status as of 2026-08-09: **v0.3.0 provides 94 tools across 13
 functional categories, five prompts, and three workflow resources.** The
 default `workflow` profile is the transactional AI-piloting surface. Planned
 work below is grouped by priority.
@@ -63,6 +63,18 @@ crash-recoverable, and machine-verifiable.
 
 ---
 
+## First post-launch feedback gate — Proxy and relink
+
+The first capability considered after launch is feedback-gated proxy and media
+relink support. It will be designed only after v0.3 operators report their
+offline/online interchange needs; it is not a promise of automatic media
+repair.
+
+- `fcpxml_detect_proxies(path)` — flag clips with proxy references but no
+  original
+- `fcpxml_relink_media(path, search_root)` — re-resolve offline clips against
+  a new media root, with a reviewable report before any mutation
+
 ## v0.4 — Production recipes
 
 **Goal:** rebuild the fcp-mcp-specific recipe catalog on the transactional
@@ -80,14 +92,10 @@ workflow surface.
 
 ---
 
-## v0.5 — Proxy + offline media awareness
+## Later post-launch work — Proxy + offline media awareness
 
 **Goal:** make offline/online workflows first-class.
 
-- `fcpxml_detect_proxies(path)` — flag clips with proxy references but
-  no original
-- `fcpxml_relink_media(path, search_root)` — re-resolve offline clips
-  against a new media root (matches by basename + duration)
 - `fcpxml_make_offline(path, pattern)` / `fcpxml_make_online(...)` —
   toggle clips between online and offline metadata
 - Integration with `fcp_import_xml` — offline clips get a warning in

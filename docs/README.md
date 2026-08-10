@@ -6,6 +6,10 @@ review evidence.
 ## Current Operator Documentation
 
 - [README](../README.md) — installation, profiles, capabilities, and safety model
+- [First run](FIRST_RUN.md) — install, verify, and choose the default profile
+- [Compatibility](COMPATIBILITY.md) — bounded FCPXML interchange and Final Cut Pro handoff
+- [Support](../SUPPORT.md) — maintainer-owned help and issue routing
+- [Security](../SECURITY.md) — private vulnerability reporting
 - [LLM guide](../LLM_GUIDE.md) — tool-selection and approval rules for AI clients
 - [Workflow recipes](../WORKFLOWS.md) — bounded prepare/review/commit sequences
 - [YouTube-MCP clip-plan handoff](YOUTUBE_MCP_HANDOFF.md) — generate native FCPXML from provenance-preserving youtube-mcp materialized clip plans
@@ -17,22 +21,23 @@ review evidence.
 - [Changelog](../CHANGELOG.md) — release-level behavior changes
 - [Roadmap](../ROADMAP.md) — planned work
 - [Contributing](../CONTRIBUTING.md) — development and verification process
-- [v0.3 local release review](reviews/v0.3.0-release-review.md) — exact gates,
-  artifact hashes, residual risks, and publication recommendation
+- [v0.3.0 release notes](releases/v0.3.0.md) — release identity and known boundaries
+- [v0.3.0 review evidence](reviews/v0.3.0-release-review.md) — exact gates,
+  artifact hashes, tested Final Cut Pro handoff evidence, and residual risks
 
-## v0.3 Status
+## v0.3.0 product contract
 
-The reviewed v0.3 release candidate is merged into `main` at
-`23d2a330935bd1a3722d5745ba61ad15b5c40001`. All eight post-merge CI gates
-passed in run `30394569899`. It is not yet a tagged GitHub release and has not
-been published to PyPI or the MCP Registry.
+Version 0.3.0 provides a 94-tool catalog: `inspect=30`, `workflow=34`,
+`edit=75`, and `full=94`. The default `workflow` profile is a bounded
+transactional FCPXML surface: inspect, prepare, review, hash approval, then
+commit. It never directly mutates FCPXML or Final Cut Pro.
 
-The release changes the default `workflow` profile to a transactional editing
-surface. An AI client prepares a private candidate, presents the semantic diff
-and candidate hash for review, and commits only the exact approved candidate.
-The server persists evidence and supports explicit cancellation and
-reconciliation, but does not claim that a chat approval was independently
-human-verified.
+The release supports bounded FCPXML interchange and optional Final Cut Pro
+handoff. The documented review records DTD and disposable-project canaries;
+these are evidence for the tested handoff, not a claim of complete autonomous
+Final Cut Pro control. `fcpxml_generate_from_clip_plan` accepts
+`youtube-mcp.materialized-clip-plan/v1` provenance manifests in the `edit` and
+`full` profiles only.
 
 ## Research and Decision Record
 

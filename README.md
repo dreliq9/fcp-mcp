@@ -2,14 +2,15 @@
 
 <!-- mcp-name: io.github.dreliq9/fcp-mcp -->
 
-**A local MCP server for Final Cut Pro** — up to 93 tools and five prompts
-covering FCPXML editing, opt-in live FCP control, parametric puppets,
-media analysis, transactional edit approval, and runtime diagnostics.
+**Trusted, local, human-approved Final Cut Pro workflows.** fcp-mcp inspects,
+generates, and transactionally edits FCPXML, then optionally hands verified
+artifacts to Final Cut Pro. The default profile never performs direct live or
+offline mutation.
 
-> **v0.3 release candidate:** The transactional workflow release is merged
-> into `main` at `23d2a33` and passed all eight post-merge CI gates. It has
-> completed the [local release review](docs/reviews/v0.3.0-release-review.md),
-> but is not yet tagged or published to PyPI or the MCP Registry.
+Version 0.3.0 freezes a 94-tool catalog across four profiles. It is a bounded
+FCPXML interchange and tested Final Cut Pro handoff surface—not a claim of
+complete autonomous Final Cut Pro control. The default workflow is inspect,
+prepare, review, hash approval, then commit.
 
 ```
 You: "Find and repair flash frames in hero.fcpxml."
@@ -18,78 +19,18 @@ Claude → fcpxml_detect_flash_frames → fcpxml_workflow_prepare
 Result: the reviewed candidate is atomically committed with durable evidence
 ```
 
-Where many integrations stop at one layer, fcp-mcp covers the local
-editing stack:
-
-- **FCPXML engine** — parse, edit, QC, generate, cross-NLE export — 49 tools
-- **Live FCP control** — AppleScript-backed library/playback/menu/share — 20 tools
-- **Media analysis** — ffprobe-backed scene/loudness/frame tools — 10 tools
-- **Parametric puppets** — character animation presets in FCPXML — 7 tools
-- **Compressor** — dispatch encodes to Apple Compressor — 2 tools
-- **Runtime diagnostics** — structured offline/live readiness — 1 tool
-
-## v0.3 Release Candidate
-
-v0.3 changes the default AI-piloting contract from direct mutation to a
-bounded, durable workflow:
-
-1. `fcpxml_workflow_prepare` creates and validates a private candidate.
-2. The client reviews the semantic diff and exact candidate SHA-256.
-3. `fcpxml_workflow_commit` accepts only that hash and atomically publishes the
-   approved result.
-4. Durable status, events, cancellation, and reconciliation evidence remain
-   available after the client session ends.
-
-Direct offline mutators remain available through the `edit` and `full`
-profiles. Live Final Cut Pro and Compressor actions require the `full` profile
-and the separate `FCP_MCP_ENABLE_LIVE_CONTROL=1` opt-in.
-
-Current documentation and evidence:
+Start here:
 
 - [Documentation index](docs/README.md)
+- [First run](docs/FIRST_RUN.md)
+- [Compatibility](docs/COMPATIBILITY.md)
+- [Support](SUPPORT.md)
+- [Security](SECURITY.md)
+- [v0.3.0 release notes](docs/releases/v0.3.0.md)
 - [Agent operating guide](LLM_GUIDE.md)
 - [Production workflow recipes](WORKFLOWS.md)
 - [v0.3 changelog](CHANGELOG.md)
-- [Release-candidate research](docs/research/2026-07-28-v0.3-release-candidate.md)
-- [Local release review](docs/reviews/v0.3.0-release-review.md)
-
-## Catalog Profiles
-
-The default `workflow` profile is the safe AI-piloting surface: 34 tools,
-three prompts, and three workflow resource templates. Select a profile with
-`FCP_MCP_PROFILE`:
-
-| Profile | Tools | Prompts | Resources | Purpose |
-|---|---:|---:|---:|---|
-| `inspect` | 30 | 2 | 0 | Offline inspection and diagnostics |
-| `workflow` (default) | 34 | 3 | 3 | Inspection plus reviewable transactional edits |
-| `edit` | 74 | 5 | 3 | Direct offline mutators plus workflows |
-| `full` | 93 | 5 | 3 | All offline, live FCP, media, and Compressor tools |
-
-Live FCP control remains independently disabled unless
-`FCP_MCP_ENABLE_LIVE_CONTROL=1`; choosing `full` does not grant that
-authority.
-
-## Available Tools (93 in `full`)
-
-The full catalog contains 92 domain tools across 13 functional categories,
-plus `fcp_doctor`.
-
-| Category | Count | What it does |
-|---|---|---|
-| **inspect** | 8 | Parse, list clips/markers/effects/roles, analyze pacing, timeline stats, A/B diff |
-| **qc** | 10 | Flash frames, gaps, duplicates, media links, frame rates, audio levels, safe zones, duration, structural validation, aggregate QC report |
-| **edit** | 12 | Markers, keywords, titles, audio, transitions, trim, split, delete, reorder, speed, role assign, reformat |
-| **heal** | 3 | Fix flash frames, fill gaps, remove silence |
-| **batch** | 4 | Markers, rename, role assign, apply transition across many clips |
-| **generate** | 4 | New project/timeline, auto rough cut, montage from a shotlist |
-| **templates** | 3 | List and save FCPXML templates; `fcpxml_apply_template` remains `unsupported_contract` in v0.3.0 |
-| **io** | 5 | Import SRT/EDL, export EDL + DaVinci Resolve XML + Premiere FCP7 XMEML |
-| **live** | 20 | AppleScript-backed: library/events/projects, playback, menu/keyboard, share, discover effects & motion templates |
-| **puppet** | 7 | Parametric character rigs in FCPXML with motion presets (walk, talk, wave, multi-scene composition) |
-| **media** | 10 | ffprobe + ffmpeg: info, streams, EBU R128 loudness, silence, beat detection, scene detect, thumbnails, audio-to-MIDI |
-| **compressor** | 2 | List Compressor settings, dispatch encode jobs |
-| **workflow** | 4 | Prepare, inspect, hash-approve, commit, or cancel durable edit runs |
+- [v0.3.0 review evidence](docs/reviews/v0.3.0-release-review.md)
 
 ## Project Structure
 
@@ -167,13 +108,6 @@ Install the current published release from PyPI:
 pipx install fcp-mcp
 ```
 
-Until v0.3 is tagged and published, install its merged candidate directly
-from `main`:
-
-```bash
-pipx install "git+https://github.com/dreliq9/fcp-mcp.git@main"
-```
-
 Or from source (for contributors):
 
 ```bash
@@ -236,6 +170,45 @@ claude mcp list       # from terminal
 ```
 
 ---
+
+## Catalog Profiles
+
+Select a profile with `FCP_MCP_PROFILE`. The default `workflow` profile keeps
+the inspect → prepare → review → hash approval → commit sequence bounded and
+reviewable.
+
+| Profile | Tools | Prompts | Resources | Purpose |
+|---|---:|---:|---:|---|
+| `inspect` | 30 | 2 | 0 | Offline inspection and diagnostics |
+| `workflow` (default) | 34 | 3 | 3 | Reviewable transactional FCPXML edits |
+| `edit` | 75 | 5 | 3 | Direct offline mutation plus workflows |
+| `full` | 94 | 5 | 3 | All offline tools and opt-in live FCP, media, and Compressor tools |
+
+The 94 tools include the `youtube-mcp.materialized-clip-plan/v1` provenance
+adapter, `fcpxml_generate_from_clip_plan`, in `edit` and `full` only. Live FCP
+control remains independently disabled unless `FCP_MCP_ENABLE_LIVE_CONTROL=1`;
+choosing `full` does not grant that authority.
+
+## Available Tools (94 in `full`)
+
+The full catalog combines 93 domain tools across 13 functional categories with
+`fcp_doctor`.
+
+| Category | Count | What it does |
+|---|---:|---|
+| **inspect** | 8 | Parse, list clips/markers/effects/roles, analyze pacing, timeline stats, A/B diff |
+| **qc** | 10 | Flash frames, gaps, duplicates, media links, frame rates, audio levels, safe zones, duration, structural validation, aggregate QC report |
+| **edit** | 12 | Markers, keywords, titles, audio, transitions, trim, split, delete, reorder, speed, role assign, reformat |
+| **heal** | 3 | Fix flash frames, fill gaps, remove silence |
+| **batch** | 4 | Markers, rename, role assign, apply transition across many clips |
+| **generate** | 5 | New project/timeline, rough cuts, montages, and provenance-preserving clip-plan FCPXML |
+| **templates** | 3 | List and save FCPXML templates; `fcpxml_apply_template` remains `unsupported_contract` in v0.3.0 |
+| **io** | 5 | Import SRT/EDL, export EDL + DaVinci Resolve XML + Premiere FCP7 XMEML |
+| **live** | 20 | AppleScript-backed library/events/projects, playback, menu/keyboard, share, and discovery |
+| **puppet** | 7 | Parametric character rigs in FCPXML with motion presets |
+| **media** | 10 | ffprobe + ffmpeg info, loudness, silence, beats, scenes, thumbnails, and audio-to-MIDI |
+| **compressor** | 2 | List Compressor settings and dispatch encode jobs |
+| **workflow** | 4 | Prepare, inspect, hash-approve, commit, or cancel durable edit runs |
 
 ## Key Features
 

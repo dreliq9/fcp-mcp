@@ -12,7 +12,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [
     { name = "Adam Steen", email = "dreliq9@gmail.com" },
-    { name = "Claude (Anthropic)", email = "noreply@anthropic.com" },
+]
+maintainers = [
+    { name = "Adam Steen", email = "dreliq9@gmail.com" },
 ]
 keywords = [
     "mcp",

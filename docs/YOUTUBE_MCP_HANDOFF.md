@@ -1,4 +1,4 @@
-# YouTube-MCP clip-plan handoff
+# YouTube-MCP clip-plan handoff for v0.3.0
 
 FCP-MCP can consume the editor-neutral materialized clip manifest produced by `dreliq9/youtube-mcp-v2` without teaching youtube-mcp about Final Cut Pro.
 
@@ -24,7 +24,9 @@ YouTube-MCP owns discovery, evidence selection, source timestamps, source acquis
 
 ## Tool
 
-`fcpxml_generate_from_clip_plan` is an `OFFLINE_WRITE` tool and is therefore available in the `edit` and `full` profiles, not the default review-only `workflow` profile.
+`fcpxml_generate_from_clip_plan` is an `OFFLINE_WRITE` tool. In v0.3.0 it
+exists only in the `edit` and `full` profiles—not in the default review-only
+`workflow` profile or the `inspect` profile.
 
 ```text
 fcpxml_generate_from_clip_plan(

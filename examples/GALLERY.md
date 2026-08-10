@@ -1,6 +1,6 @@
 # Scenario Gallery
 
-These scenarios show where the v0.2.1 surface is useful and where its
+These scenarios show where the v0.3.0 surface is useful and where its
 boundaries are. The machine-validated calls live in
 [`WORKFLOWS.md`](../WORKFLOWS.md); this page is the short capability map.
 
@@ -15,7 +15,7 @@ existing asset resource ID and changes timeline media.
 ## SRT captions
 
 Import an SRT into an existing FCPXML document, write to a distinct
-output, and run the safe-zone or structural checks afterward. v0.2.1
+output, and run the safe-zone or structural checks afterward. v0.3.0
 uses the `Titles.Subtitle` role and lane 1; it does not expose a caption
 font-preset or arbitrary-lane parameter.
 
@@ -23,7 +23,7 @@ font-preset or arbitrary-lane parameter.
 
 Detect beat timestamps, compute a representative inter-beat cadence,
 and use that cadence as `max_clip_duration` for the rough-cut generator.
-The result approximates musical pacing. v0.2.1 does not accept
+The result approximates musical pacing. v0.3.0 does not accept
 individual cut points and must not be described as frame-exact beat
 sync.
 
@@ -31,7 +31,15 @@ sync.
 
 Check media links before producing Resolve XML, FCP7 XMEML, or EDL.
 Treat each conversion as lossy and inspect it in the destination NLE.
-There is no v0.2.1 media-relink tool.
+There is no v0.3.0 media-relink tool.
+
+## YouTube materialized clip-plan handoff
+
+Use `fcpxml_generate_from_clip_plan` to turn a
+`youtube-mcp.materialized-clip-plan/v1` manifest into native FCPXML while
+preserving its provenance sidecar. This adapter exists only in the `edit` and
+`full` profiles; review the generated FCPXML before any subsequent workflow
+commit or optional Final Cut Pro handoff.
 
 ## Authorized live FCP and Compressor flow
 
