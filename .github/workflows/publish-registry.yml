@@ -2,6 +2,11 @@ name: Publish MCP Registry metadata
 
 on:
   workflow_dispatch:
+    inputs:
+      release_sha:
+        description: 40-hex commit SHA peeled from refs/tags/v0.3.0
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -9,16 +14,28 @@ permissions:
 jobs:
   registry:
     name: Publish immutable v0.3.0 Registry metadata
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
     steps:
-      - name: Checkout immutable v0.3.0
+      - name: Checkout immutable release SHA
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: v0.3.0
+          ref: ${{ inputs.release_sha }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Prove immutable release identity
+        run: |
+          set -euo pipefail
+          release_sha="${{ inputs.release_sha }}"
+          case "$release_sha" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "release_sha must be a full lowercase 40-hex commit SHA" >&2; exit 1 ;;
+          esac
+          test "$(git rev-parse HEAD)" = "$release_sha"
+          test "$(git rev-parse refs/tags/v0.3.0^{})" = "$release_sha"
       - name: Verify immutable release metadata
         run: |
           set -euo pipefail

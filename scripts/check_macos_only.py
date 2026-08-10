@@ -49,6 +49,7 @@ REGISTRY_WORKFLOW = ".github/workflows/publish-registry.yml"
 REGISTRY_PUBLISHER_DIGEST = (
     "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
 )
+REGISTRY_RELEASE_SHA_PATTERN = "[0-9a-f]" * 40
 MACOS_CLASSIFIER = "Operating System :: MacOS :: MacOS X"
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 
@@ -527,18 +528,135 @@ def _check_publish(root: Path, findings: list[str]) -> None:
         _check_publish_job(jobs["publish"], findings)
 
 
+def _normalize_run(command: str) -> str:
+    return "\n".join(line.rstrip() for line in command.strip().splitlines()) + "\n"
+
+
+def _expected_registry_job() -> dict[str, Any]:
+    identity = _normalize_run(
+        f'''set -euo pipefail
+release_sha="${{{{ inputs.release_sha }}}}"
+case "$release_sha" in
+  {REGISTRY_RELEASE_SHA_PATTERN}) ;;
+  *) echo "release_sha must be a full lowercase 40-hex commit SHA" >&2; exit 1 ;;
+esac
+test "$(git rev-parse HEAD)" = "$release_sha"
+test "$(git rev-parse refs/tags/v0.3.0^{{}})" = "$release_sha"'''
+    )
+    metadata = _normalize_run(
+        '''set -euo pipefail
+test "$(jq -r '.name' server.json)" = "io.github.dreliq9/fcp-mcp"
+test "$(jq -r '.version' server.json)" = "0.3.0"
+test "$(jq -r '.packages | length' server.json)" = "1"
+test "$(jq -r '.packages[0].registryType' server.json)" = "pypi"
+test "$(jq -r '.packages[0].identifier' server.json)" = "fcp-mcp"
+test "$(jq -r '.packages[0].version' server.json)" = "0.3.0"
+test "$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')" = "0.3.0"'''
+    )
+    pypi = _normalize_run(
+        '''set -euo pipefail
+package_json="$RUNNER_TEMP/pypi-fcp-mcp-0.3.0.json"
+for attempt in $(seq 1 12); do
+  if curl --fail --silent --show-error --location --max-time 20 --retry 0 \\
+    --output "$package_json" \\
+    https://pypi.org/pypi/fcp-mcp/0.3.0/json && \\
+    jq -e --arg name "fcp-mcp" --arg version "0.3.0" \\
+      '.info.name == $name and .info.version == $version and ([.urls[] | select(.filename == "fcp_mcp-0.3.0-py3-none-any.whl")] | length == 1)' \\
+      "$package_json"; then
+    exit 0
+  fi
+  if [ "$attempt" -lt 12 ]; then
+    sleep 10
+  fi
+done
+echo "PyPI fcp-mcp 0.3.0 was not publicly available" >&2
+exit 1'''
+    )
+    publisher = _normalize_run(
+        f'''set -euo pipefail
+publisher_archive="$RUNNER_TEMP/mcp-publisher_linux_amd64.tar.gz"
+publisher_dir="$RUNNER_TEMP/mcp-publisher"
+curl --fail --silent --show-error --location --max-time 60 --retry 0 \\
+  --output "$publisher_archive" \\
+  https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz
+printf '%s  %s\\n' \\
+  {REGISTRY_PUBLISHER_DIGEST} \\
+  "$publisher_archive" | sha256sum -c -
+mkdir -p "$publisher_dir"
+tar --extract --gzip --file "$publisher_archive" --directory "$publisher_dir" --no-same-owner
+test -x "$publisher_dir/mcp-publisher"'''
+    )
+    publish = _normalize_run(
+        '''set -euo pipefail
+publisher="$RUNNER_TEMP/mcp-publisher/mcp-publisher"
+"$publisher" login github-oidc
+"$publisher" publish'''
+    )
+    response = _normalize_run(
+        '''set -euo pipefail
+registry_json="$RUNNER_TEMP/registry-fcp-mcp-0.3.0.json"
+registry_url="https://registry.modelcontextprotocol.io/v0.1/servers/io.github.dreliq9%2Ffcp-mcp/versions/0.3.0"
+for attempt in $(seq 1 6); do
+  if curl --fail --silent --show-error --location --max-time 20 --retry 0 \\
+    --output "$registry_json" "$registry_url" && \\
+    jq -e --arg name "io.github.dreliq9/fcp-mcp" --arg package "fcp-mcp" --arg version "0.3.0" \\
+      '.server.name == $name and .server.version == $version and ([.server.packages[] | select(.registryType == "pypi" and .identifier == $package and .version == $version)] | length == 1)' \\
+      "$registry_json"; then
+    exit 0
+  fi
+  if [ "$attempt" -lt 6 ]; then
+    sleep 10
+  fi
+done
+echo "Registry response did not confirm fcp-mcp 0.3.0" >&2
+exit 1'''
+    )
+    return {
+        "name": "Publish immutable v0.3.0 Registry metadata",
+        "if": "github.ref == 'refs/heads/main'",
+        "runs-on": PUBLISH_RUNNER,
+        "permissions": {"contents": "read", "id-token": "write"},
+        "steps": [
+            {
+                "name": "Checkout immutable release SHA",
+                "uses": CHECKOUT_ACTION,
+                "with": {
+                    "ref": "${{ inputs.release_sha }}",
+                    "fetch-depth": 0,
+                    "persist-credentials": False,
+                },
+            },
+            {"name": "Prove immutable release identity", "run": identity},
+            {"name": "Verify immutable release metadata", "run": metadata},
+            {"name": "Wait for public PyPI 0.3.0", "run": pypi},
+            {"name": "Download verified mcp-publisher", "run": publisher},
+            {"name": "Publish through GitHub OIDC", "run": publish},
+            {"name": "Verify Registry response", "run": response},
+        ],
+    }
+
+
 def _check_registry_publish(root: Path, findings: list[str]) -> None:
-    path = root / REGISTRY_WORKFLOW
-    workflow = _load_yaml(path, root, findings)
+    workflow = _load_yaml(root / REGISTRY_WORKFLOW, root, findings)
     if workflow is None:
         return
-    prefix = f"{REGISTRY_WORKFLOW}: registry"
-    if "defaults" in workflow or "env" in workflow:
-        findings.append(f"{REGISTRY_WORKFLOW}: workflow may alter registry publishing")
-    if workflow.get("on") != {"workflow_dispatch": None}:
+    expected_trigger = {
+        "workflow_dispatch": {
+            "inputs": {
+                "release_sha": {
+                    "description": "40-hex commit SHA peeled from refs/tags/v0.3.0",
+                    "required": True,
+                    "type": "string",
+                }
+            }
+        }
+    }
+    if workflow.get("on") != expected_trigger:
         findings.append(f"{REGISTRY_WORKFLOW}: trigger is not manual-only")
     if workflow.get("permissions") != WORKFLOW_PERMISSIONS:
         findings.append(f"{REGISTRY_WORKFLOW}: workflow permissions are not exactly contents read")
+    if "defaults" in workflow or "env" in workflow:
+        findings.append(f"{REGISTRY_WORKFLOW}: workflow may alter registry publishing")
     jobs = _jobs(workflow, REGISTRY_WORKFLOW, findings)
     if jobs is None:
         return
@@ -547,71 +665,21 @@ def _check_registry_publish(root: Path, findings: list[str]) -> None:
         return
     job = jobs["registry"]
     if not isinstance(job, dict):
-        findings.append(f"{prefix} job is not a mapping")
+        findings.append(f"{REGISTRY_WORKFLOW}: registry job is not a mapping")
         return
-    allowed_job_keys = {"name", "runs-on", "permissions", "steps"}
-    if set(job) - allowed_job_keys:
-        findings.append(f"{prefix} job contains forbidden keys")
-    if job.get("runs-on") != PUBLISH_RUNNER:
-        findings.append(f"{prefix} job is not the isolated Ubuntu metadata exception")
-    if job.get("permissions") != {"contents": "read", "id-token": "write"}:
-        findings.append(f"{prefix} permissions are not isolated GitHub OIDC")
-    steps = job.get("steps")
-    if not isinstance(steps, list) or len(steps) != 6:
-        findings.append(f"{prefix} must contain exactly six reviewed steps")
-        return
-    checkout = steps[0]
-    if not isinstance(checkout, dict) or checkout != {
-        "name": "Checkout immutable v0.3.0",
-        "uses": CHECKOUT_ACTION,
-        "with": {"ref": "v0.3.0", "persist-credentials": False},
-    }:
-        findings.append(f"{prefix} checkout is not the pinned immutable tag")
-    expected_names = [
-        "Verify immutable release metadata",
-        "Wait for public PyPI 0.3.0",
-        "Download verified mcp-publisher",
-        "Publish through GitHub OIDC",
-        "Verify Registry response",
-    ]
-    remaining = steps[1:]
-    if any(
-        not isinstance(step, dict)
-        or set(step) != {"name", "run"}
-        or step.get("name") != expected_name
-        or not isinstance(step.get("run"), str)
-        for step, expected_name in zip(remaining, expected_names, strict=True)
-    ):
-        findings.append(f"{prefix} steps are not the isolated reviewed commands")
-        return
-    command = "\n".join(step["run"] for step in remaining)
-    required_markers = (
-        "set -euo pipefail",
-        "server.json",
-        "pyproject.toml",
-        "https://pypi.org/pypi/fcp-mcp/0.3.0/json",
-        "mcp-publisher_linux_amd64.tar.gz",
-        "releases/download/v1.8.1/",
-        REGISTRY_PUBLISHER_DIGEST,
-        "sha256sum -c -",
-        "tar --extract",
-        "login github-oidc",
-        "\"$publisher\" publish",
-        "https://registry.modelcontextprotocol.io/v0.1/servers/",
-        ".server.name == $name",
-        ".server.version == $version",
-        ".identifier == $package",
-    )
-    if any(marker not in command for marker in required_markers):
-        findings.append(f"{prefix} lacks a required pinned publication guard")
-    forbidden_markers = (
-        "MCP_GITHUB_TOKEN",
-        "github --token",
-        "secrets.",
-        "ACTIONS_RUNTIME_TOKEN",
-    )
-    if any(marker in command for marker in forbidden_markers):
-        findings.append(f"{prefix} contains a forbidden long-lived token path")
+    normalized_job = dict(job)
+    steps = normalized_job.get("steps")
+    if isinstance(steps, list):
+        normalized_job["steps"] = [
+            {**step, "run": _normalize_run(step["run"])}
+            if isinstance(step, dict) and isinstance(step.get("run"), str)
+            else step
+            for step in steps
+        ]
+    if normalized_job != _expected_registry_job():
+        findings.append(
+            f"{REGISTRY_WORKFLOW}: registry job differs from reviewed trajectory"
+        )
 
 
 def _check_pyproject(root: Path, findings: list[str]) -> None:

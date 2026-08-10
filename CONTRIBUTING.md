@@ -130,10 +130,13 @@ runners do not contain the licensed Final Cut Pro application bundle.
 
 Registry metadata is published only after PyPI `fcp-mcp` `0.3.0` is publicly
 available. Do not move or recreate the `v0.3.0` tag, and do not rerun PyPI
-publication for this version. Instead, manually dispatch
-`.github/workflows/publish-registry.yml`; it checks out the immutable
-`v0.3.0` tag and uses a separate short-lived GitHub OIDC credential for the
-MCP Registry. It never publishes a Python distribution.
+publication for this version. After Task 9 creates the immutable `v0.3.0`
+tag, dispatch `.github/workflows/publish-registry.yml` from `main` only. Its
+required `release_sha` input is the full lowercase 40-hex SHA peeled from
+`refs/tags/v0.3.0`; the workflow rejects any other ref, checks out that exact
+SHA with full tag history, and proves both `HEAD` and the peeled explicit tag
+ref equal it before requesting Registry OIDC. It never publishes a Python
+distribution.
 
 The workflow downloads the pinned MCP publisher, verifies its SHA-256 before
 execution, verifies both `server.json` versions and the package version, then

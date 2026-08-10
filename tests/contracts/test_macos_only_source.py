@@ -219,6 +219,82 @@ def test_checker_allows_the_pinned_registry_metadata_exception(tmp_path):
     assert check(tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "wrong_source_ref",
+        "missing_release_sha",
+        "malformed_sha_validation",
+        "mismatched_tag_target",
+        "comment_decoy",
+        "failure_masking",
+        "altered_url",
+        "unbounded_retry",
+        "pypi_publish",
+        "token_fallback",
+        "linux_product_command",
+    ],
+)
+def test_checker_rejects_registry_release_safety_bypasses(tmp_path, mutation):
+    _write_valid_repository(tmp_path)
+    path = tmp_path / ".github" / "workflows" / "publish-registry.yml"
+    text = path.read_text(encoding="utf-8")
+
+    if mutation == "wrong_source_ref":
+        text = text.replace("refs/heads/main", "refs/tags/v0.3.0", 1)
+    elif mutation == "missing_release_sha":
+        text = text.replace(
+            "      release_sha:\n"
+            "        description: 40-hex commit SHA peeled from refs/tags/v0.3.0\n"
+            "        required: true\n"
+            "        type: string\n",
+            "",
+            1,
+        )
+    elif mutation == "malformed_sha_validation":
+        text = text.replace("[0-9a-f]", "[0-9a-fA-F]", 1)
+    elif mutation == "mismatched_tag_target":
+        text = text.replace("refs/tags/v0.3.0^{}", "refs/tags/v0.2.1^{}", 1)
+    elif mutation == "comment_decoy":
+        text = text.replace(
+            "          set -euo pipefail\n",
+            "          # set -euo pipefail\n          true\n",
+            1,
+        )
+    elif mutation == "failure_masking":
+        text = text.replace("sha256sum -c -", "sha256sum -c - || true", 1)
+    elif mutation == "altered_url":
+        text = text.replace("https://pypi.org", "https://evil.invalid", 1)
+    elif mutation == "unbounded_retry":
+        text = text.replace("for attempt in $(seq 1 12); do", "while true; do", 1)
+    elif mutation == "pypi_publish":
+        text = text.replace('          "$publisher" publish\n', '          "$publisher" publish\n          python -m twine upload dist/*\n', 1)
+    elif mutation == "token_fallback":
+        text = text.replace(
+            '          "$publisher" login github-oidc\n',
+            '          "$publisher" login github-oidc --token "${{ secrets.MCP_GITHUB_TOKEN }}"\n',
+            1,
+        )
+    elif mutation == "linux_product_command":
+        text = text.replace(
+            '          "$publisher" publish\n',
+            '          "$publisher" publish\n          fcp-mcp --help\n',
+            1,
+        )
+
+    path.write_text(text, encoding="utf-8")
+
+    findings = check(tmp_path)
+    assert any(
+        marker in finding
+        for finding in findings
+        for marker in (
+            ".github/workflows/publish-registry.yml: trigger is not manual-only",
+            ".github/workflows/publish-registry.yml: registry job differs from reviewed trajectory",
+        )
+    )
+
+
 def test_checker_reports_windows_source_and_linux_product_job(tmp_path):
     _write_valid_repository(tmp_path)
     (tmp_path / "src" / "fcp_mcp" / "bad.py").write_text(
