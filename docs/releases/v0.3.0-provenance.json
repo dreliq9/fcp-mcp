@@ -1,0 +1,12 @@
+{
+  "schema_version": "1",
+  "source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
+  "runtime": {"python_executable": "python3.12", "python_version": "3.12.13", "cwd": "out-of-tree temporary checkout"},
+  "installed_wheel": {"filename": "fcp_mcp-0.3.0-py3-none-any.whl", "sha256": "527b7cc46789125168a84999569c81e866804559e7dfa2a07a4c924d2612c7fb", "command": "fcp-mcp", "import_location": "site-packages/fcp_mcp/__init__.py"},
+  "commands": ["python -m build", "pip install wheel", "fcp-mcp --version", "fcp-mcp doctor --json", "scripts/wheel_smoke.py --command fcp-mcp", "scripts/apple_dtd_gate.py corrected.fcpxml"],
+  "trajectory": {"run_id": "790da06a-04f7-48e8-a9e8-78014a464f6c", "plan_sha256": "79f29fcedf1cdc5ca645b1445bef525b5b6ec84998501458c238ff6a51d5bf0a", "candidate_sha256": "782f96039ed8a14e68bbbbf5649d719e3e81f8ef7c90a7c3dc2d74d7cb9bb3ff", "output_sha256": "782f96039ed8a14e68bbbbf5649d719e3e81f8ef7c90a7c3dc2d74d7cb9bb3ff", "diff_sha256": "c3303bd83dccc021b9817f0606d44eca79e8915dbcbbdcd45a331f7e3403d71a"},
+  "media": {"identity": "/Volumes/Extreme SSD/GHG/P1010413.MP4", "sha256": "b51ebe8fa82bc452ea882292d955808b01af11c572925c5785c94fca152308d1"},
+  "corrected_fcpxml_sha256": "2b60935326c91072fc26835441c5256774747385353e82e8cf8743843a6f9404",
+  "apple_dtd_gate": "passed",
+  "targeted_validation": {"pytest_passed": 17, "documented_blocks": 51}
+}
