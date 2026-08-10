@@ -135,8 +135,10 @@ tag, dispatch `.github/workflows/publish-registry.yml` from `main` only. Its
 required `release_sha` input is the full lowercase 40-hex SHA peeled from
 `refs/tags/v0.3.0`; the workflow rejects any other ref, checks out that exact
 SHA with full tag history, and proves both `HEAD` and the peeled explicit tag
-ref equal it before requesting Registry OIDC. It never publishes a Python
-distribution.
+ref equal it before requesting Registry OIDC. A separate no-OIDC validation
+job fails (rather than skips) non-`main` dispatches and malformed input; the
+OIDC job receives the SHA through a quoted `RELEASE_SHA` environment variable,
+not shell interpolation. It never publishes a Python distribution.
 
 The workflow downloads the pinned MCP publisher, verifies its SHA-256 before
 execution, verifies both `server.json` versions and the package version, then

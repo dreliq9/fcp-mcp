@@ -233,6 +233,10 @@ def test_checker_allows_the_pinned_registry_metadata_exception(tmp_path):
         "pypi_publish",
         "token_fallback",
         "linux_product_command",
+        "direct_shell_expression",
+        "missing_validation_job",
+        "validation_job_skips_non_main",
+        "publish_bypasses_validation",
     ],
 )
 def test_checker_rejects_registry_release_safety_bypasses(tmp_path, mutation):
@@ -281,6 +285,22 @@ def test_checker_rejects_registry_release_safety_bypasses(tmp_path, mutation):
             '          "$publisher" publish\n          fcp-mcp --help\n',
             1,
         )
+    elif mutation == "direct_shell_expression":
+        text = text.replace(
+            'test "$(git rev-parse HEAD)" = "$RELEASE_SHA"',
+            'test "$(git rev-parse HEAD)" = "${{ inputs.release_sha }}"',
+            1,
+        )
+    elif mutation == "missing_validation_job":
+        text = text.replace("  validate:\n", "  validation:\n", 1)
+    elif mutation == "validation_job_skips_non_main":
+        text = text.replace(
+            "  validate:\n",
+            "  validate:\n    if: github.ref == 'refs/heads/main'\n",
+            1,
+        )
+    elif mutation == "publish_bypasses_validation":
+        text = text.replace("    needs: validate\n", "", 1)
 
     path.write_text(text, encoding="utf-8")
 
@@ -290,6 +310,8 @@ def test_checker_rejects_registry_release_safety_bypasses(tmp_path, mutation):
         for finding in findings
         for marker in (
             ".github/workflows/publish-registry.yml: trigger is not manual-only",
+            ".github/workflows/publish-registry.yml: jobs are not exactly the Registry exception",
+            ".github/workflows/publish-registry.yml: validate job differs from reviewed trajectory",
             ".github/workflows/publish-registry.yml: registry job differs from reviewed trajectory",
         )
     )

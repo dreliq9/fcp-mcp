@@ -12,9 +12,27 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Reject unsafe Registry dispatch
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Validate source and release SHA
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "Registry publication must be dispatched from refs/heads/main" >&2
+            exit 1
+          fi
+          case "$RELEASE_SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+            *) echo "release_sha must be a full lowercase 40-hex commit SHA" >&2; exit 1 ;;
+          esac
   registry:
     name: Publish immutable v0.3.0 Registry metadata
-    if: github.ref == 'refs/heads/main'
+    needs: validate
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,15 +45,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Prove immutable release identity
+        env:
+          RELEASE_SHA: ${{ inputs.release_sha }}
         run: |
           set -euo pipefail
-          release_sha="${{ inputs.release_sha }}"
-          case "$release_sha" in
-            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-            *) echo "release_sha must be a full lowercase 40-hex commit SHA" >&2; exit 1 ;;
-          esac
-          test "$(git rev-parse HEAD)" = "$release_sha"
-          test "$(git rev-parse refs/tags/v0.3.0^{})" = "$release_sha"
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "$(git rev-parse refs/tags/v0.3.0^{})" = "$RELEASE_SHA"
       - name: Verify immutable release metadata
         run: |
           set -euo pipefail

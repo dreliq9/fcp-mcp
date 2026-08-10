@@ -89,39 +89,32 @@ def test_registry_workflow_is_manual_oidc_only_and_verifies_public_metadata():
     assert "github --token" not in workflow
 
 
-def test_registry_workflow_proves_the_immutable_tag_matches_dispatch_sha():
+def test_registry_workflow_guards_dispatch_before_oidc_and_proves_tag_identity():
     workflow = YAML(typ="safe").load(
         Path(".github/workflows/publish-registry.yml").read_text(encoding="utf-8")
     )
 
-    assert workflow["on"] == {
-        "workflow_dispatch": {
-            "inputs": {
-                "release_sha": {
-                    "description": "40-hex commit SHA peeled from refs/tags/v0.3.0",
-                    "required": True,
-                    "type": "string",
-                }
-            }
-        }
-    }
+    validate = workflow["jobs"]["validate"]
     registry = workflow["jobs"]["registry"]
-    assert registry["if"] == "github.ref == 'refs/heads/main'"
-    checkout = registry["steps"][0]
-    assert checkout["with"] == {
+    assert validate["runs-on"] == "ubuntu-latest"
+    assert validate["permissions"] == {}
+    assert validate["steps"][0]["env"] == {
+        "RELEASE_SHA": "${{ inputs.release_sha }}"
+    }
+    assert 'if [ "$GITHUB_REF" != "refs/heads/main" ]; then' in validate["steps"][0]["run"]
+    assert registry["needs"] == "validate"
+    assert "if" not in registry
+    assert registry["steps"][0]["with"] == {
         "ref": "${{ inputs.release_sha }}",
         "fetch-depth": 0,
         "persist-credentials": False,
     }
     identity = registry["steps"][1]
     assert identity["name"] == "Prove immutable release identity"
-    assert identity["run"] == (
-        "set -euo pipefail\n"
-        'release_sha="${{ inputs.release_sha }}"\n'
-        'case "$release_sha" in\n'
-        '  [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;\n'
-        '  *) echo "release_sha must be a full lowercase 40-hex commit SHA" >&2; exit 1 ;;\n'
-        "esac\n"
-        'test "$(git rev-parse HEAD)" = "$release_sha"\n'
-        'test "$(git rev-parse refs/tags/v0.3.0^{})" = "$release_sha"\n'
-    )
+    assert identity["env"] == {"RELEASE_SHA": "${{ inputs.release_sha }}"}
+    assert 'test "$(git rev-parse HEAD)" = "$RELEASE_SHA"' in identity["run"]
+    assert 'test "$(git rev-parse refs/tags/v0.3.0^{})" = "$RELEASE_SHA"' in identity["run"]
+    for job in workflow["jobs"].values():
+        for step in job["steps"]:
+            if "run" in step:
+                assert "${{" not in step["run"]

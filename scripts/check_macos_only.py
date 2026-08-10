@@ -532,16 +532,23 @@ def _normalize_run(command: str) -> str:
     return "\n".join(line.rstrip() for line in command.strip().splitlines()) + "\n"
 
 
-def _expected_registry_job() -> dict[str, Any]:
-    identity = _normalize_run(
+def _expected_registry_jobs() -> dict[str, Any]:
+    validation = _normalize_run(
         f'''set -euo pipefail
-release_sha="${{{{ inputs.release_sha }}}}"
-case "$release_sha" in
+if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+  echo "Registry publication must be dispatched from refs/heads/main" >&2
+  exit 1
+fi
+case "$RELEASE_SHA" in
   {REGISTRY_RELEASE_SHA_PATTERN}) ;;
   *) echo "release_sha must be a full lowercase 40-hex commit SHA" >&2; exit 1 ;;
 esac
-test "$(git rev-parse HEAD)" = "$release_sha"
-test "$(git rev-parse refs/tags/v0.3.0^{{}})" = "$release_sha"'''
+'''
+    )
+    identity = _normalize_run(
+        '''set -euo pipefail
+test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+test "$(git rev-parse refs/tags/v0.3.0^{})" = "$RELEASE_SHA"'''
     )
     metadata = _normalize_run(
         '''set -euo pipefail
@@ -612,27 +619,45 @@ echo "Registry response did not confirm fcp-mcp 0.3.0" >&2
 exit 1'''
     )
     return {
-        "name": "Publish immutable v0.3.0 Registry metadata",
-        "if": "github.ref == 'refs/heads/main'",
-        "runs-on": PUBLISH_RUNNER,
-        "permissions": {"contents": "read", "id-token": "write"},
-        "steps": [
-            {
-                "name": "Checkout immutable release SHA",
-                "uses": CHECKOUT_ACTION,
-                "with": {
-                    "ref": "${{ inputs.release_sha }}",
-                    "fetch-depth": 0,
-                    "persist-credentials": False,
+        "validate": {
+            "name": "Reject unsafe Registry dispatch",
+            "runs-on": PUBLISH_RUNNER,
+            "permissions": {},
+            "steps": [
+                {
+                    "name": "Validate source and release SHA",
+                    "env": {"RELEASE_SHA": "${{ inputs.release_sha }}"},
+                    "run": validation,
+                }
+            ],
+        },
+        "registry": {
+            "name": "Publish immutable v0.3.0 Registry metadata",
+            "needs": "validate",
+            "runs-on": PUBLISH_RUNNER,
+            "permissions": {"contents": "read", "id-token": "write"},
+            "steps": [
+                {
+                    "name": "Checkout immutable release SHA",
+                    "uses": CHECKOUT_ACTION,
+                    "with": {
+                        "ref": "${{ inputs.release_sha }}",
+                        "fetch-depth": 0,
+                        "persist-credentials": False,
+                    },
                 },
-            },
-            {"name": "Prove immutable release identity", "run": identity},
-            {"name": "Verify immutable release metadata", "run": metadata},
-            {"name": "Wait for public PyPI 0.3.0", "run": pypi},
-            {"name": "Download verified mcp-publisher", "run": publisher},
-            {"name": "Publish through GitHub OIDC", "run": publish},
-            {"name": "Verify Registry response", "run": response},
-        ],
+                {
+                    "name": "Prove immutable release identity",
+                    "env": {"RELEASE_SHA": "${{ inputs.release_sha }}"},
+                    "run": identity,
+                },
+                {"name": "Verify immutable release metadata", "run": metadata},
+                {"name": "Wait for public PyPI 0.3.0", "run": pypi},
+                {"name": "Download verified mcp-publisher", "run": publisher},
+                {"name": "Publish through GitHub OIDC", "run": publish},
+                {"name": "Verify Registry response", "run": response},
+            ],
+        },
     }
 
 
@@ -660,26 +685,28 @@ def _check_registry_publish(root: Path, findings: list[str]) -> None:
     jobs = _jobs(workflow, REGISTRY_WORKFLOW, findings)
     if jobs is None:
         return
-    if set(jobs) != {"registry"}:
+    expected_jobs = _expected_registry_jobs()
+    if set(jobs) != set(expected_jobs):
         findings.append(f"{REGISTRY_WORKFLOW}: jobs are not exactly the Registry exception")
         return
-    job = jobs["registry"]
-    if not isinstance(job, dict):
-        findings.append(f"{REGISTRY_WORKFLOW}: registry job is not a mapping")
-        return
-    normalized_job = dict(job)
-    steps = normalized_job.get("steps")
-    if isinstance(steps, list):
-        normalized_job["steps"] = [
-            {**step, "run": _normalize_run(step["run"])}
-            if isinstance(step, dict) and isinstance(step.get("run"), str)
-            else step
-            for step in steps
-        ]
-    if normalized_job != _expected_registry_job():
-        findings.append(
-            f"{REGISTRY_WORKFLOW}: registry job differs from reviewed trajectory"
-        )
+    for job_name, expected_job in expected_jobs.items():
+        job = jobs[job_name]
+        if not isinstance(job, dict):
+            findings.append(f"{REGISTRY_WORKFLOW}: {job_name} job is not a mapping")
+            continue
+        normalized_job = dict(job)
+        steps = normalized_job.get("steps")
+        if isinstance(steps, list):
+            normalized_job["steps"] = [
+                {**step, "run": _normalize_run(step["run"])}
+                if isinstance(step, dict) and isinstance(step.get("run"), str)
+                else step
+                for step in steps
+            ]
+        if normalized_job != expected_job:
+            findings.append(
+                f"{REGISTRY_WORKFLOW}: {job_name} job differs from reviewed trajectory"
+            )
 
 
 def _check_pyproject(root: Path, findings: list[str]) -> None:
