@@ -27,7 +27,7 @@ def test_release_provenance_binds_one_installed_execution() -> None:
     provenance = _provenance()
     note = NOTE_PATH.read_text(encoding="utf-8")
 
-    runtime = provenance["installed_execution"]
+    runtime = provenance["installed_executions"]["prior_workflow_smoke"]
     assert isinstance(runtime, dict)
     for field in (
         "python_executable",
@@ -66,18 +66,44 @@ def test_release_provenance_binds_one_installed_execution() -> None:
     assert artifact in note
 
 
-def test_release_provenance_binds_corrected_live_import_and_image() -> None:
+def test_release_provenance_binds_installed_generated_live_import_and_image() -> None:
     provenance = _provenance()
+    note = NOTE_PATH.read_text(encoding="utf-8")
+    generation = provenance["installed_generation"]
+    assert isinstance(generation, dict)
+    assert generation["source_commit"] == provenance["evidence_identity"][
+        "fixed_head_source_commit"
+    ]
+    assert generation["tool"] == "fcpxml_create_timeline"
+    assert generation["stdio_argv"] == [
+        provenance["installed_executions"]["fixed_head_generation"][
+            "console_script"
+        ]
+    ]
+    clips = json.loads(generation["arguments"]["clips_json"])
+    assert clips == [
+        {
+            "src": "/Volumes/Extreme SSD/GHG/P1010413.MP4",
+            "name": "GHG P1010413 five-second evidence",
+            "start": "900900/30000s",
+            "duration": "150150/30000s",
+            "asset_duration": "5735730/30000s",
+            "role": "Dialogue",
+        }
+    ]
+
     live_import = provenance["live_import"]
     assert isinstance(live_import, dict)
     assert live_import["asset_duration"] == "5735730/30000s"
     assert live_import["source_start"] == "900900/30000s"
     assert live_import["clip_duration"] == "150150/30000s"
 
-    corrected_xml = live_import["corrected_fcpxml"]
-    assert isinstance(corrected_xml, dict)
-    assert Path(corrected_xml["path"]).is_absolute()
-    _assert_sha256(corrected_xml["sha256"])
+    generated_xml = live_import["installed_generated_fcpxml"]
+    assert isinstance(generated_xml, dict)
+    assert Path(generated_xml["path"]).is_absolute()
+    generated_hash = _assert_sha256(generated_xml["sha256"])
+    assert generated_hash == generation["output_sha256"]
+    assert generated_hash in note
 
     dtd = live_import["dtd_validation"]
     assert isinstance(dtd, dict)
@@ -87,12 +113,19 @@ def test_release_provenance_binds_corrected_live_import_and_image() -> None:
 
     observed = live_import["operator_observation"]
     assert isinstance(observed, dict)
-    assert observed["library"] == "v0.3-live-import-corrected-evidence.fcpbundle"
-    assert observed["event"] == "v0.3 Evidence Corrected"
-    assert observed["project"] == "v0.3 Live Import Evidence Corrected"
+    assert observed["library"] == "v0.3-installed-generated-evidence.fcpbundle"
+    assert observed["event"] == "v0.3 Fixed Head Evidence"
+    assert observed["project"] == "v0.3 Installed Generated Evidence"
     assert observed["import_warning"] == "none observed"
     assert observed["visible_clip_duration"] == "00:00:05:00"
     assert observed["visible_role"] == "Dialogue-1"
+
+    managed_copy = live_import["managed_media_copy"]
+    source = provenance["media"]
+    assert managed_copy["size_bytes"] == source["size_bytes"]
+    assert managed_copy["sha256"] == source["sha256"]
+    assert "not copied source" not in note
+    assert "managed library copy" in note
 
     image = provenance["screenshot"]
     assert isinstance(image, dict)
@@ -108,16 +141,28 @@ def test_release_provenance_separates_installed_and_inventory_builds() -> None:
     provenance = _provenance()
     builds = provenance["builds"]
     assert isinstance(builds, dict)
-    assert set(builds) == {"base_revision_installed", "post_evidence_inventory"}
+    assert set(builds) == {
+        "prior_workflow_installed",
+        "fixed_head_generation_installed",
+        "final_inventory_only",
+    }
 
-    installed = builds["base_revision_installed"]
-    inventory = builds["post_evidence_inventory"]
-    assert installed["installed"] is True
+    prior = builds["prior_workflow_installed"]
+    fixed = builds["fixed_head_generation_installed"]
+    inventory = builds["final_inventory_only"]
+    assert prior["installed"] is True
+    assert fixed["installed"] is True
     assert inventory["installed"] is False
     assert inventory["published"] is False
     assert inventory["purpose"] == "inventory-only"
 
-    for build in (installed, inventory):
+    assert provenance["installed_generation"]["wheel_sha256"] == next(
+        artifact["sha256"]
+        for artifact in fixed["artifacts"]
+        if artifact["kind"] == "wheel"
+    )
+
+    for build in (prior, fixed, inventory):
         artifacts = build["artifacts"]
         assert {artifact["kind"] for artifact in artifacts} == {"wheel", "sdist"}
         for artifact in artifacts:

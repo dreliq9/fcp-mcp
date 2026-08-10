@@ -1,38 +1,64 @@
 {
-  "schema_version": "2",
+  "schema_version": "3",
   "evidence_identity": {
-    "source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
-    "correction_base_commit": "db8d2da7f1383c95485528469144a028d290b24b",
+    "prior_workflow_source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
+    "fixed_head_source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
+    "asset_duration_contract_commits": [
+      "06601df54451ac595564b02574620196d7f9dfbe",
+      "a15fc4683c2b2bf89f140321f74a89b3bcde93cc"
+    ],
+    "evidence_correction_base_commit": "d6157d42c4984decd8b6f23ded937257bdc12d7c",
     "package_version": "0.3.0",
-    "publication_status": "not published, tagged, or pushed by this evidence task"
+    "publication_status": "not published, tagged, pushed, or submitted by this evidence task"
   },
   "environment": {
     "macos_version": "26.5.2",
     "macos_build": "25F84",
     "final_cut_pro_version": "12.2",
-    "final_cut_pro_bundle_id": "com.apple.FinalCut"
+    "final_cut_pro_bundle_id": "com.apple.FinalCut",
+    "python_version": "3.12.13"
   },
-  "installed_execution": {
-    "python_executable": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/python",
-    "python_executable_resolved": "/Users/adamsteen/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12",
-    "python_executable_sha256": "ba159225dd53b48213f9c446f89b037de6258d136be6f5db91c98e1ed5a8ab0c",
-    "python_version": "3.12.13",
-    "console_script": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/fcp-mcp",
-    "console_script_sha256": "bc3d585ab237f0a216aa36c0df1514f27d217b0c77333fb80e9d16c619acb152",
-    "package_import": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/lib/python3.12/site-packages/fcp_mcp/__init__.py",
-    "package_import_sha256": "15e512011862f10109871d4f70eca89c6a737c98ffd054fc287993dea80a23e6",
-    "cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
-    "installed_wheel_path": "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-    "installed_wheel_sha256": "527b7cc46789125168a84999569c81e866804559e7dfa2a07a4c924d2612c7fb",
-    "direct_url_record": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/lib/python3.12/site-packages/fcp_mcp-0.3.0.dist-info/direct_url.json",
-    "direct_url_record_sha256": "c30d2565a5a4fac56f8db9a50ab353be8d668f7a8ef9c12770ec6e369eceab3b"
+  "installed_executions": {
+    "prior_workflow_smoke": {
+      "purpose": "earlier installed-wheel workflow trajectory",
+      "source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
+      "python_executable": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/python",
+      "python_executable_resolved": "/Users/adamsteen/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12",
+      "python_executable_sha256": "ba159225dd53b48213f9c446f89b037de6258d136be6f5db91c98e1ed5a8ab0c",
+      "console_script": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/fcp-mcp",
+      "console_script_sha256": "bc3d585ab237f0a216aa36c0df1514f27d217b0c77333fb80e9d16c619acb152",
+      "package_import": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/lib/python3.12/site-packages/fcp_mcp/__init__.py",
+      "package_import_sha256": "15e512011862f10109871d4f70eca89c6a737c98ffd054fc287993dea80a23e6",
+      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
+      "installed_wheel_path": "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+      "installed_wheel_sha256": "527b7cc46789125168a84999569c81e866804559e7dfa2a07a4c924d2612c7fb",
+      "direct_url_record": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/lib/python3.12/site-packages/fcp_mcp-0.3.0.dist-info/direct_url.json",
+      "direct_url_record_sha256": "c30d2565a5a4fac56f8db9a50ab353be8d668f7a8ef9c12770ec6e369eceab3b"
+    },
+    "fixed_head_generation": {
+      "purpose": "installed MCP stdio generation of the imported FCPXML",
+      "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
+      "python_executable": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/python",
+      "python_executable_resolved": "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+      "python_executable_sha256": "31b9c9a8d50289f3a13f014b3efd8ea3534fc3eea7ca7d9809e166139910b805",
+      "console_script": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/fcp-mcp",
+      "console_script_sha256": "a8955b54afd1607654467d7cdac4132ee173c468b210b7251084486ca8ce25c6",
+      "package_import": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/lib/python3.12/site-packages/fcp_mcp/__init__.py",
+      "package_import_sha256": "15e512011862f10109871d4f70eca89c6a737c98ffd054fc287993dea80a23e6",
+      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
+      "installed_wheel_path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+      "installed_wheel_sha256": "b85e1ca6690570f80f9981b085d4e410f073fe4b711b071eeab838dfbf73424d",
+      "direct_url_record": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/lib/python3.12/site-packages/fcp_mcp-0.3.0.dist-info/direct_url.json",
+      "direct_url_record_sha256": "1a644aa28fa4c3fe289cbc002a1b24a2ac131083bbe5e0632065c46362242873"
+    }
   },
   "builds": {
-    "base_revision_installed": {
+    "prior_workflow_installed": {
       "source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
-      "source_cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
+      "purpose": "earlier installed workflow smoke",
       "installed": true,
       "published": false,
+      "build_cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
       "artifacts": [
         {
           "kind": "wheel",
@@ -46,29 +72,50 @@
         }
       ]
     },
-    "post_evidence_inventory": {
-      "source_commit": "db8d2da7f1383c95485528469144a028d290b24b",
+    "fixed_head_generation_installed": {
+      "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
+      "purpose": "installed fixed-head generation and Final Cut import",
+      "installed": true,
+      "published": false,
+      "build_cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
+      "artifacts": [
+        {
+          "kind": "wheel",
+          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+          "size_bytes": 232265,
+          "sha256": "b85e1ca6690570f80f9981b085d4e410f073fe4b711b071eeab838dfbf73424d"
+        },
+        {
+          "kind": "sdist",
+          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0.tar.gz",
+          "size_bytes": 890845,
+          "sha256": "dc45927f5aafcf6149db65a1ef64aab01c376567313263b1e30a9f4bdd3901e4"
+        }
+      ]
+    },
+    "final_inventory_only": {
+      "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
       "purpose": "inventory-only",
       "installed": false,
       "published": false,
       "build_cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
       "snapshot_inputs": {
-        "docs/releases/v0.3.0.md": "f96864114cc3ba3eac7b43baffb3e6ab93016660e64be56992863acebed19027",
-        "docs/releases/v0.3.0-provenance.json": "4f789a91cc7f09423476f329e585c4802bb3d389ada493d1e91df90487c081b1",
-        "docs/assets/v0.3-live-import.png": "ffe16f48cf6d2eb97cb9f5265efabcff414aab9885fa5f190a0906a835956894"
+        "docs/releases/v0.3.0.md": "e6073551a51d449ba5a9f62435a403a4d6fe9a79c32972757e7ad0d75e3af81c",
+        "docs/releases/v0.3.0-provenance.json": "4495eb9942a769e3aaf56c5a70c62c8a40ab6f377508b8de2848226820568588",
+        "docs/assets/v0.3-live-import.png": "a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a"
       },
       "artifacts": [
         {
           "kind": "wheel",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r1/post-evidence-corrected-r2/fcp_mcp-0.3.0-py3-none-any.whl",
-          "size_bytes": 231511,
-          "sha256": "4216820abc0c1b0e58af986dd94194162e82756e1a77b0294d8d8bad2c7b1ff1"
+          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0-py3-none-any.whl",
+          "size_bytes": 232265,
+          "sha256": "7bc6125a409ff452ced1418adc556d78938c7cd357560a48ba25a6a83e909c5b"
         },
         {
           "kind": "sdist",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r1/post-evidence-corrected-r2/fcp_mcp-0.3.0.tar.gz",
-          "size_bytes": 890702,
-          "sha256": "91c324b2a8d4c49f6bb3a4144291c88605bae153b7a30cef4dfd7a1e3678e064"
+          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0.tar.gz",
+          "size_bytes": 891643,
+          "sha256": "d979239dcf210f86c6f83bd32e499c3b3cc2957cebe18f9bde2767ed3bea01da"
         }
       ],
       "required_members": [
@@ -78,16 +125,16 @@
       ],
       "member_container": "sdist",
       "member_hashes_match_snapshot_inputs": true,
-      "attestation_boundary": "The public note and provenance appended these artifact hashes after the build. The sdist embeds the exact snapshot_inputs above, avoiding an impossible self-referential archive hash claim."
+      "attestation_boundary": "Archive and snapshot hashes are appended to the public files only after this inventory artifact is constructed; the embedded provenance is the pre-attestation snapshot."
     }
   },
   "sample_materialization": {
     "path": "/private/tmp/fcp-mcp-v030-evidence-r1/output/wheel-smoke-first-run-02dce804200549eab434c944245d359d.fcpxml",
     "sha256": "c54521e017d140cdf059fd950c7c286f0182e9622cd74ecacdfb83436b97ec02",
-    "relationship_to_trajectory": "separate installed sample-command check; not the workflow source below"
+    "relationship_to_trajectory": "separate earlier installed sample-command check; not the workflow or installed-generation source"
   },
   "trajectory": {
-    "kind": "installed-wheel two-operation smoke",
+    "kind": "earlier installed-wheel two-operation smoke",
     "run_id": "790da06a-04f7-48e8-a9e8-78014a464f6c",
     "run_created_at": "2026-08-10T04:31:03.772431Z",
     "source_path": "/private/tmp/fcp-mcp-v030-evidence-r1/output/wheel-smoke-source-8dee81b96a1b4372b0fba522e6d1fb77.fcpxml",
@@ -117,8 +164,55 @@
     "smoke_report_path": "/private/tmp/fcp-mcp-v030-evidence-r1/wheel-smoke.json",
     "smoke_report_sha256": "d0c7bb7a749a7070e3639258fe2d12341a0647923b8c01a06b37cc18accaad69"
   },
+  "installed_generation": {
+    "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
+    "wheel_path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+    "wheel_sha256": "b85e1ca6690570f80f9981b085d4e410f073fe4b711b071eeab838dfbf73424d",
+    "record_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/installed-generation.json",
+    "record_sha256": "8d2772be89007a04a324860c7b393b2afa1234570ed4878cac530d7047e17531",
+    "invocation_script_path": "/private/tmp/fcp-mcp-v030-evidence-r2/invoke_installed_timeline.py",
+    "invocation_script_sha256": "40e71cdbf069c7d899316675eddad2dfc7a96d28168ff131ec94a1bbb819b7fc",
+    "stdio_argv": [
+      "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/fcp-mcp"
+    ],
+    "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
+    "environment": {
+      "FCP_MCP_PROFILE": "full",
+      "FCP_MCP_OUTPUT_DIR": "/private/tmp/fcp-mcp-v030-evidence-r2/live",
+      "FCP_MCP_ALLOWED_ROOTS": "/private/tmp/fcp-mcp-v030-evidence-r2:/Volumes/Extreme SSD/GHG",
+      "FCP_MCP_STATE_DIR": "/private/tmp/fcp-mcp-v030-evidence-r2/state",
+      "FCP_MCP_ENABLE_LIVE_CONTROL": "0"
+    },
+    "tool": "fcpxml_create_timeline",
+    "arguments": {
+      "clips_json": "[{\"src\":\"/Volumes/Extreme SSD/GHG/P1010413.MP4\",\"name\":\"GHG P1010413 five-second evidence\",\"start\":\"900900/30000s\",\"duration\":\"150150/30000s\",\"asset_duration\":\"5735730/30000s\",\"role\":\"Dialogue\"}]",
+      "project_name": "v0.3 Installed Generated Evidence",
+      "format_name": "FFVideoFormat1080p2997",
+      "event_name": "v0.3 Fixed Head Evidence",
+      "output_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml"
+    },
+    "result": {
+      "status": "passed",
+      "project": "v0.3 Installed Generated Evidence",
+      "selected_clip_count": 1,
+      "target_duration_seconds": 5.005,
+      "transaction_id": "9cbc03af-d655-4218-9d91-98954128f669",
+      "validation_warnings": [
+        "Asset 'GHG P1010413 five-second evidence' has no source path"
+      ]
+    },
+    "output_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml",
+    "output_size_bytes": 999,
+    "output_sha256": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
+    "first_attempt": {
+      "status": "rejected before write",
+      "error": "path_outside_scope: requested live output while FCP_MCP_OUTPUT_DIR was bound to output",
+      "output_created": false
+    }
+  },
   "media": {
     "identity": "/Volumes/Extreme SSD/GHG/P1010413.MP4",
+    "authorization": "authorized original media supplied for this evidence task",
     "size_bytes": 2252375418,
     "sha256": "b51ebe8fa82bc452ea882292d955808b01af11c572925c5785c94fca152308d1",
     "video": "H.264 3840x2160 30000/1001",
@@ -126,50 +220,61 @@
     "duration_seconds": 191.191
   },
   "live_import": {
-    "corrected_fcpxml": {
-      "path": "/private/tmp/fcp-mcp-v030-evidence-r1/live/v0.3-live-import-corrected.fcpxml",
-      "size_bytes": 837,
-      "sha256": "2b60935326c91072fc26835441c5256774747385353e82e8cf8743843a6f9404"
+    "installed_generated_fcpxml": {
+      "path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml",
+      "size_bytes": 999,
+      "sha256": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
+      "post_generation_manual_edits": false
     },
     "asset_duration": "5735730/30000s",
     "source_start": "900900/30000s",
     "clip_duration": "150150/30000s",
+    "media_reference": "file:///Volumes/Extreme%20SSD/GHG/P1010413.MP4",
     "dtd_validation": {
       "dtd_path": "/Applications/Final Cut Pro.app/Contents/Frameworks/Interchange.framework/Versions/A/Resources/FCPXMLv1_11.dtd",
       "dtd_sha256": "fc85a0b4e56f28d63774f2e333301800db19c160b55cc118b55c4fe199f633be",
       "dtd_size_bytes": 41938,
       "authoritative_gate": "scripts/apple_dtd_gate.py (lxml)",
       "result": "passed",
-      "report_path": "/private/tmp/fcp-mcp-v030-evidence-r1/live/dtd.json",
-      "report_sha256": "0e6eff3c87eea2144e3fd6aee316ec9dc56e786845e39923142f4620a6f2963e",
+      "xml_sha256_before": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
+      "xml_sha256_after": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
+      "report_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/dtd.json",
+      "report_sha256": "e85d1f9f1422def40a815100809540ae80c682c303bbe375395e89d676559102",
       "xmllint_valid": "not claimed; the retained XML has no external SYSTEM identifier",
-      "macos_dtdvalid_caveat": "xmllint --dtdvalid emitted xmlSAX2ResolveEntity"
+      "macos_dtdvalid_caveat": "xmllint --dtdvalid emits xmlSAX2ResolveEntity"
     },
     "operator_observation": {
-      "route": "Final Cut Pro > File > Import > XML; Go to Folder exact corrected FCPXML path; Import",
-      "library_path": "/private/tmp/fcp-mcp-v030-evidence-r1/v0.3-live-import-corrected-evidence.fcpbundle",
-      "library": "v0.3-live-import-corrected-evidence.fcpbundle",
-      "event": "v0.3 Evidence Corrected",
-      "project": "v0.3 Live Import Evidence Corrected",
+      "route": "Final Cut Pro > File > Import > XML; Command-Shift-G; exact installed-generated FCPXML path; Import; select project in list view; Clip > Open Clip",
+      "library_path": "/private/tmp/fcp-mcp-v030-evidence-r2/v0.3-installed-generated-evidence.fcpbundle",
+      "library": "v0.3-installed-generated-evidence.fcpbundle",
+      "event": "v0.3 Fixed Head Evidence",
+      "project": "v0.3 Installed Generated Evidence",
       "import_warning": "none observed",
       "visible_clip_duration": "00:00:05:00",
       "visible_video": "filmstrip",
       "visible_audio": "waveform",
       "visible_format": "1080p HD 29.97p, Stereo",
       "visible_role": "Dialogue-1",
-      "observation_scope": "operator observation; the screenshot does not prove absence of an earlier warning"
+      "observation_scope": "operator observation; screenshot does not prove absence of an earlier warning dialog"
+    },
+    "managed_media_copy": {
+      "path": "/private/tmp/fcp-mcp-v030-evidence-r2/v0.3-installed-generated-evidence.fcpbundle/v0.3 Fixed Head Evidence/Original Media/P1010413.mp4",
+      "size_bytes": 2252375418,
+      "sha256": "b51ebe8fa82bc452ea882292d955808b01af11c572925c5785c94fca152308d1",
+      "matches_authorized_original": true
     }
   },
   "screenshot": {
     "path": "docs/assets/v0.3-live-import.png",
-    "sha256": "ffe16f48cf6d2eb97cb9f5265efabcff414aab9885fa5f190a0906a835956894",
+    "sha256": "a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a",
+    "size_bytes": 484002,
     "dimensions_px": [972, 768],
     "format": "PNG",
     "capture": "genuine Final Cut Pro window capture, cropped only",
-    "privacy_check": "passed; no local path or unrelated library/project sidebar is visible",
+    "privacy_check": "passed; no local path, other library names, or unrelated project names are visible",
     "visible_evidence": [
-      "v0.3 Live Import Evidence Corrected",
-      "00:00:05:00",
+      "v0.3 Installed Generated Evidence",
+      "05:00",
       "video filmstrip",
       "audio waveform",
       "1080p HD 29.97p, Stereo",
@@ -178,71 +283,162 @@
   },
   "commands": [
     {
-      "purpose": "base distribution build",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
+      "purpose": "fixed-head distribution build",
+      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
       "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r1/buildvenv/bin/python",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
         "-m",
         "build",
         "--outdir",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/dist"
+        "/private/tmp/fcp-mcp-v030-evidence-r2/dist"
       ],
+      "result": "wheel and sdist built",
       "exit_code": 0
     },
     {
-      "purpose": "install exact base wheel",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
+      "purpose": "install exact fixed-head wheel",
+      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
       "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/pip",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/pip",
         "install",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0-py3-none-any.whl"
+        "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl"
       ],
+      "result": "installed",
       "exit_code": 0
     },
     {
-      "purpose": "installed wheel smoke",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
-      "environment": {
-        "FCP_MCP_PROFILE": "workflow",
-        "FCP_MCP_STATE_DIR": "/private/tmp/fcp-mcp-v030-evidence-r1/state",
-        "FCP_MCP_OUTPUT_DIR": "/private/tmp/fcp-mcp-v030-evidence-r1/output"
-      },
+      "purpose": "invoke installed MCP stdio timeline tool",
+      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
       "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/python",
-        "scripts/wheel_smoke.py",
-        "--command",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/fcp-mcp"
+        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/python",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/invoke_installed_timeline.py"
       ],
-      "stdout_path": "/private/tmp/fcp-mcp-v030-evidence-r1/wheel-smoke.json",
+      "server_argv": [
+        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/fcp-mcp"
+      ],
+      "result_record": "/private/tmp/fcp-mcp-v030-evidence-r2/live/installed-generation.json",
+      "result": "passed; output SHA-256 2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
       "exit_code": 0
     },
     {
-      "purpose": "corrected Apple DTD gate",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
+      "purpose": "Apple DTD gate over unchanged installed-generated XML",
+      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
       "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/python",
-        "scripts/apple_dtd_gate.py",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/live/v0.3-live-import-corrected.fcpxml"
+        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/python",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/source/scripts/apple_dtd_gate.py",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml"
       ],
-      "stdout_path": "/private/tmp/fcp-mcp-v030-evidence-r1/live/dtd.json",
+      "stdout_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/dtd.json",
+      "result": "passed against installed FCPXML 1.11 DTD; XML hash unchanged",
       "exit_code": 0
     },
     {
-      "purpose": "corrected post-evidence inventory build",
+      "purpose": "final post-evidence inventory-only build",
       "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
       "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r1/buildvenv/bin/python",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
         "-m",
         "build",
         "--outdir",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/post-evidence-corrected-r2"
+        "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory"
       ],
+      "result": "inventory-only wheel and sdist built; not installed or published",
       "exit_code": 0
     }
   ],
   "validations": [
     {
-      "purpose": "focused corrected evidence and release contracts",
+      "purpose": "strict TDD initial semantic RED",
+      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/test_generator.py::TestTimelineBuilder",
+        "tests/test_server_contracts.py::test_create_timeline_accepts_explicit_asset_duration",
+        "tests/test_server_contracts.py::test_create_timeline_rejects_short_explicit_asset_duration",
+        "-q"
+      ],
+      "result": "6 failed, 2 passed before implementation",
+      "exit_code": 1
+    },
+    {
+      "purpose": "strict TDD cached/conflict RED",
+      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/test_generator.py::TestTimelineBuilder::test_repeated_source_rejects_conflicting_asset_durations",
+        "tests/test_generator.py::TestTimelineBuilder::test_cached_asset_is_extended_to_cover_new_selected_range",
+        "-q"
+      ],
+      "result": "2 failed before edge-case implementation",
+      "exit_code": 1
+    },
+    {
+      "purpose": "focused generator, tool, result, legacy-schema, and profile GREEN",
+      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
+      "argv": [
+        ".venv/bin/python",
+        "-m",
+        "pytest",
+        "tests/test_generator.py",
+        "tests/test_server_contracts.py",
+        "tests/result_contracts/test_offline_write_results.py",
+        "tests/contracts/test_profile_catalogs.py",
+        "tests/contracts/test_legacy_catalog_snapshot.py",
+        "tests/test_tool_catalog.py",
+        "-q"
+      ],
+      "result": "132 passed",
+      "exit_code": 0
+    },
+    {
+      "purpose": "twine validation for fixed-head build",
+      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
+      "argv": [
+        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
+        "-m",
+        "twine",
+        "check",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0.tar.gz"
+      ],
+      "result": "2 artifacts passed",
+      "exit_code": 0
+    },
+    {
+      "purpose": "twine validation for final inventory-only build",
+      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
+      "argv": [
+        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
+        "-m",
+        "twine",
+        "check",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0-py3-none-any.whl",
+        "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0.tar.gz"
+      ],
+      "result": "2 artifacts passed",
+      "exit_code": 0
+    },
+    {
+      "purpose": "inventory sdist member hash comparison",
+      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
+      "argv": [
+        ".venv/bin/python",
+        "-c",
+        "hash the three required sdist members and assert equality with builds.final_inventory_only.snapshot_inputs"
+      ],
+      "result": {
+        "docs/assets/v0.3-live-import.png": "a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a",
+        "docs/releases/v0.3.0-provenance.json": "4495eb9942a769e3aaf56c5a70c62c8a40ab6f377508b8de2848226820568588",
+        "docs/releases/v0.3.0.md": "e6073551a51d449ba5a9f62435a403a4d6fe9a79c32972757e7ad0d75e3af81c"
+      },
+      "exit_code": 0
+    },
+    {
+      "purpose": "focused final release-evidence and product contracts",
       "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
       "argv": [
         ".venv/bin/python",
@@ -254,68 +450,29 @@
         "tests/test_release_gates.py",
         "-q"
       ],
-      "result": "20 passed",
+      "result": "20 passed in 1.26s",
       "exit_code": 0
     },
     {
       "purpose": "full-profile documented calls",
       "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
       "environment": {"FCP_MCP_PROFILE": "full"},
-      "argv": [".venv/bin/python", "scripts/check_contracts.py"],
+      "argv": [
+        ".venv/bin/python",
+        "scripts/check_contracts.py"
+      ],
       "result": "Validated 51 tool-call blocks across 3 file(s).",
       "exit_code": 0
     },
     {
-      "purpose": "corrected Apple DTD gate rerun",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/python",
-        "scripts/apple_dtd_gate.py",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/live/v0.3-live-import-corrected.fcpxml"
-      ],
-      "result": "passed with installed FCPXML 1.11 DTD",
-      "exit_code": 0
-    },
-    {
-      "purpose": "twine validation for installed and inventory build sets",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        ".venv/bin/python",
-        "-m",
-        "twine",
-        "check",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0.tar.gz",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/post-evidence-corrected-r2/fcp_mcp-0.3.0-py3-none-any.whl",
-        "/private/tmp/fcp-mcp-v030-evidence-r1/post-evidence-corrected-r2/fcp_mcp-0.3.0.tar.gz"
-      ],
-      "result": "4 artifacts passed",
-      "exit_code": 0
-    },
-    {
-      "purpose": "sdist evidence-member inventory and hashes",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        ".venv/bin/python",
-        "-c",
-        "import hashlib,json,tarfile; from pathlib import Path; prov=json.loads(Path(\"docs/releases/v0.3.0-provenance.json\").read_text()); expected=prov[\"builds\"][\"post_evidence_inventory\"][\"snapshot_inputs\"]; archive=tarfile.open(\"/private/tmp/fcp-mcp-v030-evidence-r1/post-evidence-corrected-r2/fcp_mcp-0.3.0.tar.gz\"); actual={rel:hashlib.sha256(archive.extractfile(\"fcp_mcp-0.3.0/\"+rel).read()).hexdigest() for rel in expected}; archive.close(); assert actual == expected, (actual,expected); print(json.dumps(actual,sort_keys=True))"
-      ],
-      "result": {
-        "docs/assets/v0.3-live-import.png": "ffe16f48cf6d2eb97cb9f5265efabcff414aab9885fa5f190a0906a835956894",
-        "docs/releases/v0.3.0-provenance.json": "4f789a91cc7f09423476f329e585c4802bb3d389ada493d1e91df90487c081b1",
-        "docs/releases/v0.3.0.md": "f96864114cc3ba3eac7b43baffb3e6ab93016660e64be56992863acebed19027"
-      },
-      "exit_code": 0
-    },
-    {
-      "purpose": "corrected screenshot signature, dimensions, and hash",
+      "purpose": "screenshot signature, dimensions, and hash",
       "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
       "commands": [
         ["file", "docs/assets/v0.3-live-import.png"],
         ["sips", "-g", "pixelWidth", "-g", "pixelHeight", "docs/assets/v0.3-live-import.png"],
         ["shasum", "-a", "256", "docs/assets/v0.3-live-import.png"]
       ],
-      "result": "PNG, 972x768, ffe16f48cf6d2eb97cb9f5265efabcff414aab9885fa5f190a0906a835956894",
+      "result": "PNG, 972x768, a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a",
       "exit_code": 0
     },
     {
