@@ -27,6 +27,7 @@ Start here:
 - [Support](SUPPORT.md)
 - [Security](SECURITY.md)
 - [v0.3.0 release notes](docs/releases/v0.3.0.md)
+- [Fresh v0.3.0 installed-artifact and Final Cut Pro evidence](docs/releases/v0.3.0.md)
 - [Agent operating guide](LLM_GUIDE.md)
 - [Production workflow recipes](WORKFLOWS.md)
 - [v0.3 changelog](CHANGELOG.md)

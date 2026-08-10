@@ -2,5 +2,6 @@ include LICENSE README.md CHANGELOG.md ROADMAP.md LLM_GUIDE.md WORKFLOWS.md SUPP
 include server.json
 recursive-include examples *.py *.md
 recursive-include docs *.md
+recursive-include docs/assets *.png
 recursive-include scripts *.py
 recursive-include src/fcp_mcp/samples *.fcpxml
