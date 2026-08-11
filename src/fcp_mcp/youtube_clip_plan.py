@@ -20,6 +20,8 @@ from .fcpxml.transaction import FCPXMLTransactionReceipt
 from .fcpxml.validator import FCPXMLValidator, ValidationResult
 from .observability import emit_event
 from .profiles import ToolClass
+from .result_models.common import ArtifactReference
+from .result_models.fcpxml import TransactionReceiptResult
 from .result_models.handoff import YouTubeClipPlanGenerationResult
 from .tool_metadata import OFFLINE_WRITE
 from .utils.atomic_write import AtomicBundleItem, atomic_replace_bundle
@@ -115,22 +117,37 @@ def _validate_provenance_candidate(
         )
 
 
-def _existing_bundle_transaction_id(
+def _emit_event_best_effort(event: dict[str, Any], *, format: str) -> None:
+    try:
+        emit_event(event, format=format)
+    except Exception:  # noqa: BLE001 - logging cannot invalidate a committed pair
+        # Observability must not turn a committed artifact pair into an error.
+        return
+
+
+def _inspect_existing_bundle(
     destination: Path,
     provenance_path: Path,
     fcpxml_sha256: str,
     provenance_without_transaction: dict[str, Any],
-) -> str | None:
-    if (
-        destination.is_symlink()
-        or provenance_path.is_symlink()
-        or not destination.is_file()
-        or not provenance_path.is_file()
-        or _sha256(destination) != fcpxml_sha256
-    ):
-        return None
+) -> tuple[str | None, tuple[str | None, str | None]]:
+    destination_sha256 = None
+    provenance_sha256 = None
+    existing_bytes: bytes | None = None
     try:
-        existing_bytes = provenance_path.read_bytes()
+        if not destination.is_symlink() and destination.is_file():
+            destination_sha256 = _sha256(destination)
+        if not provenance_path.is_symlink() and provenance_path.is_file():
+            existing_bytes = provenance_path.read_bytes()
+            provenance_sha256 = hashlib.sha256(existing_bytes).hexdigest()
+    except OSError:
+        destination_sha256 = None
+        provenance_sha256 = None
+        existing_bytes = None
+    snapshot = (destination_sha256, provenance_sha256)
+    if destination_sha256 != fcpxml_sha256 or existing_bytes is None:
+        return None, snapshot
+    try:
         existing = json.loads(existing_bytes.decode("utf-8"))
         transaction_id = str(existing.pop("transaction_id"))
         canonical_transaction_id = str(uuid.UUID(transaction_id))
@@ -143,14 +160,14 @@ def _existing_bundle_transaction_id(
         ValueError,
         json.JSONDecodeError,
     ):
-        return None
+        return None, snapshot
     if transaction_id != canonical_transaction_id or existing != provenance_without_transaction:
-        return None
+        return None, snapshot
     expected = dict(provenance_without_transaction)
     expected["transaction_id"] = canonical_transaction_id
     if existing_bytes != _encode_provenance(expected):
-        return None
-    return canonical_transaction_id
+        return None, snapshot
+    return canonical_transaction_id, snapshot
 
 
 def _validated_assets(
@@ -323,12 +340,13 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
                 for asset in assets
             ],
         }
-        transaction_id = _existing_bundle_transaction_id(
+        existing_transaction_id, expected_prior_sha256 = _inspect_existing_bundle(
             destination,
             provenance_path,
             fcpxml_sha256,
             provenance_without_transaction,
-        ) or str(uuid.uuid4())
+        )
+        transaction_id = existing_transaction_id or str(uuid.uuid4())
         provenance = dict(provenance_without_transaction)
         provenance["transaction_id"] = transaction_id
         provenance_bytes = _encode_provenance(provenance)
@@ -354,9 +372,10 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
                 ),
                 event_format=runtime.CONFIG.log_format,
                 transaction_id=transaction_id,
+                expected_prior_sha256=expected_prior_sha256,
             )
         except FCPMCPError as error:
-            emit_event(
+            _emit_event_best_effort(
                 {
                     "event": "fcpxml_transaction",
                     "operation": "youtube_clip_plan_bundle",
@@ -373,6 +392,7 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
             )
             raise
         primary = bundle_receipt.items[0]
+        sidecar = bundle_receipt.items[1]
         receipt = FCPXMLTransactionReceipt(
             transaction_id=bundle_receipt.transaction_id,
             source=None,
@@ -388,7 +408,7 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
             ),
             elapsed_ms=round((time.perf_counter() - started) * 1000),
         )
-        emit_event(
+        _emit_event_best_effort(
             {
                 "event": "fcpxml_transaction",
                 "operation": "youtube_clip_plan_bundle",
@@ -422,10 +442,28 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
                 else None
             ),
             hashes_verified=True,
-            destination=runtime._artifact_reference(receipt),
-            provenance=runtime._artifact_reference_for_path(
-                provenance_path,
-                media_type="application/json",
+            destination=ArtifactReference(
+                path=str(primary.destination),
+                media_type="application/vnd.apple.fcpxml+xml",
+                sha256=primary.output_sha256,
+                size_bytes=primary.output_size_bytes,
             ),
-            receipt=runtime._receipt_result(receipt),
+            provenance=ArtifactReference(
+                path=str(sidecar.destination),
+                media_type="application/json",
+                sha256=sidecar.output_sha256,
+                size_bytes=sidecar.output_size_bytes,
+            ),
+            receipt=TransactionReceiptResult(
+                transaction_id=receipt.transaction_id,
+                source=None,
+                destination=str(receipt.destination),
+                backup_path=(str(receipt.backup_path) if receipt.backup_path else None),
+                input_sha256=None,
+                prior_sha256=receipt.prior_sha256,
+                output_sha256=receipt.output_sha256,
+                validation_warnings=list(receipt.validation_warnings),
+                elapsed_ms=receipt.elapsed_ms,
+                disposition=receipt.disposition,
+            ),
         )

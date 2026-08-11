@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -202,6 +204,184 @@ def test_handoff_overwrite_and_identical_retry_keep_one_bound_logical_effect(
     provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
     assert provenance["transaction_id"] == second.receipt.transaction_id
     assert provenance["fcpxml_sha256"] == _sha256(destination)
+
+
+def test_staggered_identical_handoffs_commit_only_one_logical_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcp_mcp.youtube_clip_plan as clip_plan_module
+
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    manifest = _manifest(tmp_path)
+    destination = tmp_path / "frontier.fcpxml"
+    real_replace = clip_plan_module.atomic_replace_bundle
+    first_ready = threading.Event()
+    release_first = threading.Event()
+    call_lock = threading.Lock()
+    call_count = 0
+
+    def staggered_replace(*args, **kwargs):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            is_first = call_count == 1
+        if is_first:
+            first_ready.set()
+            assert release_first.wait(timeout=5)
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(clip_plan_module, "atomic_replace_bundle", staggered_replace)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        delayed = executor.submit(
+            handler,
+            str(manifest),
+            project_name="Frontier Montage",
+            output_path=str(destination),
+        )
+        assert first_ready.wait(timeout=5)
+        winner = handler(
+            str(manifest),
+            project_name="Frontier Montage",
+            output_path=str(destination),
+        )
+        release_first.set()
+        with pytest.raises(FCPMCPError) as caught:
+            delayed.result(timeout=5)
+
+    assert caught.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+    provenance = json.loads((tmp_path / "frontier.sources.json").read_text())
+    assert provenance["transaction_id"] == winner.receipt.transaction_id
+    assert len(list(tmp_path.glob("*.bak.*"))) == 0
+
+
+def test_delayed_stale_handoff_cannot_overwrite_a_newer_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcp_mcp.youtube_clip_plan as clip_plan_module
+
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    manifest = _manifest(tmp_path)
+    destination = tmp_path / "frontier.fcpxml"
+    real_replace = clip_plan_module.atomic_replace_bundle
+    first_ready = threading.Event()
+    release_first = threading.Event()
+    call_lock = threading.Lock()
+    call_count = 0
+
+    def staggered_replace(*args, **kwargs):
+        nonlocal call_count
+        with call_lock:
+            call_count += 1
+            is_first = call_count == 1
+        if is_first:
+            first_ready.set()
+            assert release_first.wait(timeout=5)
+        return real_replace(*args, **kwargs)
+
+    monkeypatch.setattr(clip_plan_module, "atomic_replace_bundle", staggered_replace)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        stale = executor.submit(
+            handler,
+            str(manifest),
+            project_name="Stale Project",
+            output_path=str(destination),
+        )
+        assert first_ready.wait(timeout=5)
+        winner = handler(
+            str(manifest),
+            project_name="Winning Project",
+            output_path=str(destination),
+        )
+        release_first.set()
+        with pytest.raises(FCPMCPError) as caught:
+            stale.result(timeout=5)
+
+    assert caught.value.code is ErrorCode.IDEMPOTENCY_CONFLICT
+    project = ElementTree.parse(destination).getroot().find(".//project")
+    assert project is not None
+    assert project.attrib["name"] == "Winning Project"
+    provenance = json.loads((tmp_path / "frontier.sources.json").read_text())
+    assert provenance["transaction_id"] == winner.receipt.transaction_id
+
+
+def test_result_evidence_cannot_mix_with_a_later_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcp_mcp.youtube_clip_plan as clip_plan_module
+
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    manifest = _manifest(tmp_path)
+    destination = tmp_path / "frontier.fcpxml"
+    real_emit = clip_plan_module.emit_event
+    first_event = threading.Event()
+    release_first = threading.Event()
+    event_lock = threading.Lock()
+    blocked = False
+
+    def staggered_emit(event, *, format):
+        nonlocal blocked
+        should_block = False
+        if event.get("validation_outcome") == "valid":
+            with event_lock:
+                if not blocked:
+                    blocked = True
+                    should_block = True
+        if should_block:
+            first_event.set()
+            assert release_first.wait(timeout=5)
+        return real_emit(event, format=format)
+
+    monkeypatch.setattr(clip_plan_module, "emit_event", staggered_emit)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            handler,
+            str(manifest),
+            project_name="First Project",
+            output_path=str(destination),
+        )
+        assert first_event.wait(timeout=5)
+        second = handler(
+            str(manifest),
+            project_name="Second Project",
+            output_path=str(destination),
+        )
+        release_first.set()
+        first_result = first.result(timeout=5)
+
+    assert first_result.receipt.transaction_id != second.receipt.transaction_id
+    assert first_result.destination.sha256 == first_result.receipt.output_sha256
+    assert first_result.destination.sha256 != second.destination.sha256
+
+
+def test_success_event_failure_does_not_turn_a_committed_bundle_into_an_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcp_mcp.youtube_clip_plan as clip_plan_module
+
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    destination = tmp_path / "frontier.fcpxml"
+
+    def fail_event(*_args, **_kwargs) -> None:
+        raise OSError("event sink unavailable")
+
+    monkeypatch.setattr(clip_plan_module, "emit_event", fail_event)
+    result = handler(
+        str(_manifest(tmp_path)),
+        project_name="Frontier Montage",
+        output_path=str(destination),
+    )
+
+    assert result.destination.sha256 == result.receipt.output_sha256
+    assert destination.exists()
+    assert (tmp_path / "frontier.sources.json").exists()
 
 
 def test_invalid_sidecar_candidate_preserves_existing_output_pair(

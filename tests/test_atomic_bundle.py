@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -55,6 +56,26 @@ def _journal_paths(tmp_path: Path) -> list[Path]:
 
 def _stage_paths(tmp_path: Path) -> list[Path]:
     return list(tmp_path.glob(".*.stage"))
+
+
+def _receipt_paths(tmp_path: Path) -> list[Path]:
+    return list(tmp_path.glob(".fcp-mcp.bundle.*.receipt.json"))
+
+
+def _write_checksummed_journal(path: Path, payload: dict[str, object]) -> None:
+    body = dict(payload)
+    body.pop("journal_sha256", None)
+    canonical = json.dumps(
+        body,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    body["journal_sha256"] = hashlib.sha256(canonical).hexdigest()
+    path.write_text(
+        json.dumps(body, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _inject_boundary_failure(
@@ -166,6 +187,7 @@ def test_bundle_rejects_invalid_sidecar_before_destination_mutation(
     assert second.read_bytes() == b'{"old": true}\n'
     assert _journal_paths(tmp_path) == []
     assert _stage_paths(tmp_path) == []
+    assert _receipt_paths(tmp_path) == []
 
 
 def test_atomic_bundle_is_narrowly_limited_to_one_output_pair(tmp_path: Path) -> None:
@@ -179,6 +201,19 @@ def test_atomic_bundle_is_narrowly_limited_to_one_output_pair(tmp_path: Path) ->
         atomic_replace_bundle(items, transaction_id=str(uuid.uuid4()))
 
     assert caught.value.code is ErrorCode.INVALID_ARGUMENTS
+    assert all(not Path(item.destination).exists() for item in items)
+
+
+def test_atomic_bundle_rejects_noncanonical_artifact_pairs(tmp_path: Path) -> None:
+    items = (
+        AtomicBundleItem(tmp_path / "timeline.fcpxml", b"timeline"),
+        AtomicBundleItem(tmp_path / "other.sources.json", b"{}\n"),
+    )
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(items, transaction_id=str(uuid.uuid4()))
+
+    assert caught.value.code is ErrorCode.INVALID_PATH
     assert all(not Path(item.destination).exists() for item in items)
 
 
@@ -207,6 +242,35 @@ def test_handled_bundle_failure_restores_both_existing_destinations(
     assert destinations[1].read_bytes() == b'{"old": true}\n'
     assert _journal_paths(tmp_path) == []
     assert _stage_paths(tmp_path) == []
+    assert _receipt_paths(tmp_path) == []
+
+
+def test_rollback_contract_restores_bytes_and_existence_with_secure_evidence_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, items = _bundle(tmp_path)
+    destinations = tuple(Path(item.destination) for item in items)
+    prior = (b"old timeline", b'{"old": true}\n')
+    for destination, payload in zip(destinations, prior):
+        destination.write_bytes(payload)
+        destination.chmod(0o644)
+    _inject_boundary_failure(
+        monkeypatch,
+        destinations,
+        boundary="before_terminal",
+        error=OSError("injected rollback"),
+    )
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(items, transaction_id=attempt)
+
+    assert caught.value.code is ErrorCode.TRANSACTION_FAILED
+    assert tuple(destination.read_bytes() for destination in destinations) == prior
+    assert tuple(stat.S_IMODE(destination.stat().st_mode) for destination in destinations) == (
+        0o600,
+        0o600,
+    )
 
 
 def test_failure_between_replacements_restores_prior_absence(
@@ -231,6 +295,69 @@ def test_failure_between_replacements_restores_prior_absence(
     assert _stage_paths(tmp_path) == []
 
 
+def test_failure_with_one_unchanged_output_restores_the_changed_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt = str(uuid.uuid4())
+    first = tmp_path / "timeline.fcpxml"
+    second = tmp_path / "timeline.sources.json"
+    first.write_bytes(b"unchanged timeline")
+    second.write_bytes(b'{"old": true}\n')
+    items = (
+        AtomicBundleItem(first, b"unchanged timeline"),
+        AtomicBundleItem(second, b'{"new": true}\n', validate=_valid_json),
+    )
+    _inject_boundary_failure(
+        monkeypatch,
+        (first, second),
+        boundary="before_terminal",
+        error=OSError("injected after changed replacement"),
+    )
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(items, transaction_id=attempt)
+
+    assert caught.value.code is ErrorCode.TRANSACTION_FAILED
+    assert first.read_bytes() == b"unchanged timeline"
+    assert second.read_bytes() == b'{"old": true}\n'
+    assert _journal_paths(tmp_path) == []
+    assert _stage_paths(tmp_path) == []
+
+
+def test_hot_recovery_commits_pair_with_one_unchanged_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt = str(uuid.uuid4())
+    first = tmp_path / "timeline.fcpxml"
+    second = tmp_path / "timeline.sources.json"
+    first.write_bytes(b"unchanged timeline")
+    second.write_bytes(b'{"old": true}\n')
+    items = (
+        AtomicBundleItem(first, b"unchanged timeline"),
+        AtomicBundleItem(second, b'{"new": true}\n', validate=_valid_json),
+    )
+    _inject_boundary_failure(
+        monkeypatch,
+        (first, second),
+        boundary="before_terminal",
+        error=KeyboardInterrupt("interrupted after changed replacement"),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        atomic_replace_bundle(items, transaction_id=attempt)
+
+    receipt = atomic_replace_bundle(items, transaction_id=attempt)
+
+    assert receipt.transaction_id == attempt
+    assert receipt.replayed is True
+    assert first.read_bytes() == b"unchanged timeline"
+    assert second.read_bytes() == b'{"new": true}\n'
+    assert _journal_paths(tmp_path) == []
+    assert _stage_paths(tmp_path) == []
+
+
 def test_terminal_cleanup_failure_rolls_back_the_committed_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -249,6 +376,7 @@ def test_terminal_cleanup_failure_rolls_back_the_committed_pair(
         nonlocal injected
         if not injected and path.name.endswith(".journal.json"):
             injected = True
+            real_unlink(path, missing_ok=missing_ok)
             raise OSError("injected terminal cleanup failure")
         real_unlink(path, missing_ok=missing_ok)
 
@@ -262,6 +390,7 @@ def test_terminal_cleanup_failure_rolls_back_the_committed_pair(
     assert destinations[1].read_bytes() == b'{"old": true}\n'
     assert _journal_paths(tmp_path) == []
     assert _stage_paths(tmp_path) == []
+    assert _receipt_paths(tmp_path) == []
 
 
 @pytest.mark.parametrize("boundary", ["before_first", "between", "before_terminal"])
@@ -290,6 +419,44 @@ def test_abandoned_journal_is_reconciled_at_each_replacement_boundary(
     assert receipt.transaction_id == attempt
     assert destinations[0].read_bytes() == b"new timeline"
     assert destinations[1].read_bytes() == b'{"new": true}\n'
+    assert _journal_paths(tmp_path) == []
+    assert _stage_paths(tmp_path) == []
+
+
+@pytest.mark.parametrize("boundary", ["before_first", "between", "before_terminal"])
+def test_different_request_reconciles_each_hot_journal_boundary_before_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    first_attempt, first_items = _bundle(tmp_path)
+    destinations = tuple(Path(item.destination) for item in first_items)
+    destinations[0].write_bytes(b"old timeline")
+    destinations[1].write_bytes(b'{"old": true}\n')
+    _inject_boundary_failure(
+        monkeypatch,
+        destinations,
+        boundary=boundary,
+        error=KeyboardInterrupt(f"interrupted {boundary}"),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        atomic_replace_bundle(first_items, transaction_id=first_attempt)
+
+    second_attempt = str(uuid.uuid4())
+    second_items = (
+        AtomicBundleItem(destinations[0], b"newer timeline"),
+        AtomicBundleItem(
+            destinations[1],
+            b'{"newer": true}\n',
+            validate=_valid_json,
+        ),
+    )
+    receipt = atomic_replace_bundle(second_items, transaction_id=second_attempt)
+
+    assert receipt.transaction_id == second_attempt
+    assert receipt.replayed is False
+    assert destinations[0].read_bytes() == b"newer timeline"
+    assert destinations[1].read_bytes() == b'{"newer": true}\n'
     assert _journal_paths(tmp_path) == []
     assert _stage_paths(tmp_path) == []
 
@@ -339,6 +506,33 @@ def test_repeated_identical_bundle_is_a_noop_with_same_transaction_identity(
     assert second.replayed is True
     assert sorted(tmp_path.glob("*.bak.*")) == backup_snapshot
     assert _journal_paths(tmp_path) == []
+
+
+@pytest.mark.parametrize("damage", ["deleted", "tampered"])
+def test_identical_replay_requires_immutable_prior_receipt_evidence(
+    tmp_path: Path,
+    damage: str,
+) -> None:
+    attempt, items = _bundle(tmp_path)
+    destinations = tuple(Path(item.destination) for item in items)
+    destinations[0].write_bytes(b"old timeline")
+    destinations[1].write_bytes(b'{"old": true}\n')
+    first = atomic_replace_bundle(items, transaction_id=attempt)
+    backup = first.items[0].backup_path
+    assert backup is not None
+    if damage == "deleted":
+        backup.unlink()
+    else:
+        backup.write_bytes(b"tampered prior evidence")
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(items, transaction_id=attempt)
+
+    assert caught.value.code is ErrorCode.RECOVERY_REQUIRED
+    assert [destination.read_bytes() for destination in destinations] == [
+        b"new timeline",
+        b'{"new": true}\n',
+    ]
 
 
 def test_identical_retry_refuses_unjournaled_attempt_evidence(
@@ -405,7 +599,7 @@ def test_live_bundle_writer_is_not_recovered_as_abandoned(tmp_path: Path) -> Non
         assert entered_validation.wait(timeout=5)
         with pytest.raises(FCPMCPError) as caught:
             atomic_replace_bundle(
-                tuple(reversed(items)),
+                items,
                 transaction_id=str(uuid.uuid4()),
             )
         assert caught.value.code is ErrorCode.RECOVERY_REQUIRED
@@ -478,7 +672,7 @@ def test_rolled_back_terminal_journal_never_reclassifies_outputs_as_committed(
     journal = _journal_paths(tmp_path)[0]
     journal_payload = json.loads(journal.read_text(encoding="utf-8"))
     journal_payload["state"] = "rolled_back"
-    journal.write_text(json.dumps(journal_payload), encoding="utf-8")
+    _write_checksummed_journal(journal, journal_payload)
     for item in items:
         Path(item.destination).write_bytes(item.payload)
 
@@ -567,6 +761,10 @@ def test_bundle_receipt_hashes_normal_create_and_overwrite(tmp_path: Path) -> No
         _sha256_bytes(b'{"new": true}\n'),
     ]
     assert [item.prior_sha256 for item in created.items] == [None, None]
+    assert [item.output_size_bytes for item in created.items] == [
+        len(b"new timeline"),
+        len(b'{"new": true}\n'),
+    ]
 
     second_attempt, second_items = _bundle(
         tmp_path,
@@ -591,3 +789,6 @@ def test_bundle_receipt_hashes_normal_create_and_overwrite(tmp_path: Path) -> No
         b"new timeline",
         b'{"new": true}\n',
     ]
+    terminal_receipts = list(tmp_path.glob(".fcp-mcp.bundle.*.receipt.json"))
+    assert len(terminal_receipts) == 2
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in terminal_receipts)

@@ -56,11 +56,14 @@ The bundle transaction does not claim that two POSIX replacements happen
 simultaneously. It serializes conflicting writers and coordinates the two
 single-path replacements with same-directory stages, rollback copies, and a
 durable integrity-checked journal. A handled failure restores both outputs to
-their exact prior state, including prior absence. A later conflicting invocation reconciles an
-interrupted non-terminal journal before starting new work; ambiguous or
-tampered recovery evidence returns `recovery_required` without overwriting the
-observed destinations. An identical retry of an already committed pair reuses
-the bound transaction identity and creates no duplicate logical effect.
+their exact prior file bytes and prior existence. That rollback contract does
+not preserve timestamps, mode bits, ACLs, flags, or extended attributes.
+Rollback copies and retained terminal receipt evidence are deliberately created
+with mode `0600`. A later conflicting invocation reconciles an interrupted
+non-terminal journal before starting new work; ambiguous or tampered recovery
+evidence returns `recovery_required` without overwriting the observed
+destinations. An identical retry of an already committed pair reuses the bound
+transaction identity and creates no duplicate logical effect.
 
 Materialized youtube-mcp assets have already been source-trimmed. FCP-MCP therefore uses each local clip from `0s` for its full `duration_s`; it does not reinterpret the original YouTube in/out points.
 

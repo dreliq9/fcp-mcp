@@ -41,6 +41,7 @@ class AtomicBundleItemReceipt:
     backup_path: Path | None
     prior_sha256: str | None
     output_sha256: str
+    output_size_bytes: int
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,7 @@ class _JournalItem:
     prior_exists: bool
     prior_sha256: str | None
     output_sha256: str
+    output_size_bytes: int
 
 
 @dataclass(frozen=True)
@@ -318,6 +320,14 @@ def _normalize_bundle_items(
                 )
         normalized.append(AtomicBundleItem(destination, item.payload, item.validate))
     assert parent is not None
+    primary = Path(normalized[0].destination)
+    sidecar = Path(normalized[1].destination)
+    expected_sidecar = primary.with_name(primary.stem + ".sources.json")
+    if primary.suffix.lower() != ".fcpxml" or sidecar != expected_sidecar:
+        raise _bundle_error(
+            ErrorCode.INVALID_PATH,
+            "Atomic bundles are limited to a canonical FCPXML and sources pair",
+        )
     return parent, tuple(normalized)
 
 
@@ -325,12 +335,13 @@ def _bundle_paths(
     parent: Path,
     items: Sequence[AtomicBundleItem],
     transaction_id: str,
-) -> tuple[str, Path, Path, Path, tuple[Path, ...], tuple[Path, ...]]:
+) -> tuple[str, Path, Path, Path, Path, tuple[Path, ...], tuple[Path, ...]]:
     key_material = "\0".join(sorted(Path(item.destination).name for item in items))
     key = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:24]
     lock = parent / f".fcp-mcp.bundle.{key}.lock"
     journal = parent / f".fcp-mcp.bundle.{key}.journal.json"
     journal_temp = parent / f".fcp-mcp.bundle.{key}.journal.tmp"
+    receipt = parent / f".fcp-mcp.bundle.{key}.{transaction_id}.receipt.json"
     stages = tuple(
         parent / f".{Path(item.destination).name}.{transaction_id}.stage" for item in items
     )
@@ -338,13 +349,17 @@ def _bundle_paths(
         parent / f"{Path(item.destination).name}.bak.{transaction_id}" for item in items
     )
     destinations = {Path(item.destination) for item in items}
-    internals = {lock, journal, journal_temp, *stages, *backups}
-    if len(internals) != 3 + len(stages) + len(backups) or destinations & internals:
+    internals = {lock, journal, journal_temp, receipt, *stages, *backups}
+    if len(internals) != 4 + len(stages) + len(backups) or destinations & internals:
         raise _bundle_error(
             ErrorCode.INVALID_PATH,
             "Bundle destination collides with transaction evidence",
         )
-    return key, lock, journal, journal_temp, stages, backups
+    return key, lock, journal, journal_temp, receipt, stages, backups
+
+
+def _bundle_receipt_path(parent: Path, key: str, transaction_id: str) -> Path:
+    return parent / f".fcp-mcp.bundle.{key}.{transaction_id}.receipt.json"
 
 
 def _find_unjournaled_bundle_evidence(
@@ -513,6 +528,7 @@ def _journal_payload(journal: _BundleJournal) -> bytes:
                 "prior_exists": item.prior_exists,
                 "prior_sha256": item.prior_sha256,
                 "output_sha256": item.output_sha256,
+                "output_size_bytes": item.output_size_bytes,
             }
             for item in journal.items
         ],
@@ -600,6 +616,8 @@ def _load_bundle_journal(
                 raw_item.get("stage_name") != expected_stage
                 or type(prior_exists) is not bool
                 or not _valid_sha256(raw_item.get("output_sha256"))
+                or type(raw_item.get("output_size_bytes")) is not int
+                or raw_item["output_size_bytes"] < 0
             ):
                 raise ValueError("journal item identity mismatch")
             if prior_exists:
@@ -619,6 +637,7 @@ def _load_bundle_journal(
                     prior_exists=prior_exists,
                     prior_sha256=prior_sha256,
                     output_sha256=raw_item["output_sha256"],
+                    output_size_bytes=raw_item["output_size_bytes"],
                 )
             )
         return _BundleJournal(
@@ -663,13 +682,25 @@ def _path_hash_or_absent(path: Path) -> str | None:
 
 def _classify_destination(item: _JournalItem) -> str:
     observed = _path_hash_or_absent(item.destination)
-    if observed == item.output_sha256:
+    matches_output = observed == item.output_sha256
+    matches_prior = (item.prior_exists and observed == item.prior_sha256) or (
+        not item.prior_exists and observed is None
+    )
+    if matches_output and matches_prior:
+        return "both"
+    if matches_output:
         return "output"
-    if item.prior_exists and observed == item.prior_sha256:
-        return "prior"
-    if not item.prior_exists and observed is None:
+    if matches_prior:
         return "prior"
     return "unknown"
+
+
+def _is_prior_state(state: str) -> bool:
+    return state in {"prior", "both"}
+
+
+def _is_output_state(state: str) -> bool:
+    return state in {"output", "both"}
 
 
 def _unlink_verified(path: Path, expected_sha256: str) -> None:
@@ -729,6 +760,7 @@ def _receipt_from_journal(
                 backup_path=item.backup,
                 prior_sha256=item.prior_sha256,
                 output_sha256=item.output_sha256,
+                output_size_bytes=item.output_size_bytes,
             )
             for item in journal.items
         ),
@@ -749,6 +781,80 @@ def _journal_matches_request(
         requested_hashes.get(journal_item.destination) == journal_item.output_sha256
         for journal_item in journal.items
     )
+
+
+def _ensure_terminal_receipt(
+    journal: _BundleJournal,
+    receipt_path: Path,
+) -> bool:
+    destinations = tuple(item.destination for item in journal.items)
+    try:
+        receipt_path.lstat()
+    except FileNotFoundError:
+        _write_exclusive(receipt_path, _journal_payload(journal))
+        _sync_directory(receipt_path.parent)
+        return True
+    terminal = _load_bundle_journal(
+        receipt_path,
+        key=journal.key,
+        destinations=destinations,
+    )
+    if terminal != journal or terminal.state != "committed":
+        raise _bundle_error(
+            ErrorCode.RECOVERY_REQUIRED,
+            "Terminal bundle receipt does not match committed evidence",
+            receipt_path=str(receipt_path),
+        )
+    return False
+
+
+def _load_replay_receipt(
+    receipt_path: Path,
+    *,
+    key: str,
+    transaction_id: str,
+    items: Sequence[AtomicBundleItem],
+    elapsed_ms: int,
+) -> AtomicBundleReceipt:
+    destinations = tuple(Path(item.destination) for item in items)
+    terminal = _load_bundle_journal(receipt_path, key=key, destinations=destinations)
+    if terminal.state != "committed" or not _journal_matches_request(
+        terminal,
+        transaction_id,
+        items,
+    ):
+        raise _bundle_error(
+            ErrorCode.RECOVERY_REQUIRED,
+            "Terminal bundle receipt does not prove the requested replay",
+            receipt_path=str(receipt_path),
+        )
+    if not all(_is_output_state(_classify_destination(item)) for item in terminal.items):
+        raise _bundle_error(
+            ErrorCode.RECOVERY_REQUIRED,
+            "Terminal bundle receipt does not match destination evidence",
+            receipt_path=str(receipt_path),
+        )
+    for item in terminal.items:
+        if item.destination.stat().st_size != item.output_size_bytes:
+            raise _bundle_error(
+                ErrorCode.RECOVERY_REQUIRED,
+                "Terminal bundle output size does not match receipt evidence",
+            )
+        if item.prior_exists:
+            assert item.backup is not None and item.prior_sha256 is not None
+            if (
+                _regular_sha256(item.backup, code=ErrorCode.RECOVERY_REQUIRED)
+                != item.prior_sha256
+            ):
+                raise _bundle_error(
+                    ErrorCode.RECOVERY_REQUIRED,
+                    "Terminal bundle backup does not match receipt evidence",
+                    backup_path=str(item.backup),
+                )
+    for item in items:
+        if item.validate is not None:
+            item.validate(Path(item.destination))
+    return _receipt_from_journal(terminal, elapsed_ms=elapsed_ms, replayed=True)
 
 
 def _rollback_bundle(
@@ -799,7 +905,7 @@ def _rollback_bundle(
         _sync_directory(item.destination.parent)
     for item in journal.items:
         observed = _classify_destination(item)
-        if observed != "prior":
+        if not _is_prior_state(observed):
             raise _bundle_error(
                 ErrorCode.RECOVERY_REQUIRED,
                 "Bundle rollback could not be proven",
@@ -837,15 +943,15 @@ def _recover_bundle(
             journal_path=str(journal_path),
         )
     if journal.state == "rolled_back":
-        if not all(state == "prior" for state in states):
+        if not all(_is_prior_state(state) for state in states):
             raise _bundle_error(
                 ErrorCode.RECOVERY_REQUIRED,
                 "Rolled-back bundle journal does not match destination evidence",
             )
         _rollback_bundle(journal, journal_path, journal_temp)
         return None
-    if journal.state == "committed" or all(state == "output" for state in states):
-        if not all(state == "output" for state in states):
+    if journal.state == "committed" or all(_is_output_state(state) for state in states):
+        if not all(_is_output_state(state) for state in states):
             raise _bundle_error(
                 ErrorCode.RECOVERY_REQUIRED,
                 "Terminal bundle journal does not match destination evidence",
@@ -888,6 +994,12 @@ def _recover_bundle(
         if journal.state != "committed":
             _cleanup_journal_temp(journal_temp)
             _replace_bundle_journal(journal_path, journal_temp, committed)
+        receipt_path = _bundle_receipt_path(
+            journal_path.parent,
+            journal.key,
+            journal.transaction_id,
+        )
+        _ensure_terminal_receipt(committed, receipt_path)
         _cleanup_bundle_evidence(
             committed,
             journal_path,
@@ -924,11 +1036,34 @@ def _same_bundle_already_committed(
     return True
 
 
+def _bundle_destination_snapshot(
+    items: Sequence[AtomicBundleItem],
+) -> tuple[str | None, ...]:
+    snapshot: list[str | None] = []
+    for item in items:
+        destination = Path(item.destination)
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            snapshot.append(None)
+        except OSError as error:
+            raise _bundle_error(
+                ErrorCode.INVALID_PATH,
+                "Bundle destination could not be inspected",
+            ) from error
+        else:
+            snapshot.append(
+                _regular_sha256(destination, code=ErrorCode.INVALID_PATH)
+            )
+    return tuple(snapshot)
+
+
 def atomic_replace_bundle(
     items: Sequence[AtomicBundleItem],
     *,
     event_format: str = "text",
     transaction_id: str | None = None,
+    expected_prior_sha256: tuple[str | None, str | None] | None = None,
 ) -> AtomicBundleReceipt:
     """Commit a same-directory artifact bundle with durable rollback recovery.
 
@@ -936,17 +1071,29 @@ def atomic_replace_bundle(
     helper coordinates the replacements with fsynced stages, backups, a durable
     journal, and an exclusive pair-scoped lock so handled failures are all-or-old
     and an interrupted attempt can be reconciled before a conflicting commit.
+
+    Rollback preserves each destination's exact prior bytes and prior existence.
+    It does not preserve timestamps, mode bits, ACLs, flags, or extended
+    attributes; backup and receipt evidence is deliberately created mode 0600.
     """
     started = time.perf_counter()
     attempt = _canonical_transaction_id(transaction_id)
     parent, normalized_items = _normalize_bundle_items(tuple(items))
-    key, lock, journal_path, journal_temp, stages, backups = _bundle_paths(
+    key, lock, journal_path, journal_temp, receipt_path, stages, backups = _bundle_paths(
         parent,
         normalized_items,
         attempt,
     )
     with _exclusive_bundle_lock(lock):
         _, normalized_items = _normalize_bundle_items(normalized_items)
+        if (
+            expected_prior_sha256 is not None
+            and _bundle_destination_snapshot(normalized_items) != expected_prior_sha256
+        ):
+            raise _bundle_error(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "Bundle destinations changed after the request snapshot",
+            )
         try:
             journal_path.lstat()
         except FileNotFoundError:
@@ -986,35 +1133,25 @@ def atomic_replace_bundle(
             )
 
         if _same_bundle_already_committed(normalized_items):
-            journal_items: list[_JournalItem] = []
-            for item, stage, backup in zip(normalized_items, stages, backups):
-                backup_path = backup if backup.is_file() and not backup.is_symlink() else None
-                prior_sha256 = (
-                    _regular_sha256(backup_path, code=ErrorCode.RECOVERY_REQUIRED)
-                    if backup_path is not None
-                    else None
-                )
-                journal_items.append(
-                    _JournalItem(
-                        destination=Path(item.destination),
-                        stage=stage,
-                        backup=backup_path,
-                        prior_exists=backup_path is not None,
-                        prior_sha256=prior_sha256,
-                        output_sha256=hashlib.sha256(item.payload).hexdigest(),
-                    )
-                )
-            replay = _receipt_from_journal(
-                _BundleJournal(key, attempt, "committed", tuple(journal_items)),
+            return _load_replay_receipt(
+                receipt_path,
+                key=key,
+                transaction_id=attempt,
+                items=normalized_items,
                 elapsed_ms=round((time.perf_counter() - started) * 1000),
-                replayed=True,
             )
-            return replay
+        if receipt_path.exists() or receipt_path.is_symlink():
+            raise _bundle_error(
+                ErrorCode.IDEMPOTENCY_CONFLICT,
+                "Terminal receipt identity is already bound to different output bytes",
+                receipt_path=str(receipt_path),
+            )
 
         created_stages: list[Path] = []
         created_backups: list[Path] = []
         active_journal: _BundleJournal | None = None
         journal_published = False
+        receipt_published = False
         try:
             for item, stage in zip(normalized_items, stages):
                 _write_exclusive(stage, item.payload)
@@ -1059,6 +1196,7 @@ def atomic_replace_bundle(
                         prior_exists=prior_exists,
                         prior_sha256=prior_sha256,
                         output_sha256=hashlib.sha256(item.payload).hexdigest(),
+                        output_size_bytes=len(item.payload),
                     )
                 )
             _sync_directory(parent)
@@ -1067,12 +1205,17 @@ def atomic_replace_bundle(
             journal_published = True
             _sync_directory(parent)
 
-            if any(_classify_destination(item) != "prior" for item in active_journal.items):
+            if any(
+                not _is_prior_state(_classify_destination(item))
+                for item in active_journal.items
+            ):
                 raise _bundle_error(
                     ErrorCode.RECOVERY_REQUIRED,
                     "Bundle destinations changed before replacement",
                 )
             for item in active_journal.items:
+                if item.prior_exists and item.prior_sha256 == item.output_sha256:
+                    continue
                 os.replace(item.stage, item.destination)
                 _sync_directory(parent)
             for item, requested in zip(active_journal.items, normalized_items):
@@ -1089,6 +1232,9 @@ def atomic_replace_bundle(
 
             committed = _BundleJournal(key, attempt, "committed", active_journal.items)
             _replace_bundle_journal(journal_path, journal_temp, committed)
+            _write_exclusive(receipt_path, _journal_payload(committed))
+            receipt_published = True
+            _sync_directory(parent)
             _cleanup_bundle_evidence(
                 committed,
                 journal_path,
@@ -1116,6 +1262,18 @@ def atomic_replace_bundle(
             if active_journal is not None and journal_published:
                 try:
                     _rollback_bundle(active_journal, journal_path, journal_temp)
+                    if receipt_published:
+                        terminal = _BundleJournal(
+                            active_journal.key,
+                            active_journal.transaction_id,
+                            "committed",
+                            active_journal.items,
+                        )
+                        _unlink_verified(
+                            receipt_path,
+                            hashlib.sha256(_journal_payload(terminal)).hexdigest(),
+                        )
+                        _sync_directory(parent)
                 except Exception as rollback_error:
                     raise _bundle_error(
                         ErrorCode.RECOVERY_REQUIRED,
