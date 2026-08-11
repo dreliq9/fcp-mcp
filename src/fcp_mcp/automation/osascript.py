@@ -169,6 +169,167 @@ function run(argv) {
 """.strip(),
 )
 
+FCP_BROWSER_SEARCH = OsaProgram(
+    "JavaScript",
+    r"""
+function run(argv) {
+    if (argv.length !== 3) {
+        throw new Error("Expected query, scope, and transcript match arguments");
+    }
+    const query = argv[0];
+    const scope = argv[1];
+    const transcriptMatch = argv[2];
+    const systemEvents = Application("System Events");
+    const process = systemEvents.processes.byName("Final Cut Pro");
+
+    function safely(callback) {
+        try {
+            return callback();
+        } catch (error) {
+            return null;
+        }
+    }
+
+    function attribute(element, name) {
+        return safely(() => element.attributes.byName(name).value());
+    }
+
+    function find(element, predicate, depth) {
+        if (depth > 22) {
+            return null;
+        }
+        if (predicate(element)) {
+            return element;
+        }
+        const children = safely(() => element.uiElements()) || [];
+        for (let index = 0; index < children.length; index++) {
+            const result = find(children[index], predicate, depth + 1);
+            if (result) {
+                return result;
+            }
+        }
+        return null;
+    }
+
+    function press(element) {
+        if (!element) {
+            throw new Error("Required Final Cut Pro accessibility control was not found");
+        }
+        element.actions.byName("AXPress").perform();
+    }
+
+    process.frontmost = true;
+    let window = null;
+    for (let attempt = 0; attempt < 15 && !window; attempt++) {
+        delay(0.2);
+        const windows = safely(() => process.windows()) || [];
+        window = windows.find(
+            candidate => safely(() => candidate.subrole()) === "AXStandardWindow"
+        ) || windows[0] || null;
+    }
+    if (!window) {
+        throw new Error("Final Cut Pro does not have an accessible main window");
+    }
+
+    const searchIdentifier = "editor/browserMedia/search/textField";
+    const menuIdentifier = "editor/browserMedia/search/menuButton";
+    let field = find(
+        window,
+        element => attribute(element, "AXIdentifier") === searchIdentifier,
+        0
+    );
+    let menuButton = find(
+        window,
+        element => attribute(element, "AXIdentifier") === menuIdentifier,
+        0
+    );
+
+    if (!field || !menuButton) {
+        const searchButton = find(
+            window,
+            element => {
+                const role = safely(() => element.role());
+                const description = safely(() => element.description()) || "";
+                const help = safely(() => element.help()) || "";
+                return role === "AXButton" && (
+                    description === "Search" ||
+                    help.includes("Search for clips and projects")
+                );
+            },
+            0
+        );
+        press(searchButton);
+        delay(0.3);
+        field = find(
+            window,
+            element => attribute(element, "AXIdentifier") === searchIdentifier,
+            0
+        );
+        menuButton = find(
+            window,
+            element => attribute(element, "AXIdentifier") === menuIdentifier,
+            0
+        );
+    }
+
+    press(field);
+    delay(0.1);
+    systemEvents.keystroke("a", {using: "command down"});
+    systemEvents.keyCode(51);
+    systemEvents.keystroke(query);
+    delay(0.2);
+
+    press(menuButton);
+    delay(0.3);
+    const menu = find(
+        window,
+        element => safely(() => element.role()) === "AXMenu",
+        0
+    );
+    if (!menu) {
+        throw new Error("Final Cut Pro search category menu did not open");
+    }
+
+    const displayNames = {
+        "all": "All",
+        "visual": "Visual",
+        "all-text": "All Text",
+        "notes": "Notes",
+        "names": "Names",
+        "markers": "Markers"
+    };
+    if (scope === "transcript") {
+        const transcript = menu.menuItems.byName("Transcript");
+        const submenu = transcript.menus()[0];
+        const matchName = transcriptMatch === "is_related_to"
+            ? "Is Related To"
+            : "Includes";
+        press(submenu.menuItems.byName(matchName));
+    } else {
+        const displayName = displayNames[scope];
+        if (!displayName) {
+            throw new Error("Unsupported Final Cut Pro browser search scope");
+        }
+        press(menu.menuItems.byName(displayName));
+    }
+    delay(0.2);
+
+    const observedQuery = safely(() => field.value());
+    if (observedQuery !== query) {
+        throw new Error("Final Cut Pro did not retain the requested browser search query");
+    }
+    return JSON.stringify({
+        query: query,
+        scope: scope,
+        transcriptMatch: scope === "transcript" ? transcriptMatch : null,
+        observedQuery: observedQuery,
+        criteriaApplied: true,
+        resultsObserved: false
+    });
+}
+""".strip(),
+)
+
 FCP_EXPORT_XML = OsaProgram(
     "AppleScript",
     """

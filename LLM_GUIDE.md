@@ -2,7 +2,7 @@
 
 MCP server giving you (Claude) professional-grade Final Cut Pro editing
 via FCPXML + AppleScript + ffprobe. The default `workflow` profile exposes
-34 tools, three prompts, and three workflow resources; `full` exposes 93
+34 tools, three prompts, and three workflow resources; `full` exposes 95
 tools across 13 categories and five prompts.
 Modified FCPXMLs are written alongside their input with a `_modified`
 suffix unless `output_path` is specified.
@@ -43,6 +43,19 @@ edit and inspect is the #1 cause of wasted tool calls.
    call; looping `fcpxml_assign_role` is 30 calls and 30× more context.
 5. **Live tools are last.** Do all FCPXML work off-line, then
    `fcp_import_xml` to load it into a running FCP, then trigger Share.
+
+## Final Cut 12 features
+
+Use `fcpxml_add_search_collection` to persist Transcript or Visual Search
+criteria in FCPXML 1.14. Use `fcp_final_cut_12` for live browser search and
+current editing workflows such as Beat Detection, Generate Subtitles, Auto
+Mask, Match Color, Edit Detection, and caption conversion.
+
+Treat live feature results literally. `command_sent` does not prove the
+timeline changed. `interactive_mode_started` means the returned `next_step`
+must be completed in Final Cut. Browser search verifies the query and criteria
+but cannot enumerate matching rows. `select_all_subtitles` is context-sensitive
+and requires focus in the subtitle list.
 
 ## Resolve clip names by listing first
 

@@ -44,6 +44,7 @@ EXPECTED_LIVE_RESULT_MODELS = {
     "fcp_redo": "FCPRedoResult",
     "fcp_menu_command": "FCPMenuCommandResult",
     "fcp_keyboard_shortcut": "FCPKeyboardShortcutResult",
+    "fcp_final_cut_12": "FCPFinalCut12Result",
     "fcp_share": "FCPShareResult",
     "compressor_encode": "CompressorSubmissionResult",
     "compressor_list_settings": "CompressorSettingsResult",
@@ -316,6 +317,7 @@ def test_compressor_settings_separates_resolved_paths_from_raw_cli_lines(
         (server.fcp_redo, ()),
         (server.fcp_menu_command, ("File > Export XML...",)),
         (server.fcp_keyboard_shortcut, ("cmd+shift+e",)),
+        (server.fcp_final_cut_12, ("detect_edits",)),
         (server.fcp_share, ("Apple Devices 4K",)),
         (server.compressor_encode, ("source.mov",)),
     ],
@@ -422,6 +424,163 @@ def test_osascript_actions_preserve_text_and_remain_unverified(
         "The automation command returned, but Final Cut Pro state was not independently observed."
     ]
     assert len(calls) == 1
+
+
+def test_final_cut_12_browser_search_verifies_typed_criteria(
+    monkeypatch,
+    live_config,
+):
+    raw = json.dumps(
+        {
+            "query": "cloud outage",
+            "scope": "transcript",
+            "transcriptMatch": "is_related_to",
+            "observedQuery": "cloud outage",
+            "criteriaApplied": True,
+            "resultsObserved": False,
+        },
+        separators=(",", ":"),
+    )
+    calls = []
+
+    def fake(program, args=(), **kwargs):
+        calls.append((program, list(args), kwargs))
+        return raw
+
+    monkeypatch.setattr(automation, "run_osascript", fake)
+
+    outcome = server.fcp_final_cut_12(
+        "set_browser_search",
+        "cloud outage",
+        "transcript",
+        "is_related_to",
+    )
+
+    assert str(outcome) == raw
+    assert calls[0][0] is automation.FCP_BROWSER_SEARCH
+    assert calls[0][1] == [
+        "cloud outage",
+        "transcript",
+        "is_related_to",
+    ]
+    assert outcome.structured.request.model_dump() == {
+        "feature_action": "set_browser_search",
+        "query": "cloud outage",
+        "search_scope": "transcript",
+        "transcript_match": "is_related_to",
+    }
+    assert outcome.structured.completion == "criteria_applied"
+    assert outcome.structured.observed_query == "cloud outage"
+    assert outcome.structured.criteria_applied is True
+    assert outcome.structured.results_observed is False
+    assert outcome.structured.requires_user_interaction is False
+
+
+@pytest.mark.parametrize(
+    (
+        "action",
+        "expected_program",
+        "expected_args",
+        "completion",
+        "interactive",
+    ),
+    [
+        (
+            "detect_edits",
+            automation.FCP_KEYBOARD_SHORTCUT,
+            ["shift+e", "e", "shift"],
+            "command_sent",
+            False,
+        ),
+        (
+            "add_auto_mask",
+            automation.FCP_KEYBOARD_SHORTCUT,
+            ["control+cmd+k", "k", "control", "command"],
+            "interactive_mode_started",
+            True,
+        ),
+        (
+            "duplicate_captions_to_subtitles",
+            automation.FCP_MENU_COMMAND,
+            [
+                '["Edit","Closed Captions","Duplicate Captions to Subtitles"]',
+                "Edit > Closed Captions > Duplicate Captions to Subtitles",
+                "Edit",
+                "Closed Captions",
+                "Duplicate Captions to Subtitles",
+            ],
+            "command_sent",
+            False,
+        ),
+        (
+            "send_frame_to_pixelmator_pro",
+            automation.FCP_SHARE,
+            ["Send Frame to Pixelmator Pro"],
+            "interactive_mode_started",
+            True,
+        ),
+    ],
+)
+def test_final_cut_12_actions_map_to_stable_automation(
+    monkeypatch,
+    live_config,
+    action,
+    expected_program,
+    expected_args,
+    completion,
+    interactive,
+):
+    calls = []
+
+    def fake(program, args=(), **kwargs):
+        calls.append((program, list(args), kwargs))
+        return f"sent:{action}"
+
+    monkeypatch.setattr(automation, "run_osascript", fake)
+
+    outcome = server.fcp_final_cut_12(action)
+
+    assert calls[0][0] is expected_program
+    assert calls[0][1] == expected_args
+    assert outcome.structured.request.feature_action == action
+    assert outcome.structured.completion == completion
+    assert outcome.structured.requires_user_interaction is interactive
+    assert bool(outcome.structured.next_step) is interactive
+
+
+@pytest.mark.parametrize("query", ["", "   ", "line\nbreak", "x" * 501])
+def test_final_cut_12_rejects_invalid_browser_queries(query):
+    with pytest.raises(FCPMCPError, match="invalid_arguments"):
+        server.fcp_final_cut_12("set_browser_search", query)
+
+
+def test_browser_search_program_never_interpolates_the_query(
+    monkeypatch,
+    live_config,
+):
+    hostile = 'x"; Application("Terminal").doScript("touch /tmp/pwned")'
+    raw = json.dumps(
+        {
+            "query": hostile,
+            "scope": "visual",
+            "transcriptMatch": None,
+            "observedQuery": hostile,
+            "criteriaApplied": True,
+            "resultsObserved": False,
+        }
+    )
+    calls = []
+
+    def fake(program, args=(), **kwargs):
+        calls.append((program, list(args)))
+        return raw
+
+    monkeypatch.setattr(automation, "run_osascript", fake)
+
+    server.fcp_final_cut_12("set_browser_search", hostile, "visual")
+
+    assert hostile not in calls[0][0].source
+    assert calls[0][1] == [hostile, "visual", "includes"]
 
 
 def test_hostile_menu_value_remains_argv_and_typed_request(
@@ -667,13 +826,34 @@ async def test_registered_mcp_boundary_preserves_text_and_structured_schema(
 
 
 @pytest.mark.asyncio
-async def test_registered_output_schema_titles_match_all_19_models():
+async def test_registered_output_schema_titles_match_all_20_models():
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
 
     assert {
         name: tools[name].output_schema["title"]
         for name in EXPECTED_LIVE_RESULT_MODELS
     } == EXPECTED_LIVE_RESULT_MODELS
+
+
+def test_final_cut_12_result_rejects_fabricated_completion_evidence():
+    request = live_models.FCPFinalCut12Request(
+        feature_action="set_browser_search",
+        query="dialogue",
+        search_scope="transcript",
+        transcript_match="includes",
+    )
+
+    with pytest.raises(ValidationError):
+        live_models.FCPFinalCut12Result(
+            request=request,
+            raw_response="{}",
+            warnings=["No independent result observation was made."],
+            completion="command_sent",
+            requires_user_interaction=False,
+            next_step=None,
+            observed_query=None,
+            criteria_applied=False,
+        )
 
 
 ACTION_MODEL_CASES = [

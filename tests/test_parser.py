@@ -81,6 +81,37 @@ class TestParserBasic:
         assert transform.scale == 1.25
         assert transform.scale_y == 0.75
 
+    def test_parse_fcpxml_114_search_collections(self, parser: FCPXMLParser):
+        document = parser.parse_bytes(
+            b'''<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.14">
+  <event name="Searches">
+    <smart-collection name="Related dialogue" match="all">
+      <match-text enabled="1" rule="isRelatedTo" value="cloud outage" scope="transcript"/>
+      <match-analysis-type enabled="1" rule="isAvailable" value="transcript"/>
+    </smart-collection>
+    <smart-collection name="Beach shots" match="all">
+      <match-text enabled="1" rule="includes" value="beach at sunset" scope="visual"/>
+      <match-analysis-type enabled="1" rule="isAvailable" value="visual"/>
+    </smart-collection>
+  </event>
+</fcpxml>'''
+        )
+
+        assert document.version == "1.14"
+        assert [item.name for item in document.smart_collections] == [
+            "Related dialogue",
+            "Beach shots",
+        ]
+        assert document.smart_collections[0].predicates[0].kind == "match-text"
+        assert document.smart_collections[0].predicates[0].attributes == {
+            "enabled": "1",
+            "rule": "isRelatedTo",
+            "value": "cloud outage",
+            "scope": "transcript",
+        }
+        assert document.smart_collections[1].predicates[1].attributes["value"] == "visual"
+
 
 class TestParserLibrary:
     def test_library_exists(self, sample_doc: FCPXMLDocument):

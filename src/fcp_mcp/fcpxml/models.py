@@ -12,6 +12,8 @@ from typing import Any
 
 from .time_utils import RationalTime
 
+CURRENT_FCPXML_VERSION = "1.14"
+
 
 class ClipType(Enum):
     ASSET_CLIP = "asset-clip"
@@ -97,6 +99,23 @@ class Keyword:
     start: RationalTime = field(default_factory=RationalTime.zero)
     duration: RationalTime = field(default_factory=RationalTime.zero)
     value: str = ""
+
+
+@dataclass
+class SmartCollectionPredicate:
+    """One match predicate inside an FCPXML smart collection."""
+
+    kind: str
+    attributes: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class SmartCollection:
+    """A saved browser search represented by an FCPXML smart collection."""
+
+    name: str
+    match: str = "all"
+    predicates: list[SmartCollectionPredicate] = field(default_factory=list)
 
 
 @dataclass
@@ -257,7 +276,7 @@ class Library:
 @dataclass
 class FCPXMLDocument:
     """Root document representing a parsed FCPXML file."""
-    version: str = "1.11"
+    version: str = CURRENT_FCPXML_VERSION
     resources: dict[str, Any] = field(default_factory=dict)  # id → Format/Asset/Effect
     formats: dict[str, Format] = field(default_factory=dict)
     assets: dict[str, Asset] = field(default_factory=dict)
@@ -267,6 +286,7 @@ class FCPXMLDocument:
     # If the FCPXML contains standalone events/projects (no library wrapper)
     events: list[Event] = field(default_factory=list)
     projects: list[Project] = field(default_factory=list)
+    smart_collections: list[SmartCollection] = field(default_factory=list)
 
     @property
     def all_projects(self) -> list[Project]:

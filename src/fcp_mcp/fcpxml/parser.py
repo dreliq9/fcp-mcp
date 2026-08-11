@@ -1,6 +1,7 @@
 """FCPXML parser — converts FCPXML files into Python data models.
 
-Supports FCPXML versions 1.6–1.11.
+Supports FCPXML versions 1.6–1.14, including Final Cut Pro 12 transcript and
+visual-search smart collections.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ from typing import ClassVar
 
 from ..utils.safe_xml import parse_fcpxml, parse_string
 from .models import (
+    CURRENT_FCPXML_VERSION,
     AppliedEffect,
     Asset,
     Clip,
@@ -25,6 +27,8 @@ from .models import (
     MarkerType,
     Project,
     Sequence,
+    SmartCollection,
+    SmartCollectionPredicate,
     Spine,
     TimecodeFormat,
     TransformParams,
@@ -67,7 +71,7 @@ class FCPXMLParser:
 
     def _parse_root(self, root: ET.Element) -> FCPXMLDocument:
         doc = FCPXMLDocument()
-        doc.version = root.get("version", "1.11")
+        doc.version = root.get("version", CURRENT_FCPXML_VERSION)
 
         # Parse resources
         resources_el = root.find("resources")
@@ -87,7 +91,29 @@ class FCPXMLParser:
         for project_el in root.findall("project"):
             doc.projects.append(self._parse_project(project_el, doc))
 
+        # Collections can live at the document, library, event, or nested
+        # collection-folder level. Keep a document-wide inventory so callers
+        # do not lose FCPXML 1.14 Transcript/Visual search predicates.
+        for collection_el in root.iter("smart-collection"):
+            doc.smart_collections.append(
+                self._parse_smart_collection(collection_el)
+            )
+
         return doc
+
+    def _parse_smart_collection(self, el: ET.Element) -> SmartCollection:
+        """Parse a saved browser search without discarding future predicates."""
+        return SmartCollection(
+            name=el.get("name", ""),
+            match=el.get("match", "all"),
+            predicates=[
+                SmartCollectionPredicate(
+                    kind=child.tag,
+                    attributes=dict(child.attrib),
+                )
+                for child in el
+            ],
+        )
 
     def _parse_resources(self, resources_el: ET.Element, doc: FCPXMLDocument) -> None:
         """Parse all resource elements."""

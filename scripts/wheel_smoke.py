@@ -22,8 +22,8 @@ EXPECTED_VERSION = "0.3.0"
 PROFILE_COUNTS = {
     "inspect": (30, 2, 0),
     "workflow": (34, 3, 3),
-    "edit": (74, 5, 3),
-    "full": (93, 5, 3),
+    "edit": (75, 5, 3),
+    "full": (95, 5, 3),
 }
 SOURCE_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <fcpxml version="1.11"><resources>

@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from urllib.parse import quote as url_quote
 
+from .models import CURRENT_FCPXML_VERSION
 from .time_utils import FORMAT_FRAME_DURATIONS, RationalTime
 from .transaction import FCPXMLTransactionReceipt, commit_fcpxml
 
@@ -16,7 +17,7 @@ from .transaction import FCPXMLTransactionReceipt, commit_fcpxml
 class FCPXMLGenerator:
     """Build FCPXML documents from scratch."""
 
-    def __init__(self, version: str = "1.11"):
+    def __init__(self, version: str = CURRENT_FCPXML_VERSION):
         self.version = version
         self.root = ET.Element("fcpxml")
         self.root.set("version", version)

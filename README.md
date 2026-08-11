@@ -2,7 +2,7 @@
 
 <!-- mcp-name: io.github.dreliq9/fcp-mcp -->
 
-**A local MCP server for Final Cut Pro** — up to 93 tools and five prompts
+**A local MCP server for Final Cut Pro** — up to 95 tools and five prompts
 covering FCPXML editing, opt-in live FCP control, parametric puppets,
 media analysis, transactional edit approval, and runtime diagnostics.
 
@@ -21,8 +21,8 @@ Result: the reviewed candidate is atomically committed with durable evidence
 Where many integrations stop at one layer, fcp-mcp covers the local
 editing stack:
 
-- **FCPXML engine** — parse, edit, QC, generate, cross-NLE export — 49 tools
-- **Live FCP control** — AppleScript-backed library/playback/menu/share — 20 tools
+- **FCPXML engine** — parse, edit, QC, generate, cross-NLE export — 50 tools
+- **Live FCP control** — AppleScript/JXA library, Final Cut 12 workflows, playback, menu, and share — 21 tools
 - **Media analysis** — ffprobe-backed scene/loudness/frame tools — 10 tools
 - **Parametric puppets** — character animation presets in FCPXML — 7 tools
 - **Compressor** — dispatch encodes to Apple Compressor — 2 tools
@@ -51,6 +51,7 @@ Current documentation and evidence:
 - [Production workflow recipes](WORKFLOWS.md)
 - [v0.3 changelog](CHANGELOG.md)
 - [Release-candidate research](docs/research/2026-07-28-v0.3-release-candidate.md)
+- [Final Cut 12.3 gap audit](docs/research/2026-08-11-final-cut-12-gap-audit.md)
 - [Local release review](docs/reviews/v0.3.0-release-review.md)
 
 ## Catalog Profiles
@@ -63,29 +64,29 @@ three prompts, and three workflow resource templates. Select a profile with
 |---|---:|---:|---:|---|
 | `inspect` | 30 | 2 | 0 | Offline inspection and diagnostics |
 | `workflow` (default) | 34 | 3 | 3 | Inspection plus reviewable transactional edits |
-| `edit` | 74 | 5 | 3 | Direct offline mutators plus workflows |
-| `full` | 93 | 5 | 3 | All offline, live FCP, media, and Compressor tools |
+| `edit` | 75 | 5 | 3 | Direct offline mutators plus workflows |
+| `full` | 95 | 5 | 3 | All offline, live FCP, media, and Compressor tools |
 
 Live FCP control remains independently disabled unless
 `FCP_MCP_ENABLE_LIVE_CONTROL=1`; choosing `full` does not grant that
 authority.
 
-## Available Tools (93 in `full`)
+## Available Tools (95 in `full`)
 
-The full catalog contains 92 domain tools across 13 functional categories,
+The full catalog contains 94 domain tools across 13 functional categories,
 plus `fcp_doctor`.
 
 | Category | Count | What it does |
 |---|---|---|
 | **inspect** | 8 | Parse, list clips/markers/effects/roles, analyze pacing, timeline stats, A/B diff |
 | **qc** | 10 | Flash frames, gaps, duplicates, media links, frame rates, audio levels, safe zones, duration, structural validation, aggregate QC report |
-| **edit** | 12 | Markers, keywords, titles, audio, transitions, trim, split, delete, reorder, speed, role assign, reformat |
+| **edit** | 13 | Markers, keywords, FCPXML 1.14 Transcript/Visual smart collections, titles, audio, transitions, trim, split, delete, reorder, speed, role assign, reformat |
 | **heal** | 3 | Fix flash frames, fill gaps, remove silence |
 | **batch** | 4 | Markers, rename, role assign, apply transition across many clips |
 | **generate** | 4 | New project/timeline, auto rough cut, montage from a shotlist |
 | **templates** | 3 | List and save FCPXML templates; `fcpxml_apply_template` remains `unsupported_contract` in v0.3.0 |
 | **io** | 5 | Import SRT/EDL, export EDL + DaVinci Resolve XML + Premiere FCP7 XMEML |
-| **live** | 20 | AppleScript-backed: library/events/projects, playback, menu/keyboard, share, discover effects & motion templates |
+| **live** | 21 | AppleScript/JXA-backed: library/events/projects, Final Cut 12 search and feature workflows, playback, menu/keyboard, share, discover effects & motion templates |
 | **puppet** | 7 | Parametric character rigs in FCPXML with motion presets (walk, talk, wave, multi-scene composition) |
 | **media** | 10 | ffprobe + ffmpeg: info, streams, EBU R128 loudness, silence, beat detection, scene detect, thumbnails, audio-to-MIDI |
 | **compressor** | 2 | List Compressor settings, dispatch encode jobs |
@@ -438,7 +439,7 @@ Claude Code / Claude Desktop / any MCP client
         └── Compressor (CLI dispatch)       ← automated encodes
               │
               ▼
-        .fcpxml (v1.11+) / EDL / DaVinci XML / FCP7 XMEML / ProRes / H.264
+        .fcpxml (1.6–1.14) / EDL / DaVinci XML / FCP7 XMEML / ProRes / H.264
 ```
 
 ---

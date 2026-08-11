@@ -26,6 +26,7 @@ SUMMARY = {
             "duration": "390390/30000s",
         }
     ],
+    "smart_collections": [],
 }
 
 CLIPS = [
@@ -317,6 +318,7 @@ def _assert_summary(model: BaseModel) -> None:
     assert model.version == "1.11"
     assert model.formats == 1
     assert model.projects[0].clip_count == 6
+    assert model.smart_collections == []
 
 
 def _assert_clips(model: BaseModel) -> None:
