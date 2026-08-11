@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from itertools import pairwise
 from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import unquote as url_unquote
 
 from typing_extensions import Self
@@ -34,7 +34,7 @@ from .fcpxml.analysis import (
 )
 from .fcpxml.diff import diff_files
 from .fcpxml.generator import FCPXMLGenerator
-from .fcpxml.models import FCPXMLDocument
+from .fcpxml.models import CURRENT_FCPXML_VERSION, FCPXMLDocument
 from .fcpxml.parser import FCPXMLParser
 from .fcpxml.puppet import (
     Keyframe,
@@ -116,6 +116,7 @@ from .result_models.fcpxml import (
     SafeZoneCheckResult,
     SafeZoneObservationRecord,
     ShareDestinationListResult,
+    SmartCollectionMutationResult,
     SubtitleImportResult,
     TemplateListResult,
     TemplateSaveResult,
@@ -141,6 +142,8 @@ from .result_models.live import (
     FCPAppStateResult,
     FCPCollectionResult,
     FCPExportXMLResult,
+    FCPFinalCut12Request,
+    FCPFinalCut12Result,
     FCPImportXMLRequest,
     FCPImportXMLResult,
     FCPKeyboardShortcutRequest,
@@ -162,6 +165,8 @@ from .result_models.live import (
     FCPTimelineInfoResult,
     FCPTimeObservation,
     FCPUndoResult,
+    FinalCut12FeatureAction,
+    FinalCutBrowserSearchScope,
     LibraryRecord,
     ProjectRecord,
     VerificationStatus,
@@ -1462,6 +1467,20 @@ def fcpxml_parse(path: str) -> ToolOutcome[FCPXMLSummaryResult]:
             }
             for p in projects
         ],
+        "smart_collections": [
+            {
+                "name": collection.name,
+                "match": collection.match,
+                "predicates": [
+                    {
+                        "kind": predicate.kind,
+                        "attributes": predicate.attributes,
+                    }
+                    for predicate in collection.predicates
+                ],
+            }
+            for collection in doc.smart_collections
+        ],
     }
     return ToolOutcome(
         text=json.dumps(summary, indent=2),
@@ -2154,6 +2173,192 @@ def fcpxml_add_keyword(
                 start=keyword.get("start", ""),
                 duration=keyword.get("duration"),
             ),
+        ),
+    )
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=SmartCollectionMutationResult,
+)
+def fcpxml_add_search_collection(
+    path: str,
+    name: str,
+    search_type: Literal["transcript", "visual"],
+    query: str = "",
+    text_rule: Literal["includes", "isRelatedTo"] = "includes",
+    analysis_rule: Literal["isAvailable", "isMissing"] = "isAvailable",
+    event_name: str = "",
+    output_path: str = "",
+) -> ToolOutcome[SmartCollectionMutationResult]:
+    """Add an FCPXML 1.14 Transcript or Visual Search smart collection.
+
+    The document declaration is upgraded to FCPXML 1.14. The saved search can
+    match text, analysis availability, or both. If ``event_name`` is omitted,
+    the first event is used; documents without events receive a root-level
+    smart collection.
+
+    Args:
+        path: Source .fcpxml file
+        name: Smart collection name
+        search_type: "transcript" or "visual"
+        query: Natural-language or exact search text (optional)
+        text_rule: "includes" or "isRelatedTo"
+        analysis_rule: Require matching analysis to be available or missing
+        event_name: Exact event name, or the first event when omitted
+        output_path: Output .fcpxml path
+    """
+    normalized_name = name.strip()
+    if (
+        not normalized_name
+        or len(normalized_name) > 256
+        or "\x00" in normalized_name
+    ):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "Smart collection name must contain 1 to 256 non-NUL characters",
+        )
+    if len(query) > 1000 or "\x00" in query:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            "Smart collection query must contain at most 1000 non-NUL characters",
+        )
+    if search_type not in {"transcript", "visual"}:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Unsupported smart collection search type: {search_type}",
+        )
+    if text_rule not in {"includes", "isRelatedTo"}:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Unsupported smart collection text rule: {text_rule}",
+        )
+    if analysis_rule not in {"isAvailable", "isMissing"}:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Unsupported analysis rule: {analysis_rule}",
+        )
+
+    mod = FCPXMLModifier(_resolve_input(path, suffixes={".fcpxml"}))
+    source_version = mod.root.get("version", "")
+    mod.root.set("version", CURRENT_FCPXML_VERSION)
+
+    events = list(mod.root.iter("event"))
+    if event_name:
+        container = next(
+            (event for event in events if event.get("name") == event_name),
+            None,
+        )
+        if container is None:
+            raise FCPMCPError(
+                ErrorCode.TARGET_NOT_FOUND,
+                f"Event '{event_name}' not found",
+            )
+    else:
+        container = events[0] if events else mod.root
+
+    if any(
+        candidate.get("name") == normalized_name
+        for candidate in container.findall("smart-collection")
+    ):
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Smart collection '{normalized_name}' already exists in the target container",
+        )
+
+    collection = ET.SubElement(
+        container,
+        "smart-collection",
+        {"name": normalized_name, "match": "all"},
+    )
+    if query:
+        ET.SubElement(
+            collection,
+            "match-text",
+            {
+                "enabled": "1",
+                "rule": text_rule,
+                "value": query,
+                "scope": search_type,
+            },
+        )
+    ET.SubElement(
+        collection,
+        "match-analysis-type",
+        {
+            "enabled": "1",
+            "rule": analysis_rule,
+            "value": search_type,
+        },
+    )
+    container_label = (
+        f"event:{container.get('name', '')}"
+        if container.tag == "event"
+        else "document"
+    )
+
+    def validate_smart_collection(candidate: Path) -> None:
+        root = ET.parse(candidate).getroot()
+        if root.get("version") != CURRENT_FCPXML_VERSION:
+            _raise_validation_failure(
+                "Smart collection candidate is not declared as FCPXML 1.14"
+            )
+        matches = [
+            item
+            for item in root.iter("smart-collection")
+            if item.get("name") == normalized_name
+        ]
+        if len(matches) != 1:
+            _raise_validation_failure(
+                "Smart collection candidate does not contain exactly one requested collection"
+            )
+        committed = matches[0]
+        text_match = committed.find("match-text")
+        if query and (
+            text_match is None
+            or text_match.attrib
+            != {
+                "enabled": "1",
+                "rule": text_rule,
+                "value": query,
+                "scope": search_type,
+            }
+        ):
+            _raise_validation_failure(
+                "Smart collection candidate does not preserve the requested text predicate"
+            )
+        analysis_match = committed.find("match-analysis-type")
+        if analysis_match is None or analysis_match.attrib != {
+            "enabled": "1",
+            "rule": analysis_rule,
+            "value": search_type,
+        }:
+            _raise_validation_failure(
+                "Smart collection candidate does not preserve the requested analysis predicate"
+            )
+
+    receipt = _save_modifier_receipt(
+        mod,
+        output_path,
+        validate_candidate=validate_smart_collection,
+    )
+    return ToolOutcome(
+        text=(
+            f"FCPXML 1.14 {search_type} smart collection "
+            f"'{normalized_name}' added. Saved to: {receipt.destination}"
+        ),
+        structured=SmartCollectionMutationResult(
+            source_version=source_version,
+            target_version=CURRENT_FCPXML_VERSION,
+            name=normalized_name,
+            container=container_label,
+            search_type=search_type,
+            query=query,
+            text_rule=text_rule,
+            analysis_rule=analysis_rule,
+            destination=_artifact_reference(receipt),
+            receipt=_receipt_result(receipt),
         ),
     )
 
@@ -4984,7 +5189,7 @@ def fcp_get_app_state() -> ToolOutcome[FCPAppStateResult]:
 
 
 # ============================================================================
-# Category 6: FCP Live Control (10 tools)
+# Category 6: FCP Live Control (11 tools)
 # ============================================================================
 
 @TOOLS.tool(
@@ -5333,6 +5538,235 @@ def fcp_keyboard_shortcut(
             verification_status=VerificationStatus.UNVERIFIED,
             observed_outcome=None,
             warnings=[_UNVERIFIED_FCP_WARNING],
+        ),
+    )
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=FCPFinalCut12Result,
+)
+def fcp_final_cut_12(
+    action: FinalCut12FeatureAction,
+    query: str = "",
+    search_scope: FinalCutBrowserSearchScope = "all",
+    transcript_match: Literal["includes", "is_related_to"] = "includes",
+) -> ToolOutcome[FCPFinalCut12Result]:
+    """Run a discoverable Final Cut Pro 12 feature workflow.
+
+    This gateway covers Final Cut 12 browser search and the new native editing
+    commands introduced through 12.3. Actions that open an interactive Final
+    Cut workflow return the exact next step; they do not claim that the editor
+    completed the workflow.
+
+    Args:
+        action: Final Cut 12 feature workflow to start or execute.
+        query: Search text, required only for ``set_browser_search``.
+        search_scope: Browser search category used by ``set_browser_search``.
+        transcript_match: Transcript comparison used for transcript searches.
+    """
+    try:
+        if action == "set_browser_search":
+            request = FCPFinalCut12Request(
+                feature_action=action,
+                query=query,
+                search_scope=search_scope,
+                transcript_match=(
+                    transcript_match if search_scope == "transcript" else None
+                ),
+            )
+        else:
+            if query:
+                raise ValueError(
+                    "query is only valid for set_browser_search"
+                )
+            request = FCPFinalCut12Request(feature_action=action)
+    except ValueError as error:
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Invalid Final Cut 12 feature request: {error}",
+        ) from error
+
+    if action == "set_browser_search":
+        raw = automation.run_osascript(
+            automation.FCP_BROWSER_SEARCH,
+            [query, search_scope, transcript_match],
+            timeout=30,
+            config=CONFIG,
+        )
+        payload = _live_json(raw, "Final Cut browser search")
+        expected_fields = {
+            "query",
+            "scope",
+            "transcriptMatch",
+            "observedQuery",
+            "criteriaApplied",
+            "resultsObserved",
+        }
+        if not isinstance(payload, dict) or set(payload) != expected_fields:
+            raise FCPMCPError(
+                ErrorCode.COMMAND_FAILED,
+                "Final Cut browser search returned an invalid response shape",
+            )
+        expected_match = (
+            transcript_match if search_scope == "transcript" else None
+        )
+        if (
+            payload["query"] != query
+            or payload["scope"] != search_scope
+            or payload["transcriptMatch"] != expected_match
+            or payload["observedQuery"] != query
+            or payload["criteriaApplied"] is not True
+            or payload["resultsObserved"] is not False
+        ):
+            raise FCPMCPError(
+                ErrorCode.COMMAND_FAILED,
+                "Final Cut browser search did not verify the requested criteria",
+            )
+        return _TextToolOutcome(
+            text=raw,
+            structured=FCPFinalCut12Result(
+                request=request,
+                raw_response=raw,
+                verification_status=VerificationStatus.UNVERIFIED,
+                observed_outcome=None,
+                warnings=[
+                    (
+                        "The query and category were observed in Final Cut, but "
+                        "matching browser rows are not exposed by the current "
+                        "accessibility interface."
+                    )
+                ],
+                completion="criteria_applied",
+                requires_user_interaction=False,
+                next_step=None,
+                observed_query=payload["observedQuery"],
+                criteria_applied=True,
+                results_observed=False,
+            ),
+        )
+
+    shortcuts: dict[str, str] = {
+        "open_image_playground": "shift+option+p",
+        "generate_subtitles": "shift+cmd+s",
+        "generate_closed_captions": "shift+cmd+c",
+        "toggle_beat_detection": "option+b",
+        "toggle_beat_grid": "0",
+        "detect_edits": "shift+e",
+        "add_auto_mask": "control+cmd+k",
+        "match_color": "option+cmd+m",
+        "toggle_two_up_display": "option+u",
+        "move_primary_left": "option+left",
+        "move_primary_right": "option+right",
+        "select_connected_clips": "control+cmd+a",
+        "select_all_subtitles": "cmd+a",
+    }
+    menu_paths = {
+        "add_adjustment_clip": "Edit > Add Adjustment Clip",
+        "add_magnetic_mask": "Modify > Add Magnetic Mask",
+        "reveal_source_in_browser": "File > Reveal Source in Browser",
+        "open_magnetic_timeline_tutorial": (
+            "Help > Magnetic Timeline Tutorial"
+        ),
+        "download_demo_project": "Final Cut Pro > Download Demo Project…",
+        "duplicate_captions_to_subtitles": (
+            "Edit > Closed Captions > Duplicate Captions to Subtitles"
+        ),
+        "open_transcode_media": "File > Transcode Media…",
+        "open_content_library": "Final Cut Pro > Download Content Library",
+    }
+    interactive_steps = {
+        "add_magnetic_mask": (
+            "In the viewer, select the object, then refine and analyze the mask."
+        ),
+        "open_image_playground": (
+            "Create or choose the image in Image Playground, then insert it."
+        ),
+        "open_magnetic_timeline_tutorial": (
+            "Continue through Apple’s interactive Magnetic Timeline tutorial."
+        ),
+        "download_demo_project": (
+            "Review the download prompt and confirm the demo project."
+        ),
+        "generate_subtitles": (
+            "Review the subtitle settings in Final Cut, then click Generate."
+        ),
+        "generate_closed_captions": (
+            "Review the caption settings in Final Cut, then click Generate."
+        ),
+        "add_auto_mask": (
+            "In the viewer, select the object or region, then click Add."
+        ),
+        "match_color": (
+            "Choose the reference frame, then click Apply Match in the viewer."
+        ),
+        "send_frame_to_pixelmator_pro": (
+            "Complete the share dialog; Pixelmator Pro must be installed."
+        ),
+        "open_transcode_media": (
+            "Choose optimized or proxy media settings, then click OK."
+        ),
+        "open_content_library": (
+            "Review the download prompt and confirm the Creator Themes content."
+        ),
+    }
+
+    if action in shortcuts:
+        shortcut = shortcuts[action]
+        key, modifiers = automation.parse_shortcut(shortcut)
+        raw = automation.run_osascript(
+            automation.FCP_KEYBOARD_SHORTCUT,
+            [shortcut, key, *modifiers],
+            timeout=30,
+            config=CONFIG,
+        )
+    elif action in menu_paths:
+        menu_path = menu_paths[action]
+        parts = [part.strip() for part in menu_path.split(">")]
+        raw = automation.run_osascript(
+            automation.FCP_MENU_COMMAND,
+            [json.dumps(parts, separators=(",", ":")), menu_path, *parts],
+            timeout=30,
+            config=CONFIG,
+        )
+    elif action == "send_frame_to_pixelmator_pro":
+        raw = automation.run_osascript(
+            automation.FCP_SHARE,
+            ["Send Frame to Pixelmator Pro"],
+            timeout=30,
+            config=CONFIG,
+        )
+    else:  # pragma: no cover - Literal input and validated model are exhaustive
+        raise FCPMCPError(
+            ErrorCode.INVALID_ARGUMENTS,
+            f"Unsupported Final Cut 12 feature action: {action}",
+        )
+
+    next_step = interactive_steps.get(action)
+    interactive = next_step is not None
+    warnings = [_UNVERIFIED_FCP_WARNING]
+    if action == "select_all_subtitles":
+        warnings.append(
+            "Command-A selects subtitles only when the subtitle list has focus; "
+            "otherwise Final Cut may select a different active collection."
+        )
+    return _TextToolOutcome(
+        text=raw,
+        structured=FCPFinalCut12Result(
+            request=request,
+            raw_response=raw,
+            verification_status=VerificationStatus.UNVERIFIED,
+            observed_outcome=None,
+            warnings=warnings,
+            completion=(
+                "interactive_mode_started" if interactive else "command_sent"
+            ),
+            requires_user_interaction=interactive,
+            next_step=next_step,
+            observed_query=None,
+            criteria_applied=False,
+            results_observed=False,
         ),
     )
 

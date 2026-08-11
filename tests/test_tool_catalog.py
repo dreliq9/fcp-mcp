@@ -26,6 +26,7 @@ EXPECTED_TOOLS = {
     "fcpxml_add_marker",
     "fcpxml_batch_add_markers",
     "fcpxml_add_keyword",
+    "fcpxml_add_search_collection",
     "fcpxml_trim_clip",
     "fcpxml_split_clip",
     "fcpxml_delete_clips",
@@ -76,6 +77,7 @@ EXPECTED_TOOLS = {
     "fcp_redo",
     "fcp_menu_command",
     "fcp_keyboard_shortcut",
+    "fcp_final_cut_12",
     "fcp_share",
     "compressor_encode",
     "compressor_list_settings",
@@ -107,10 +109,10 @@ EXPECTED_TOOLS = {
 }
 
 
-def test_full_catalog_is_exactly_93_annotated_tools():
+def test_full_catalog_is_exactly_95_annotated_tools():
     tools = asyncio.run(mcp.list_tools())
     assert {tool.name for tool in tools} == EXPECTED_TOOLS
-    assert len(tools) == 93
+    assert len(tools) == 95
     assert all(tool.annotations is not None for tool in tools)
 
 

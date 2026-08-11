@@ -17,6 +17,7 @@ from fcp_mcp.fcpxml.generator import FCPXMLGenerator
 from fcp_mcp.security.paths import PathPolicy
 
 OFFLINE_WRITE_CASES = (
+    ("fcpxml_add_search_collection", "SmartCollectionMutationResult"),
     ("fcpxml_create_project", "FCPXMLGenerationResult"),
     ("fcpxml_create_timeline", "FCPXMLGenerationResult"),
     ("fcpxml_auto_rough_cut", "FCPXMLGenerationResult"),
@@ -50,6 +51,7 @@ RESULT_MODEL_NAMES = {
     "UnsupportedToolResult",
     "TemplateSaveResult",
     "ExportResult",
+    "SmartCollectionMutationResult",
 }
 
 
@@ -182,6 +184,71 @@ async def test_exact_offline_write_group_advertises_named_nonlegacy_schemas(
 
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
     assert set(tools[tool_name].output_schema["properties"]) != {"result"}
+
+
+@pytest.mark.asyncio
+async def test_search_collection_writes_fcpxml_114_predicates(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "search-source.fcpxml"
+    source.write_text(
+        '''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.11"><event name="Searches"/></fcpxml>
+''',
+        encoding="utf-8",
+    )
+    destination = tmp_path / "search-result.fcpxml"
+
+    result = await server.mcp.call_tool(
+        "fcpxml_add_search_collection",
+        {
+            "path": str(source),
+            "name": "Related dialogue",
+            "search_type": "transcript",
+            "query": "cloud outage",
+            "text_rule": "isRelatedTo",
+            "analysis_rule": "isAvailable",
+            "event_name": "Searches",
+            "output_path": str(destination),
+        },
+    )
+
+    assert result.is_error is False
+    assert result.structured_content["source_version"] == "1.11"
+    assert result.structured_content["target_version"] == "1.14"
+    assert result.structured_content["container"] == "event:Searches"
+    _assert_fcpxml_evidence(
+        result.structured_content,
+        destination,
+        source=source,
+    )
+    root = ET.parse(destination).getroot()
+    collection = root.find("./event/smart-collection")
+    assert collection is not None
+    assert collection.attrib == {"name": "Related dialogue", "match": "all"}
+    assert collection.find("match-text").attrib == {
+        "enabled": "1",
+        "rule": "isRelatedTo",
+        "value": "cloud outage",
+        "scope": "transcript",
+    }
+    assert collection.find("match-analysis-type").attrib == {
+        "enabled": "1",
+        "rule": "isAvailable",
+        "value": "transcript",
+    }
+
+    dtd_path = Path(
+        "/Applications/Final Cut Pro.app/Contents/Frameworks/"
+        "Interchange.framework/Versions/A/Resources/FCPXMLv1_14.dtd"
+    )
+    if dtd_path.exists():
+        from lxml import etree
+
+        dtd = etree.DTD(str(dtd_path))
+        parsed = etree.parse(str(destination))
+        assert dtd.validate(parsed), str(dtd.error_log)
 
 
 @pytest.mark.asyncio

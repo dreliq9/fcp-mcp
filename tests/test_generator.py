@@ -141,7 +141,7 @@ class TestOutput:
         assert output.exists()
         content = output.read_text()
         assert "fcpxml" in content
-        assert 'version="1.11"' in content
+        assert 'version="1.14"' in content
 
     def test_to_string(self, gen):
         gen.create_project(name="Test")

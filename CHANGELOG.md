@@ -3,6 +3,23 @@
 All notable changes to fcp-mcp are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/).
 
+## Unreleased — Final Cut Pro 12.3 compatibility
+
+### Added
+
+- FCPXML 1.14 parsing and generation, including lossless inventories of the
+  new Transcript and Visual Search smart-collection predicates.
+- `fcpxml_add_search_collection` for validated FCPXML 1.14 Transcript or
+  Visual Search saved searches.
+- `fcp_final_cut_12`, a typed live gateway for browser search and the native
+  Final Cut 12 editing commands introduced through 12.3.
+
+### Changed
+
+- The `edit` profile now contains 75 tools and `full` contains 95 tools.
+- New AI-assisted live workflows distinguish a sent command from an
+  interactive workflow and report the remaining editor step explicitly.
+
 ## v0.3.0 — 2026-07-28 — Transactional AI piloting
 
 ### Added

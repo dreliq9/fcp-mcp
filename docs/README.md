@@ -43,6 +43,7 @@ behavior.
 - [Trust-boundary research](research/2026-07-26-phase-0-trust-boundary.md)
 - [Transactional workflow research](research/2026-07-26-phase-1-transactional-workflows.md)
 - [Release-candidate research](research/2026-07-28-v0.3-release-candidate.md)
+- [Final Cut 12.3 compatibility and MCP gap audit](research/2026-08-11-final-cut-12-gap-audit.md)
 
 Implementation plans and specifications live in
 [`docs/superpowers/`](superpowers/). They preserve the reasoning and task

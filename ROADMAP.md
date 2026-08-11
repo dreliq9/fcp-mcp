@@ -1,7 +1,8 @@
 # fcp-mcp Roadmap
 
-Status as of 2026-07-28: **v0.3.0 provides up to 93 tools across 13
-functional categories, five prompts, and three workflow resources.** The
+Status as of 2026-08-11: **v0.3.0 plus the unreleased Final Cut 12.3
+compatibility work provides up to 95 tools across 13 functional categories,
+five prompts, and three workflow resources.** The
 default `workflow` profile is the transactional AI-piloting surface. Planned
 work below is grouped by priority.
 

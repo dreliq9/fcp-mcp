@@ -19,6 +19,21 @@ class ProjectSummaryRecord(BaseModel):
     duration: str
 
 
+class SmartCollectionPredicateRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    kind: str
+    attributes: dict[str, str]
+
+
+class SmartCollectionRecord(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    match: Literal["any", "all"]
+    predicates: list[SmartCollectionPredicateRecord]
+
+
 class FCPXMLSummaryResult(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -28,6 +43,7 @@ class FCPXMLSummaryResult(BaseModel):
     assets: int
     effects: int
     projects: list[ProjectSummaryRecord]
+    smart_collections: list[SmartCollectionRecord]
 
 
 class ClipRecord(BaseModel):
@@ -374,6 +390,22 @@ class FCPXMLMutationResult(BaseModel):
     target_width: int
     target_height: int
     target_format_name: str
+    destination: ArtifactReference
+    receipt: TransactionReceiptResult
+
+
+class SmartCollectionMutationResult(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid", strict=True)
+
+    schema_version: Literal["1"] = "1"
+    source_version: str
+    target_version: Literal["1.14"]
+    name: str
+    container: str
+    search_type: Literal["transcript", "visual"]
+    query: str
+    text_rule: Literal["includes", "isRelatedTo"]
+    analysis_rule: Literal["isAvailable", "isMissing"]
     destination: ArtifactReference
     receipt: TransactionReceiptResult
 

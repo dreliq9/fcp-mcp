@@ -323,6 +323,72 @@ class FCPShareRequest(StrictFrozenModel):
     destination: str
 
 
+FinalCut12FeatureAction = Literal[
+    "set_browser_search",
+    "add_adjustment_clip",
+    "add_magnetic_mask",
+    "open_image_playground",
+    "reveal_source_in_browser",
+    "open_magnetic_timeline_tutorial",
+    "download_demo_project",
+    "generate_subtitles",
+    "generate_closed_captions",
+    "toggle_beat_detection",
+    "toggle_beat_grid",
+    "detect_edits",
+    "add_auto_mask",
+    "match_color",
+    "toggle_two_up_display",
+    "send_frame_to_pixelmator_pro",
+    "move_primary_left",
+    "move_primary_right",
+    "select_connected_clips",
+    "duplicate_captions_to_subtitles",
+    "select_all_subtitles",
+    "open_transcode_media",
+    "open_content_library",
+]
+FinalCutBrowserSearchScope = Literal[
+    "all",
+    "transcript",
+    "visual",
+    "all-text",
+    "notes",
+    "names",
+    "markers",
+]
+
+
+class FCPFinalCut12Request(StrictFrozenModel):
+    feature_action: FinalCut12FeatureAction
+    query: str | None = None
+    search_scope: FinalCutBrowserSearchScope | None = None
+    transcript_match: Literal["includes", "is_related_to"] | None = None
+
+    @model_validator(mode="after")
+    def validate_browser_search(self) -> Self:
+        if self.feature_action == "set_browser_search":
+            if self.query is None or not self.query.strip():
+                raise ValueError("browser search query must not be empty")
+            if len(self.query) > 500 or any(ord(char) < 32 for char in self.query):
+                raise ValueError("browser search query is not safe to type")
+            if self.search_scope is None:
+                raise ValueError("browser search scope is required")
+            if self.search_scope == "transcript":
+                if self.transcript_match is None:
+                    raise ValueError("transcript search match mode is required")
+            elif self.transcript_match is not None:
+                raise ValueError(
+                    "transcript match mode is only valid for transcript search"
+                )
+        elif any(
+            value is not None
+            for value in (self.query, self.search_scope, self.transcript_match)
+        ):
+            raise ValueError("search fields are only valid for browser search")
+        return self
+
+
 class LiveActionResult(StrictFrozenModel):
     schema_version: Literal["1"] = "1"
     action: str
@@ -388,6 +454,41 @@ class FCPKeyboardShortcutResult(LiveActionResult):
 class FCPShareResult(LiveActionResult):
     action: Literal["fcp_share"] = "fcp_share"
     request: FCPShareRequest
+
+
+class FCPFinalCut12Result(LiveActionResult):
+    action: Literal["fcp_final_cut_12"] = "fcp_final_cut_12"
+    request: FCPFinalCut12Request
+    completion: Literal[
+        "command_sent",
+        "interactive_mode_started",
+        "criteria_applied",
+    ]
+    requires_user_interaction: bool
+    next_step: str | None
+    observed_query: str | None = None
+    criteria_applied: bool = False
+    results_observed: Literal[False] = False
+
+    @model_validator(mode="after")
+    def validate_feature_evidence(self) -> Self:
+        is_search = self.request.feature_action == "set_browser_search"
+        if is_search:
+            if (
+                self.completion != "criteria_applied"
+                or self.observed_query != self.request.query
+                or not self.criteria_applied
+                or self.requires_user_interaction
+                or self.next_step is not None
+            ):
+                raise ValueError("browser search evidence is inconsistent")
+        elif self.observed_query is not None or self.criteria_applied:
+            raise ValueError("search evidence is only valid for browser search")
+        if self.requires_user_interaction and not self.next_step:
+            raise ValueError("interactive feature actions require a next step")
+        if not self.requires_user_interaction and self.next_step is not None:
+            raise ValueError("noninteractive feature actions cannot have a next step")
+        return self
 
 
 class CompressorSubmissionRequest(StrictFrozenModel):
@@ -460,6 +561,8 @@ __all__ = [
     "FCPAppStateResult",
     "FCPCollectionResult",
     "FCPExportXMLResult",
+    "FCPFinalCut12Request",
+    "FCPFinalCut12Result",
     "FCPImportXMLRequest",
     "FCPImportXMLResult",
     "FCPKeyboardShortcutRequest",
@@ -481,6 +584,8 @@ __all__ = [
     "FCPTimeObservation",
     "FCPTimelineInfoResult",
     "FCPUndoResult",
+    "FinalCut12FeatureAction",
+    "FinalCutBrowserSearchScope",
     "LibraryRecord",
     "ProjectRecord",
     "VerificationStatus",
