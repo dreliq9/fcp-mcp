@@ -1,13 +1,9 @@
 {
-  "schema_version": "3",
+  "schema_version": "4",
   "evidence_identity": {
-    "prior_workflow_source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
-    "fixed_head_source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
-    "asset_duration_contract_commits": [
-      "06601df54451ac595564b02574620196d7f9dfbe",
-      "a15fc4683c2b2bf89f140321f74a89b3bcde93cc"
-    ],
-    "evidence_correction_base_commit": "d6157d42c4984decd8b6f23ded937257bdc12d7c",
+    "source_commit": "9bcdaad157c1000b51c7c6b08df5ed012bc33e25",
+    "source_branch": "codex/v0.3-product-polish",
+    "source_snapshot": "clean git archive of source_commit",
     "package_version": "0.3.0",
     "publication_status": "not published, tagged, pushed, or submitted by this evidence task"
   },
@@ -15,200 +11,229 @@
     "macos_version": "26.5.2",
     "macos_build": "25F84",
     "final_cut_pro_version": "12.2",
+    "final_cut_pro_build": "447037",
     "final_cut_pro_bundle_id": "com.apple.FinalCut",
     "python_version": "3.12.13"
   },
-  "installed_executions": {
-    "prior_workflow_smoke": {
-      "purpose": "earlier installed-wheel workflow trajectory",
-      "source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
-      "python_executable": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/python",
-      "python_executable_resolved": "/Users/adamsteen/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none/bin/python3.12",
-      "python_executable_sha256": "ba159225dd53b48213f9c446f89b037de6258d136be6f5db91c98e1ed5a8ab0c",
-      "console_script": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/bin/fcp-mcp",
-      "console_script_sha256": "bc3d585ab237f0a216aa36c0df1514f27d217b0c77333fb80e9d16c619acb152",
-      "package_import": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/lib/python3.12/site-packages/fcp_mcp/__init__.py",
-      "package_import_sha256": "15e512011862f10109871d4f70eca89c6a737c98ffd054fc287993dea80a23e6",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
-      "installed_wheel_path": "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-      "installed_wheel_sha256": "527b7cc46789125168a84999569c81e866804559e7dfa2a07a4c924d2612c7fb",
-      "direct_url_record": "/private/tmp/fcp-mcp-v030-evidence-r1/venv/lib/python3.12/site-packages/fcp_mcp-0.3.0.dist-info/direct_url.json",
-      "direct_url_record_sha256": "c30d2565a5a4fac56f8db9a50ab353be8d668f7a8ef9c12770ec6e369eceab3b"
+  "installed_execution": {
+    "source_commit": "9bcdaad157c1000b51c7c6b08df5ed012bc33e25",
+    "purpose": "exact-head installed-wheel public interface, workflow, and live-import generation evidence",
+    "python_executable": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/run-venv/bin/python",
+    "python_executable_resolved": "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
+    "python_executable_sha256": "31b9c9a8d50289f3a13f014b3efd8ea3534fc3eea7ca7d9809e166139910b805",
+    "console_script": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/run-venv/bin/fcp-mcp",
+    "console_script_sha256": "02d143100fd3f9c1bab73fafabe85e77dbcc2a8b03951f3bee1519fd965a7cbc",
+    "package_import": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/run-venv/lib/python3.12/site-packages/fcp_mcp/__init__.py",
+    "package_import_sha256": "15e512011862f10109871d4f70eca89c6a737c98ffd054fc287993dea80a23e6",
+    "cwd": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/source",
+    "installed_wheel_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+    "installed_wheel_sha256": "6cb8c5f58219dca65ddf4407d59b6358af5527bdd1dbb6364816a1fc5ed57d74",
+    "direct_url_record": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/run-venv/lib/python3.12/site-packages/fcp_mcp-0.3.0.dist-info/direct_url.json",
+    "direct_url_record_sha256": "f988d7a2d6989c75417535e7e9bff82aebcc971ed26dd0366cb90bd4c55880f7",
+    "direct_url": {
+      "archive_info": {
+        "hash": "sha256=6cb8c5f58219dca65ddf4407d59b6358af5527bdd1dbb6364816a1fc5ed57d74",
+        "hashes": {
+          "sha256": "6cb8c5f58219dca65ddf4407d59b6358af5527bdd1dbb6364816a1fc5ed57d74"
+        }
+      },
+      "url": "file:///private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/dist/fcp_mcp-0.3.0-py3-none-any.whl"
     },
-    "fixed_head_generation": {
-      "purpose": "installed MCP stdio generation of the imported FCPXML",
-      "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
-      "python_executable": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/python",
-      "python_executable_resolved": "/opt/homebrew/Cellar/python@3.12/3.12.13/Frameworks/Python.framework/Versions/3.12/bin/python3.12",
-      "python_executable_sha256": "31b9c9a8d50289f3a13f014b3efd8ea3534fc3eea7ca7d9809e166139910b805",
-      "console_script": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/fcp-mcp",
-      "console_script_sha256": "a8955b54afd1607654467d7cdac4132ee173c468b210b7251084486ca8ce25c6",
-      "package_import": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/lib/python3.12/site-packages/fcp_mcp/__init__.py",
-      "package_import_sha256": "15e512011862f10109871d4f70eca89c6a737c98ffd054fc287993dea80a23e6",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
-      "installed_wheel_path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-      "installed_wheel_sha256": "b85e1ca6690570f80f9981b085d4e410f073fe4b711b071eeab838dfbf73424d",
-      "direct_url_record": "/private/tmp/fcp-mcp-v030-evidence-r2/venv/lib/python3.12/site-packages/fcp_mcp-0.3.0.dist-info/direct_url.json",
-      "direct_url_record_sha256": "1a644aa28fa4c3fe289cbc002a1b24a2ac131083bbe5e0632065c46362242873"
-    }
+    "source_manifest_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/records/site-packages-source.sha256",
+    "source_manifest_file_count": 59,
+    "source_manifest_sha256": "d128db11e2ad60277ae02f91eda941b19c2035d311ebcc425f509d08d410677c",
+    "stdio_argv": [
+      "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/run-venv/bin/fcp-mcp"
+    ]
   },
   "builds": {
-    "prior_workflow_installed": {
-      "source_commit": "0fe558be0040422701a75c67cdf04c9a8cbac253",
-      "purpose": "earlier installed workflow smoke",
+    "exact_head_installed": {
+      "source_commit": "9bcdaad157c1000b51c7c6b08df5ed012bc33e25",
+      "source_kind": "git archive",
+      "build_cwd": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/source",
       "installed": true,
       "published": false,
-      "build_cwd": "/private/tmp/fcp-mcp-v030-evidence-r1-base",
+      "twine_check": "passed",
       "artifacts": [
         {
           "kind": "wheel",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-          "sha256": "527b7cc46789125168a84999569c81e866804559e7dfa2a07a4c924d2612c7fb"
+          "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+          "size_bytes": 240999,
+          "sha256": "6cb8c5f58219dca65ddf4407d59b6358af5527bdd1dbb6364816a1fc5ed57d74"
         },
         {
           "kind": "sdist",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r1/dist/fcp_mcp-0.3.0.tar.gz",
-          "sha256": "cafd4ce4319723c6992b2fc4228e1fac503fb5a618da80b0d3845673cc7be2b8"
-        }
-      ]
-    },
-    "fixed_head_generation_installed": {
-      "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
-      "purpose": "installed fixed-head generation and Final Cut import",
-      "installed": true,
-      "published": false,
-      "build_cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
-      "artifacts": [
-        {
-          "kind": "wheel",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-          "size_bytes": 232265,
-          "sha256": "b85e1ca6690570f80f9981b085d4e410f073fe4b711b071eeab838dfbf73424d"
-        },
-        {
-          "kind": "sdist",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0.tar.gz",
-          "size_bytes": 890845,
-          "sha256": "dc45927f5aafcf6149db65a1ef64aab01c376567313263b1e30a9f4bdd3901e4"
+          "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/dist/fcp_mcp-0.3.0.tar.gz",
+          "size_bytes": 909882,
+          "sha256": "c5ddea2e2927c198de43b33c9510af42b1844cb544229f83b13ffb6b53175f07"
         }
       ]
     },
     "final_inventory_only": {
-      "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
+      "source_commit": "9bcdaad157c1000b51c7c6b08df5ed012bc33e25",
+      "source_kind": "exact git archive overlaid with frozen public evidence files",
       "purpose": "inventory-only",
+      "build_cwd": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/inventory-source",
       "installed": false,
       "published": false,
-      "build_cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
+      "archive_was_installed": false,
+      "twine_check": "passed",
       "snapshot_inputs": {
-        "docs/releases/v0.3.0.md": "e6073551a51d449ba5a9f62435a403a4d6fe9a79c32972757e7ad0d75e3af81c",
-        "docs/releases/v0.3.0-provenance.json": "4495eb9942a769e3aaf56c5a70c62c8a40ab6f377508b8de2848226820568588",
-        "docs/assets/v0.3-live-import.png": "a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a"
+        "docs/assets/v0.3-live-import.png": "5f77cd4a5a6ca953928fa47b509ef45e1b99b9dc91dde6c97772ef2ea9d284ac",
+        "docs/releases/v0.3.0-provenance.json": "5044aebe7dde26ec544cda679d56f0a0c1944f1a719ec2876a343121114fc1a7",
+        "docs/releases/v0.3.0.md": "91315704a9f55b141faba1f125147a45d153d3229452e9c3b13406794421c7f4"
       },
+      "snapshot_manifest_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/records/pre-attestation-snapshot.sha256",
+      "snapshot_manifest_sha256": "c2f1c2a428edec36772083f8538d6b6856fee5bafcab25366aaf1a2895cf2809",
       "artifacts": [
         {
           "kind": "wheel",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0-py3-none-any.whl",
-          "size_bytes": 232265,
-          "sha256": "7bc6125a409ff452ced1418adc556d78938c7cd357560a48ba25a6a83e909c5b"
+          "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/inventory-dist/fcp_mcp-0.3.0-py3-none-any.whl",
+          "size_bytes": 240999,
+          "sha256": "45a62ad27e2d6466b322460dfb7b0ab76ac2890684709f2d105d7ca6b4f2e82b"
         },
         {
           "kind": "sdist",
-          "path": "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0.tar.gz",
-          "size_bytes": 891643,
-          "sha256": "d979239dcf210f86c6f83bd32e499c3b3cc2957cebe18f9bde2767ed3bea01da"
+          "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/inventory-dist/fcp_mcp-0.3.0.tar.gz",
+          "size_bytes": 911187,
+          "sha256": "6b6b22f9d1bdfdb7d203a72af7afa8d013f3434af07416c147e565cf161453d2"
         }
       ],
       "required_members": [
-        "docs/releases/v0.3.0.md",
+        "docs/assets/v0.3-live-import.png",
         "docs/releases/v0.3.0-provenance.json",
-        "docs/assets/v0.3-live-import.png"
+        "docs/releases/v0.3.0.md"
       ],
-      "member_container": "sdist",
+      "required_member_archive": "sdist",
+      "member_hashes": {
+        "docs/assets/v0.3-live-import.png": "5f77cd4a5a6ca953928fa47b509ef45e1b99b9dc91dde6c97772ef2ea9d284ac",
+        "docs/releases/v0.3.0-provenance.json": "5044aebe7dde26ec544cda679d56f0a0c1944f1a719ec2876a343121114fc1a7",
+        "docs/releases/v0.3.0.md": "91315704a9f55b141faba1f125147a45d153d3229452e9c3b13406794421c7f4"
+      },
       "member_hashes_match_snapshot_inputs": true,
-      "attestation_boundary": "Archive and snapshot hashes are appended to the public files only after this inventory artifact is constructed; the embedded provenance is the pre-attestation snapshot."
+      "wheel_inventory": {
+        "packaged_sample_sha256": "c54521e017d140cdf059fd950c7c286f0182e9622cd74ecacdfb83436b97ec02",
+        "metadata_sha256": "8d2fc482a4b92a6ff626e47f8ebabce7c34b190ea7d91998e205173f2f027485",
+        "public_docs_packaged_in_wheel": false
+      },
+      "attestation_boundary": "The distributions contain the pre-attestation snapshot. Their archive and snapshot hashes were appended to the public note and provenance only after the build; this inventory-only wheel was not installed and neither artifact was published."
+    }
+  },
+  "profile_smoke": {
+    "record_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/records/wheel-smoke-final.json",
+    "record_sha256": "a24854bdb2eeb2e9fae50878981a2efadf61bb70f01e8e3946c15886809ef517",
+    "version": "0.3.0",
+    "default_profile": "workflow",
+    "doctor_status": "degraded",
+    "doctor_is_error": false,
+    "counts": {
+      "inspect": [30, 2, 0],
+      "workflow": [34, 3, 3],
+      "edit": [75, 5, 3],
+      "full": [94, 5, 3]
+    },
+    "initial_setup_failure": {
+      "cause": "evidence state directory was created with mode 0755",
+      "product_response": "invalid_configuration: workflow state root does not have private mode 0700",
+      "resolution": "created a fresh state directory with mode 0700 before rerun"
     }
   },
   "sample_materialization": {
-    "path": "/private/tmp/fcp-mcp-v030-evidence-r1/output/wheel-smoke-first-run-02dce804200549eab434c944245d359d.fcpxml",
+    "source": "installed fcp-mcp sample command",
+    "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/output4/documented-first-run.fcpxml",
+    "size_bytes": 789,
     "sha256": "c54521e017d140cdf059fd950c7c286f0182e9622cd74ecacdfb83436b97ec02",
-    "relationship_to_trajectory": "separate earlier installed sample-command check; not the workflow or installed-generation source"
+    "clip": "Demo Clip"
   },
   "trajectory": {
-    "kind": "earlier installed-wheel two-operation smoke",
-    "run_id": "790da06a-04f7-48e8-a9e8-78014a464f6c",
-    "run_created_at": "2026-08-10T04:31:03.772431Z",
-    "source_path": "/private/tmp/fcp-mcp-v030-evidence-r1/output/wheel-smoke-source-8dee81b96a1b4372b0fba522e6d1fb77.fcpxml",
-    "source_sha256": "5e0cfbe2647123c21d53c00ba75174736e7e127d2b26d0fb52722092242564d4",
-    "plan_sha256": "79f29fcedf1cdc5ca645b1445bef525b5b6ec84998501458c238ff6a51d5bf0a",
+    "kind": "fresh installed-wheel packaged-sample prepare-review-hash-commit-validate",
+    "run_id": "22cda729-9d77-4708-bc13-f68fa9a1066d",
+    "created_at": "2026-08-11T05:20:29.996282Z",
+    "committed_at": "2026-08-11T05:20:30.093602Z",
+    "source_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/output4/documented-first-run.fcpxml",
+    "source_sha256": "c54521e017d140cdf059fd950c7c286f0182e9622cd74ecacdfb83436b97ec02",
+    "plan_sha256": "78a46c456fb92d5231f62bd016fcb12bd937a6015405e86dfd36e8340aa66809",
     "operations": [
-      {"kind": "add_marker", "clip_name": "Clip", "value": "Wheel smoke"},
-      {"kind": "assign_role", "clip_name": "Clip", "role": "Dialogue"}
+      {
+        "kind": "add_marker",
+        "clip_name": "Demo Clip",
+        "start": "0s",
+        "value": "First-run review marker"
+      }
     ],
-    "candidate_path": "/private/tmp/fcp-mcp-v030-evidence-r1/state/artifacts/790da06a-04f7-48e8-a9e8-78014a464f6c/candidate.fcpxml",
-    "candidate_sha256": "782f96039ed8a14e68bbbbf5649d719e3e81f8ef7c90a7c3dc2d74d7cb9bb3ff",
-    "output_path": "/private/tmp/fcp-mcp-v030-evidence-r1/output/wheel-smoke-destination-8dee81b96a1b4372b0fba522e6d1fb77.fcpxml",
-    "output_sha256": "782f96039ed8a14e68bbbbf5649d719e3e81f8ef7c90a7c3dc2d74d7cb9bb3ff",
-    "diff_path": "/private/tmp/fcp-mcp-v030-evidence-r1/state/artifacts/790da06a-04f7-48e8-a9e8-78014a464f6c/diff.json",
-    "diff_sha256": "c3303bd83dccc021b9817f0606d44eca79e8915dbcbbdcd45a331f7e3403d71a",
+    "candidate_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/state4/artifacts/22cda729-9d77-4708-bc13-f68fa9a1066d/candidate.fcpxml",
+    "candidate_sha256": "e8ef0ff17ba3d7043026d6b2a40920da6d2c92f9595a8c214b6d4ac9b3db93ee",
+    "output_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/output4/documented-first-run-marked.fcpxml",
+    "output_sha256": "e8ef0ff17ba3d7043026d6b2a40920da6d2c92f9595a8c214b6d4ac9b3db93ee",
+    "diff_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/state4/artifacts/22cda729-9d77-4708-bc13-f68fa9a1066d/diff.json",
+    "diff_sha256": "57a11565c173be4332b16ba54260f1b608475c605b6cd4ee1d102405a72b056b",
     "receipt": {
-      "path": "/private/tmp/fcp-mcp-v030-evidence-r1/state/artifacts/790da06a-04f7-48e8-a9e8-78014a464f6c/receipt.json",
-      "logical_sha256": "d93bc297999668f9d1ff6b5da7ee484a6fb3a921db9479c3a86ad7ad657adc8b",
-      "artifact_sha256": "2adc2bc2b7fc8795671ac5ce263a8a868e6ad16f4692c41363040db2d94b7d32",
-      "ledger_receipt_sha256": "2adc2bc2b7fc8795671ac5ce263a8a868e6ad16f4692c41363040db2d94b7d32"
+      "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/state4/artifacts/22cda729-9d77-4708-bc13-f68fa9a1066d/receipt.json",
+      "logical_sha256": "604e4e989c8126561a8f9dbad7a2d7525e06bb9fa751209345eca9e3832a2896",
+      "artifact_sha256": "635a6538b6d6bd773d5981045ac967958a0e00c946dd97b823854ac65ef74d79",
+      "ledger_receipt_sha256": "635a6538b6d6bd773d5981045ac967958a0e00c946dd97b823854ac65ef74d79",
+      "size_bytes": 909,
+      "approval_binding_sha256": "383657c42e078e489aa5838abaa44b0fd733c95264274ce461236e29368bafad",
+      "approval_source": "client",
+      "approval_strength": "client_unverified_human"
     },
-    "ledger_path": "/private/tmp/fcp-mcp-v030-evidence-r1/state/runs.sqlite3",
-    "ledger_sha256": "78f24364aa2a540d1d9e519c90cc268c748c9e574811e2eeed3a53fd3f78ae55",
+    "ledger_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/state4/runs.sqlite3",
+    "ledger_sha256": "22ae88c8011a5aab9440fb77e79c9757a9ac2ca5746fde9f142890c791d0a1a3",
     "ledger_integrity_check": "ok",
+    "ledger_diagnostics": {
+      "integrity_valid": true,
+      "checked_migrations": 1,
+      "checked_runs": 1,
+      "checked_events": 10,
+      "incomplete_count": 0,
+      "recovery_required_count": 0
+    },
     "terminal_state": "committed",
     "terminal_event_sequence": 10,
-    "smoke_report_path": "/private/tmp/fcp-mcp-v030-evidence-r1/wheel-smoke.json",
-    "smoke_report_sha256": "d0c7bb7a749a7070e3639258fe2d12341a0647923b8c01a06b37cc18accaad69"
+    "record_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/records/first-run-trajectory.json",
+    "record_sha256": "acdd8c3beaec85b8d101230e663ec0cce59e338155964d3b1ed34ae4878b10b2"
   },
   "installed_generation": {
-    "source_commit": "a15fc4683c2b2bf89f140321f74a89b3bcde93cc",
-    "wheel_path": "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-    "wheel_sha256": "b85e1ca6690570f80f9981b085d4e410f073fe4b711b071eeab838dfbf73424d",
-    "record_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/installed-generation.json",
-    "record_sha256": "8d2772be89007a04a324860c7b393b2afa1234570ed4878cac530d7047e17531",
-    "invocation_script_path": "/private/tmp/fcp-mcp-v030-evidence-r2/invoke_installed_timeline.py",
-    "invocation_script_sha256": "40e71cdbf069c7d899316675eddad2dfc7a96d28168ff131ec94a1bbb819b7fc",
+    "source_commit": "9bcdaad157c1000b51c7c6b08df5ed012bc33e25",
+    "wheel_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/dist/fcp_mcp-0.3.0-py3-none-any.whl",
+    "wheel_sha256": "6cb8c5f58219dca65ddf4407d59b6358af5527bdd1dbb6364816a1fc5ed57d74",
+    "record_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/records/installed-generation.json",
+    "record_size_bytes": 5376,
+    "record_sha256": "3fa9c95877ccaf5804b36be2df311bd3317ea23bc529db7bfcfc42cdc851a079",
+    "invocation_script_path": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish/.superpowers/sdd/2026-08-09-v0.3-product-launch/task-7d-invoke-installed-timeline.py",
+    "invocation_script_sha256": "f116832714547e7b29b62756c049c1691d7af4f61f74cb482194362ce9611939",
     "stdio_argv": [
-      "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/fcp-mcp"
+      "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/run-venv/bin/fcp-mcp"
     ],
-    "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
+    "cwd": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/source",
     "environment": {
       "FCP_MCP_PROFILE": "full",
-      "FCP_MCP_OUTPUT_DIR": "/private/tmp/fcp-mcp-v030-evidence-r2/live",
-      "FCP_MCP_ALLOWED_ROOTS": "/private/tmp/fcp-mcp-v030-evidence-r2:/Volumes/Extreme SSD/GHG",
-      "FCP_MCP_STATE_DIR": "/private/tmp/fcp-mcp-v030-evidence-r2/state",
+      "FCP_MCP_OUTPUT_DIR": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/live",
+      "FCP_MCP_ALLOWED_ROOTS": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610:/Volumes/Extreme SSD/GHG",
+      "FCP_MCP_STATE_DIR": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/state5",
       "FCP_MCP_ENABLE_LIVE_CONTROL": "0"
     },
     "tool": "fcpxml_create_timeline",
     "arguments": {
-      "clips_json": "[{\"src\":\"/Volumes/Extreme SSD/GHG/P1010413.MP4\",\"name\":\"GHG P1010413 five-second evidence\",\"start\":\"900900/30000s\",\"duration\":\"150150/30000s\",\"asset_duration\":\"5735730/30000s\",\"role\":\"Dialogue\"}]",
-      "project_name": "v0.3 Installed Generated Evidence",
+      "clips_json": "[{\"src\":\"/Volumes/Extreme SSD/GHG/P1010413.MP4\",\"name\":\"GHG P1010413 final-head five-second evidence\",\"start\":\"900900/30000s\",\"duration\":\"150150/30000s\",\"asset_duration\":\"5735730/30000s\",\"role\":\"Dialogue\"}]",
+      "project_name": "v0.3 Final Head Installed Evidence",
       "format_name": "FFVideoFormat1080p2997",
-      "event_name": "v0.3 Fixed Head Evidence",
-      "output_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml"
+      "event_name": "v0.3 Final Head Evidence",
+      "output_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/live/v0.3-final-head-installed.fcpxml"
     },
     "result": {
       "status": "passed",
-      "project": "v0.3 Installed Generated Evidence",
+      "project": "v0.3 Final Head Installed Evidence",
       "selected_clip_count": 1,
       "target_duration_seconds": 5.005,
-      "transaction_id": "9cbc03af-d655-4218-9d91-98954128f669",
+      "transaction_id": "7e756fd1-7427-451b-bdb3-500b54e3d6b9",
       "validation_warnings": [
-        "Asset 'GHG P1010413 five-second evidence' has no source path"
+        "Asset 'GHG P1010413 final-head five-second evidence' has no source path"
       ]
     },
-    "output_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml",
-    "output_size_bytes": 999,
-    "output_sha256": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
-    "first_attempt": {
-      "status": "rejected before write",
-      "error": "path_outside_scope: requested live output while FCP_MCP_OUTPUT_DIR was bound to output",
-      "output_created": false
-    }
+    "output_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/live/v0.3-final-head-installed.fcpxml",
+    "output_size_bytes": 1022,
+    "output_sha256": "a574c9d65a79983a214f558ef4dce650a737501afb7b0b6596de3146767f33eb"
   },
   "media": {
     "identity": "/Volumes/Extreme SSD/GHG/P1010413.MP4",
@@ -221,9 +246,9 @@
   },
   "live_import": {
     "installed_generated_fcpxml": {
-      "path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml",
-      "size_bytes": 999,
-      "sha256": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
+      "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/live/v0.3-final-head-installed.fcpxml",
+      "size_bytes": 1022,
+      "sha256": "a574c9d65a79983a214f558ef4dce650a737501afb7b0b6596de3146767f33eb",
       "post_generation_manual_edits": false
     },
     "asset_duration": "5735730/30000s",
@@ -234,21 +259,21 @@
       "dtd_path": "/Applications/Final Cut Pro.app/Contents/Frameworks/Interchange.framework/Versions/A/Resources/FCPXMLv1_11.dtd",
       "dtd_sha256": "fc85a0b4e56f28d63774f2e333301800db19c160b55cc118b55c4fe199f633be",
       "dtd_size_bytes": 41938,
+      "version": "1.11",
       "authoritative_gate": "scripts/apple_dtd_gate.py (lxml)",
       "result": "passed",
-      "xml_sha256_before": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
-      "xml_sha256_after": "2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
-      "report_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/dtd.json",
-      "report_sha256": "e85d1f9f1422def40a815100809540ae80c682c303bbe375395e89d676559102",
-      "xmllint_valid": "not claimed; the retained XML has no external SYSTEM identifier",
-      "macos_dtdvalid_caveat": "xmllint --dtdvalid emits xmlSAX2ResolveEntity"
+      "xml_sha256_before": "a574c9d65a79983a214f558ef4dce650a737501afb7b0b6596de3146767f33eb",
+      "xml_sha256_after": "a574c9d65a79983a214f558ef4dce650a737501afb7b0b6596de3146767f33eb",
+      "report_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/records/dtd-validation.json",
+      "report_sha256": "7368b4063c1dfe48ea004eda4abe6850f4b26d357015c5c3d66cd0da33307a7f"
     },
     "operator_observation": {
-      "route": "Final Cut Pro > File > Import > XML; Command-Shift-G; exact installed-generated FCPXML path; Import; select project in list view; Clip > Open Clip",
-      "library_path": "/private/tmp/fcp-mcp-v030-evidence-r2/v0.3-installed-generated-evidence.fcpbundle",
-      "library": "v0.3-installed-generated-evidence.fcpbundle",
-      "event": "v0.3 Fixed Head Evidence",
-      "project": "v0.3 Installed Generated Evidence",
+      "route": "Final Cut Pro > File > Import > XML",
+      "selection_detail": "Command-Shift-G to exact generated path, then Right and Down to enable Import",
+      "library_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/v0.3-final-head-evidence.fcpbundle",
+      "library": "v0.3-final-head-evidence.fcpbundle",
+      "event": "v0.3 Final Head Evidence",
+      "project": "v0.3 Final Head Installed Evidence",
       "import_warning": "none observed",
       "visible_clip_duration": "00:00:05:00",
       "visible_video": "filmstrip",
@@ -258,7 +283,7 @@
       "observation_scope": "operator observation; screenshot does not prove absence of an earlier warning dialog"
     },
     "managed_media_copy": {
-      "path": "/private/tmp/fcp-mcp-v030-evidence-r2/v0.3-installed-generated-evidence.fcpbundle/v0.3 Fixed Head Evidence/Original Media/P1010413.mp4",
+      "path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/v0.3-final-head-evidence.fcpbundle/v0.3 Final Head Evidence/Original Media/P1010413.mp4",
       "size_bytes": 2252375418,
       "sha256": "b51ebe8fa82bc452ea882292d955808b01af11c572925c5785c94fca152308d1",
       "matches_authorized_original": true
@@ -266,14 +291,17 @@
   },
   "screenshot": {
     "path": "docs/assets/v0.3-live-import.png",
-    "sha256": "a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a",
-    "size_bytes": 484002,
+    "sha256": "5f77cd4a5a6ca953928fa47b509ef45e1b99b9dc91dde6c97772ef2ea9d284ac",
+    "size_bytes": 485744,
     "dimensions_px": [972, 768],
     "format": "PNG",
     "capture": "genuine Final Cut Pro window capture, cropped only",
-    "privacy_check": "passed; no local path, other library names, or unrelated project names are visible",
+    "full_capture_path": "/private/tmp/fcp-mcp-v030-final-20260811T051833Z-69610/records/fcp-final-head-full.jpeg",
+    "full_capture_sha256": "6e475735395a6771da2e8f2941b344b3732ce36dad5a6837d83841e6ac91029b",
+    "crop": "removed 380 pixels from the left of the 1352x768 FCP capture; no reconstruction",
+    "privacy_check": "passed; no local path, other library name, or unrelated project name is visible",
     "visible_evidence": [
-      "v0.3 Installed Generated Evidence",
+      "v0.3 Final Head Installed Evidence",
       "05:00",
       "video filmstrip",
       "audio waveform",
@@ -281,209 +309,37 @@
       "Dialogue-1"
     ]
   },
-  "commands": [
-    {
-      "purpose": "fixed-head distribution build",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
-        "-m",
-        "build",
-        "--outdir",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/dist"
-      ],
-      "result": "wheel and sdist built",
-      "exit_code": 0
-    },
-    {
-      "purpose": "install exact fixed-head wheel",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/pip",
-        "install",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl"
-      ],
-      "result": "installed",
-      "exit_code": 0
-    },
-    {
-      "purpose": "invoke installed MCP stdio timeline tool",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/python",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/invoke_installed_timeline.py"
-      ],
-      "server_argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/fcp-mcp"
-      ],
-      "result_record": "/private/tmp/fcp-mcp-v030-evidence-r2/live/installed-generation.json",
-      "result": "passed; output SHA-256 2ad92d13768b28c123422beba718ed48c4146cc52f13f304c15292e2f5dc4c84",
-      "exit_code": 0
-    },
-    {
-      "purpose": "Apple DTD gate over unchanged installed-generated XML",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/venv/bin/python",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/source/scripts/apple_dtd_gate.py",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/live/v0.3-installed-generated.fcpxml"
-      ],
-      "stdout_path": "/private/tmp/fcp-mcp-v030-evidence-r2/live/dtd.json",
-      "result": "passed against installed FCPXML 1.11 DTD; XML hash unchanged",
-      "exit_code": 0
-    },
-    {
-      "purpose": "final post-evidence inventory-only build",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
-        "-m",
-        "build",
-        "--outdir",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory"
-      ],
-      "result": "inventory-only wheel and sdist built; not installed or published",
-      "exit_code": 0
-    }
-  ],
-  "validations": [
-    {
-      "purpose": "strict TDD initial semantic RED",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        ".venv/bin/python",
-        "-m",
-        "pytest",
-        "tests/test_generator.py::TestTimelineBuilder",
-        "tests/test_server_contracts.py::test_create_timeline_accepts_explicit_asset_duration",
-        "tests/test_server_contracts.py::test_create_timeline_rejects_short_explicit_asset_duration",
-        "-q"
-      ],
-      "result": "6 failed, 2 passed before implementation",
-      "exit_code": 1
-    },
-    {
-      "purpose": "strict TDD cached/conflict RED",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        ".venv/bin/python",
-        "-m",
-        "pytest",
-        "tests/test_generator.py::TestTimelineBuilder::test_repeated_source_rejects_conflicting_asset_durations",
-        "tests/test_generator.py::TestTimelineBuilder::test_cached_asset_is_extended_to_cover_new_selected_range",
-        "-q"
-      ],
-      "result": "2 failed before edge-case implementation",
-      "exit_code": 1
-    },
-    {
-      "purpose": "focused generator, tool, result, legacy-schema, and profile GREEN",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        ".venv/bin/python",
-        "-m",
-        "pytest",
-        "tests/test_generator.py",
-        "tests/test_server_contracts.py",
-        "tests/result_contracts/test_offline_write_results.py",
-        "tests/contracts/test_profile_catalogs.py",
-        "tests/contracts/test_legacy_catalog_snapshot.py",
-        "tests/test_tool_catalog.py",
-        "-q"
-      ],
-      "result": "132 passed",
-      "exit_code": 0
-    },
-    {
-      "purpose": "twine validation for fixed-head build",
-      "cwd": "/private/tmp/fcp-mcp-v030-evidence-r2/source",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
-        "-m",
-        "twine",
-        "check",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0-py3-none-any.whl",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/dist/fcp_mcp-0.3.0.tar.gz"
-      ],
-      "result": "2 artifacts passed",
-      "exit_code": 0
-    },
-    {
-      "purpose": "twine validation for final inventory-only build",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        "/private/tmp/fcp-mcp-v030-evidence-r2/buildvenv/bin/python",
-        "-m",
-        "twine",
-        "check",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0-py3-none-any.whl",
-        "/private/tmp/fcp-mcp-v030-evidence-r2/final-inventory/fcp_mcp-0.3.0.tar.gz"
-      ],
-      "result": "2 artifacts passed",
-      "exit_code": 0
-    },
-    {
-      "purpose": "inventory sdist member hash comparison",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        ".venv/bin/python",
-        "-c",
-        "hash the three required sdist members and assert equality with builds.final_inventory_only.snapshot_inputs"
-      ],
-      "result": {
-        "docs/assets/v0.3-live-import.png": "a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a",
-        "docs/releases/v0.3.0-provenance.json": "4495eb9942a769e3aaf56c5a70c62c8a40ab6f377508b8de2848226820568588",
-        "docs/releases/v0.3.0.md": "e6073551a51d449ba5a9f62435a403a4d6fe9a79c32972757e7ad0d75e3af81c"
-      },
-      "exit_code": 0
-    },
-    {
-      "purpose": "focused final release-evidence and product contracts",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "argv": [
-        ".venv/bin/python",
-        "-m",
-        "pytest",
+  "validation": {
+    "local_only": true,
+    "remote_ci_queried": false,
+    "targeted_pytest": {
+      "result": "passed",
+      "tests": 31,
+      "files": [
         "tests/test_release_evidence.py",
         "tests/test_product_surface.py",
         "tests/test_documented_calls.py",
         "tests/test_release_gates.py",
-        "-q"
-      ],
-      "result": "20 passed in 1.26s",
-      "exit_code": 0
+        "tests/test_apple_dtd_gate.py"
+      ]
     },
-    {
-      "purpose": "full-profile documented calls",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "environment": {"FCP_MCP_PROFILE": "full"},
-      "argv": [
-        ".venv/bin/python",
-        "scripts/check_contracts.py"
-      ],
-      "result": "Validated 51 tool-call blocks across 3 file(s).",
-      "exit_code": 0
-    },
-    {
-      "purpose": "screenshot signature, dimensions, and hash",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "commands": [
-        ["file", "docs/assets/v0.3-live-import.png"],
-        ["sips", "-g", "pixelWidth", "-g", "pixelHeight", "docs/assets/v0.3-live-import.png"],
-        ["shasum", "-a", "256", "docs/assets/v0.3-live-import.png"]
-      ],
-      "result": "PNG, 972x768, a09e7460d8a96ba8415bb42c2e09ccd09645adc6a8a11d6946e92b7839ce993a",
-      "exit_code": 0
-    },
-    {
-      "purpose": "JSON and diff hygiene",
-      "cwd": "/Users/adamsteen/fcp-mcp/.worktrees/v0.3-product-polish",
-      "commands": [
-        [".venv/bin/python", "-m", "json.tool", "docs/releases/v0.3.0-provenance.json"],
-        ["git", "diff", "--check"]
-      ],
+    "documented_tool_calls": {
       "result": "passed",
-      "exit_code": 0
-    }
-  ]
+      "blocks": 51,
+      "files": 3,
+      "profile": "full"
+    },
+    "installed_python_dtd_rerun": {
+      "result": "passed",
+      "xml_sha256_before": "a574c9d65a79983a214f558ef4dce650a737501afb7b0b6596de3146767f33eb",
+      "xml_sha256_after": "a574c9d65a79983a214f558ef4dce650a737501afb7b0b6596de3146767f33eb"
+    },
+    "json_parse": "passed",
+    "png_signature_dimensions_size_hash": "passed",
+    "twine_check_exact_head_and_inventory": "passed",
+    "inventory_member_hashes": "passed",
+    "managed_media_byte_comparison": "passed",
+    "ruff_changed_python": "passed",
+    "git_diff_check": "passed"
+  }
 }
