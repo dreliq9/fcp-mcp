@@ -32,17 +32,19 @@ exists only in the `edit` and `full` profiles—not in the default review-only
 fcpxml_generate_from_clip_plan(
   manifest_path,
   project_name="YouTube Remix",
-  output_path="",
-  verify_hashes=true
+  output_path=""
 )
 ```
+
+Hash verification is mandatory. The former `verify_hashes` input was removed
+before the first public release; no published caller relied on the opt-out.
 
 The tool:
 
 1. resolves the manifest through the normal FCP-MCP input path policy,
 2. requires schema `youtube-mcp.materialized-clip-plan/v1`,
 3. resolves every local media path through the same path policy,
-4. verifies every materialized asset SHA-256 by default,
+4. requires a valid SHA-256 digest and verifies every materialized asset's content,
 5. preserves manifest ordering,
 6. uses the existing `FCPXMLGenerator` to create a native primary-storyline timeline,
 7. commits the FCPXML through the existing atomic generator transaction path,

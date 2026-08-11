@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -155,6 +156,8 @@ def test_handoff_generates_native_fcpxml_and_provenance(tmp_path: Path) -> None:
 
     provenance = json.loads(Path(result.provenance.path).read_text())
     assert provenance["schema"] == PROVENANCE_SCHEMA
+    assert provenance["hashes_verified"] is True
+    assert "verify_hashes" not in provenance
     assert provenance["timeline_order"] == ["clip-001", "clip-002"]
     assert provenance["sources"][0]["source_start_s"] == 98.0
 
@@ -180,6 +183,48 @@ def test_handoff_rejects_unknown_schema(tmp_path: Path) -> None:
     with pytest.raises(FCPMCPError) as exc:
         handler(str(manifest), output_path=str(tmp_path / "bad.fcpxml"))
     assert exc.value.code == ErrorCode.UNSUPPORTED_CONTRACT
+
+
+@pytest.mark.parametrize("root", [[], None, "not-a-manifest", 3])
+def test_handoff_rejects_non_object_manifest_roots(tmp_path: Path, root: object) -> None:
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    manifest = tmp_path / "invalid-root.json"
+    manifest.write_text(json.dumps(root), encoding="utf-8")
+
+    with pytest.raises(FCPMCPError) as exc:
+        handler(str(manifest), output_path=str(tmp_path / "bad.fcpxml"))
+
+    assert exc.value.code == ErrorCode.VALIDATION_FAILED
+
+
+def test_handoff_requires_a_hex_sha256_and_accepts_uppercase_digest(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    manifest = _manifest(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["assets"][0]["sha256"] = "g" * 64
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(FCPMCPError) as exc:
+        handler(str(manifest), output_path=str(tmp_path / "bad.fcpxml"))
+
+    assert exc.value.code == ErrorCode.ARTIFACT_CORRUPT
+    assert "no valid SHA-256" in str(exc.value)
+
+    payload["assets"][0]["sha256"] = _sha256(
+        Path(payload["assets"][0]["path"])
+    ).upper()
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    result = handler(str(manifest), output_path=str(tmp_path / "uppercase.fcpxml"))
+    assert result.hashes_verified is True
+
+
+def test_handoff_has_no_public_hash_verification_opt_out(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+
+    assert "verify_hashes" not in inspect.signature(handler).parameters
 
 
 def test_registration_is_idempotent(tmp_path: Path) -> None:

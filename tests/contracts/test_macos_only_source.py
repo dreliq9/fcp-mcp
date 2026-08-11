@@ -168,7 +168,7 @@ jobs:
     (root / "pyproject.toml").write_text(
         """
 [project]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 classifiers = ["Operating System :: MacOS :: MacOS X"]
 
 [project.scripts]
@@ -1366,7 +1366,7 @@ def test_checker_enforces_package_document_and_manifest_contract(tmp_path):
     (tmp_path / "pyproject.toml").write_text(
         """
 [project]
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 classifiers = [
   "Operating System :: MacOS :: MacOS X",
   "Operating System :: Microsoft :: Windows",

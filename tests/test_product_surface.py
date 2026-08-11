@@ -27,6 +27,14 @@ def test_package_metadata_has_a_human_maintainer():
     assert project["maintainers"] == expected
 
 
+def test_package_metadata_and_compatibility_declare_same_python_support_range():
+    project = tomllib.loads(read("pyproject.toml"))["project"]
+    compatibility = read("docs/COMPATIBILITY.md")
+
+    assert project["requires-python"] == ">=3.10,<3.14"
+    assert "| Python | Python 3.10–3.13 |" in compatibility
+
+
 def test_public_navigation_links_launch_surfaces():
     text = read("README.md")
     for target in (

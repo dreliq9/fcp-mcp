@@ -730,8 +730,8 @@ def _check_pyproject(root: Path, findings: list[str]) -> None:
     )
     if os_classifiers != [MACOS_CLASSIFIER]:
         findings.append("pyproject.toml: OS classifiers are not macOS-only")
-    if project.get("requires-python") != ">=3.10":
-        findings.append("pyproject.toml: Requires-Python is not >=3.10")
+    if project.get("requires-python") != ">=3.10,<3.14":
+        findings.append("pyproject.toml: Requires-Python is not >=3.10,<3.14")
     scripts = project.get("scripts")
     if not isinstance(scripts, dict) or scripts.get("fcp-mcp") != "fcp_mcp.cli:main":
         findings.append("pyproject.toml: console script is not fcp_mcp.cli:main")

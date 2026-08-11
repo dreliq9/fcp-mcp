@@ -44,6 +44,11 @@ def _load_manifest(runtime: Any, manifest_path: str) -> tuple[Path, dict[str, An
             ErrorCode.VALIDATION_FAILED,
             "youtube-mcp materialized clip-plan manifest is unreadable",
         ) from exc
+    if not isinstance(data, dict):
+        raise FCPMCPError(
+            ErrorCode.VALIDATION_FAILED,
+            "youtube-mcp materialized clip-plan manifest root must be an object",
+        )
     if data.get("schema") != MATERIALIZED_SCHEMA:
         raise FCPMCPError(
             ErrorCode.UNSUPPORTED_CONTRACT,
@@ -61,8 +66,6 @@ def _load_manifest(runtime: Any, manifest_path: str) -> tuple[Path, dict[str, An
 def _validated_assets(
     runtime: Any,
     manifest: dict[str, Any],
-    *,
-    verify_hashes: bool,
 ) -> list[dict[str, Any]]:
     assets: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -104,19 +107,20 @@ def _validated_assets(
             )
 
         expected_sha = str(raw.get("sha256") or "")
-        if verify_hashes:
-            if len(expected_sha) != 64:
-                raise FCPMCPError(
-                    ErrorCode.ARTIFACT_CORRUPT,
-                    f"Materialized clip {clip_id} has no valid SHA-256",
-                )
-            actual_sha = _sha256(media_path)
-            if actual_sha != expected_sha:
-                raise FCPMCPError(
-                    ErrorCode.ARTIFACT_CORRUPT,
-                    f"Materialized clip {clip_id} SHA-256 does not match its handoff manifest",
-                    details={"clip_id": clip_id, "expected_sha256": expected_sha, "actual_sha256": actual_sha},
-                )
+        if len(expected_sha) != 64 or any(
+            char not in "0123456789abcdefABCDEF" for char in expected_sha
+        ):
+            raise FCPMCPError(
+                ErrorCode.ARTIFACT_CORRUPT,
+                f"Materialized clip {clip_id} has no valid SHA-256",
+            )
+        actual_sha = _sha256(media_path)
+        if actual_sha != expected_sha.lower():
+            raise FCPMCPError(
+                ErrorCode.ARTIFACT_CORRUPT,
+                f"Materialized clip {clip_id} SHA-256 does not match its handoff manifest",
+                details={"clip_id": clip_id, "expected_sha256": expected_sha, "actual_sha256": actual_sha},
+            )
 
         item = dict(raw)
         item["clip_id"] = clip_id
@@ -140,18 +144,17 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
         manifest_path: str,
         project_name: str = "YouTube Remix",
         output_path: str = "",
-        verify_hashes: bool = True,
     ) -> YouTubeClipPlanGenerationResult:
         """Generate FCPXML from a youtube-mcp materialized clip-plan manifest.
 
         The source clips must already have been materialized by youtube-mcp. FCP-MCP
         revalidates every local path through its normal path policy and verifies
-        SHA-256 identity by default. Clips are placed in manifest order and remain
+        SHA-256 identity. Clips are placed in manifest order and remain
         full-duration local assets because youtube-mcp already applied source trims.
         A `.sources.json` sidecar preserves original YouTube URLs/time ranges.
         """
         source_manifest, manifest = _load_manifest(runtime, manifest_path)
-        assets = _validated_assets(runtime, manifest, verify_hashes=verify_hashes)
+        assets = _validated_assets(runtime, manifest)
 
         normalized_project = project_name.strip()
         if not normalized_project:
@@ -204,7 +207,7 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
             "source_manifest_schema": manifest.get("schema"),
             "plan_revision": manifest.get("plan_revision"),
             "materialization_revision": manifest.get("materialization_revision"),
-            "verify_hashes": verify_hashes,
+            "hashes_verified": True,
             "timeline_order": [asset["clip_id"] for asset in assets],
             "sources": [
                 {
@@ -237,7 +240,7 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
             target_duration_seconds=total_duration,
             plan_revision=(str(manifest.get("plan_revision")) if manifest.get("plan_revision") is not None else None),
             materialization_revision=(str(manifest.get("materialization_revision")) if manifest.get("materialization_revision") is not None else None),
-            hashes_verified=verify_hashes,
+            hashes_verified=True,
             destination=runtime._artifact_reference(receipt),
             provenance=runtime._artifact_reference_for_path(
                 provenance_path,
