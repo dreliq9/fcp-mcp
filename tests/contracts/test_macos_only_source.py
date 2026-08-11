@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from ruamel.yaml import YAML
 
 from scripts.check_macos_only import check
 
@@ -128,13 +129,27 @@ jobs:
           python -m venv /tmp/fcp-mcp-wheel-py310
           /tmp/fcp-mcp-wheel-py310/bin/python -m pip install dist/fcp_mcp-0.3.0-py3-none-any.whl
           /tmp/fcp-mcp-wheel-py310/bin/python -c "import fcp_mcp.workflow.locking"
+      - name: Create release checksum manifest
+        run: |
+          set -euo pipefail
+          actual_files="$(find dist -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort)"
+          expected_files="$(printf '%s\\n' \\
+            dist/fcp_mcp-0.3.0-py3-none-any.whl \\
+            dist/fcp_mcp-0.3.0.tar.gz)"
+          test "$actual_files" = "$expected_files"
+          shasum -a 256 \\
+            dist/fcp_mcp-0.3.0-py3-none-any.whl \\
+            dist/fcp_mcp-0.3.0.tar.gz > fcp-mcp-v0.3.0.sha256
       - name: Upload verified distributions
         uses: {UPLOAD_ACTION}
         with:
           name: {RELEASE_ARTIFACT}
-          path: dist/
+          path: |
+            dist/fcp_mcp-0.3.0-py3-none-any.whl
+            dist/fcp_mcp-0.3.0.tar.gz
+            fcp-mcp-v0.3.0.sha256
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
   publish:
     name: Publish verified distributions to PyPI
     needs: verify
@@ -149,7 +164,7 @@ jobs:
         uses: {DOWNLOAD_ACTION}
         with:
           name: {RELEASE_ARTIFACT}
-          path: dist/
+          path: .
       - name: Publish verified distributions to PyPI
         uses: {PUBLISH_ACTION}
 """.lstrip(),
@@ -315,6 +330,189 @@ def test_checker_rejects_registry_release_safety_bypasses(tmp_path, mutation):
             ".github/workflows/publish-registry.yml: registry job differs from reviewed trajectory",
         )
     )
+
+
+def _workflow_step(job: dict[str, object], name: str) -> dict[str, object]:
+    matches = [step for step in job["steps"] if step.get("name") == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_run_id_input",
+        "malformed_run_id_validation",
+        "shell_interpolated_run_id",
+        "missing_actions_read",
+        "extra_permission",
+        "pat_injection",
+        "github_api_after_oidc",
+        "wrong_run_id",
+        "wrong_run_repository",
+        "wrong_run_path",
+        "wrong_run_event",
+        "wrong_run_status",
+        "wrong_run_conclusion",
+        "wrong_run_head_sha",
+        "wrong_run_attempt",
+        "moving_download_action",
+        "missing_download_token",
+        "missing_download_repository",
+        "missing_download_run_id",
+        "download_over_checkout",
+        "digest_mismatch_warning",
+        "manifest_before_final_smoke",
+        "extra_release_file",
+        "missing_release_wheel",
+        "malformed_manifest_row",
+        "duplicate_manifest_row",
+        "altered_manifest_filename",
+        "pypi_filename_only",
+        "pypi_only_one_file",
+        "pypi_digest_mismatch",
+        "pypi_extra_distribution",
+        "pypi_yanked_file",
+        "pypi_retry_fallthrough",
+        "missing_wheel_provenance",
+        "wrong_provenance_repository",
+        "missing_attestation_requirement",
+        "oidc_before_provenance",
+    ],
+)
+def test_checker_rejects_registry_digest_binding_mutations(tmp_path, mutation):
+    _write_valid_repository(tmp_path)
+    yaml = YAML(typ="safe")
+    publish_path = tmp_path / ".github" / "workflows" / "publish.yml"
+    registry_path = tmp_path / ".github" / "workflows" / "publish-registry.yml"
+    publish = yaml.load(publish_path.read_text(encoding="utf-8"))
+    registry = yaml.load(registry_path.read_text(encoding="utf-8"))
+    verify = publish["jobs"]["verify"]
+    registry_job = registry["jobs"]["registry"]
+    run_step = _workflow_step(registry_job, "Verify exact publish workflow run")
+    download = _workflow_step(registry_job, "Download exact release artifact")
+    artifact = _workflow_step(registry_job, "Verify release artifact contents")
+    pypi = _workflow_step(registry_job, "Verify public PyPI files and provenance")
+
+    if mutation == "missing_run_id_input":
+        del registry["on"]["workflow_dispatch"]["inputs"]["publish_run_id"]
+    elif mutation == "malformed_run_id_validation":
+        validation = registry["jobs"]["validate"]["steps"][0]
+        validation["run"] = validation["run"].replace("*[!0-9]*", "*[!0-9a-f]*")
+    elif mutation == "shell_interpolated_run_id":
+        run_step["run"] += '\necho "${{ inputs.publish_run_id }}"\n'
+    elif mutation == "missing_actions_read":
+        del registry_job["permissions"]["actions"]
+    elif mutation == "extra_permission":
+        registry_job["permissions"]["packages"] = "write"
+    elif mutation == "pat_injection":
+        run_step["env"]["GH_TOKEN"] = "${{ secrets.RELEASE_PAT }}"
+    elif mutation == "github_api_after_oidc":
+        oidc = _workflow_step(registry_job, "Publish through GitHub OIDC")
+        oidc["run"] += "\ncurl https://api.github.com/repos/dreliq9/fcp-mcp\n"
+    elif mutation == "wrong_run_id":
+        run_step["run"] = run_step["run"].replace(".id == $run_id", ".id > 0")
+    elif mutation == "wrong_run_repository":
+        run_step["run"] = run_step["run"].replace(
+            '.repository.full_name == "dreliq9/fcp-mcp"',
+            '.repository.full_name == "attacker/fcp-mcp"',
+        )
+    elif mutation == "wrong_run_path":
+        run_step["run"] = run_step["run"].replace("publish.yml", "ci.yml")
+    elif mutation == "wrong_run_event":
+        run_step["run"] = run_step["run"].replace(
+            '.event == "push"', '.event == "workflow_dispatch"'
+        )
+    elif mutation == "wrong_run_status":
+        run_step["run"] = run_step["run"].replace(
+            '.status == "completed"', '.status == "in_progress"'
+        )
+    elif mutation == "wrong_run_conclusion":
+        run_step["run"] = run_step["run"].replace(
+            '.conclusion == "success"', '.conclusion != "failure"'
+        )
+    elif mutation == "wrong_run_head_sha":
+        run_step["run"] = run_step["run"].replace(
+            ".head_sha == $release_sha", ".head_sha != null"
+        )
+    elif mutation == "wrong_run_attempt":
+        run_step["run"] = run_step["run"].replace(".run_attempt == 1", ".run_attempt >= 1")
+    elif mutation == "moving_download_action":
+        download["uses"] = "actions/download-artifact@v8"
+    elif mutation == "missing_download_token":
+        del download["with"]["github-token"]
+    elif mutation == "missing_download_repository":
+        del download["with"]["repository"]
+    elif mutation == "missing_download_run_id":
+        del download["with"]["run-id"]
+    elif mutation == "download_over_checkout":
+        download["with"]["path"] = "."
+    elif mutation == "digest_mismatch_warning":
+        download["with"]["digest-mismatch"] = "warn"
+    elif mutation == "manifest_before_final_smoke":
+        steps = verify["steps"]
+        manifest = _workflow_step(verify, "Create release checksum manifest")
+        smoke = _workflow_step(verify, "Import installed workflow package on Python 3.10")
+        steps[steps.index(manifest)], steps[steps.index(smoke)] = smoke, manifest
+    elif mutation == "extra_release_file":
+        upload = _workflow_step(verify, "Upload verified distributions")
+        upload["with"]["path"] += "dist/extra.whl\n"
+    elif mutation == "missing_release_wheel":
+        upload = _workflow_step(verify, "Upload verified distributions")
+        upload["with"]["path"] = upload["with"]["path"].replace(
+            "dist/fcp_mcp-0.3.0-py3-none-any.whl\n", ""
+        )
+    elif mutation == "malformed_manifest_row":
+        artifact["run"] = artifact["run"].replace("[0-9a-f]{64}", "[0-9a-f]+", 1)
+    elif mutation == "duplicate_manifest_row":
+        artifact["run"] = artifact["run"].replace(
+            "dist/fcp_mcp-0[.]3[.]0[.]tar[.]gz$",
+            "dist/fcp_mcp-0[.]3[.]0-py3-none-any[.]whl$",
+        )
+    elif mutation == "altered_manifest_filename":
+        artifact["run"] = artifact["run"].replace(
+            "fcp-mcp-v0.3.0.sha256", "checksums.txt"
+        )
+    elif mutation == "pypi_filename_only":
+        pypi["run"] = pypi["run"].replace(".digests.sha256 == $wheel_sha", "true")
+    elif mutation == "pypi_only_one_file":
+        pypi["run"] = pypi["run"].replace("(.urls | length == 2)", "(.urls | length >= 1)")
+    elif mutation == "pypi_digest_mismatch":
+        pypi["run"] = pypi["run"].replace(
+            ".digests.sha256 == $sdist_sha", ".digests.sha256 != $sdist_sha"
+        )
+    elif mutation == "pypi_extra_distribution":
+        pypi["run"] = pypi["run"].replace("(.urls | length == 2)", "(.urls | length >= 2)")
+    elif mutation == "pypi_yanked_file":
+        pypi["run"] = pypi["run"].replace(".yanked == false", ".yanked == true", 1)
+    elif mutation == "pypi_retry_fallthrough":
+        pypi["run"] = pypi["run"].replace("\nexit 1\n", "\nexit 0\n")
+    elif mutation == "missing_wheel_provenance":
+        pypi["run"] = pypi["run"].replace(
+            'jq -e "$provenance_query" "$wheel_provenance" && \\\n', ""
+        )
+    elif mutation == "wrong_provenance_repository":
+        pypi["run"] = pypi["run"].replace(
+            '.publisher.repository == "dreliq9/fcp-mcp"',
+            '.publisher.repository == "attacker/fcp-mcp"',
+        )
+    elif mutation == "missing_attestation_requirement":
+        pypi["run"] = pypi["run"].replace(
+            "(.attestations | length) >= 1", "(.attestations | length) >= 0"
+        )
+    elif mutation == "oidc_before_provenance":
+        steps = registry_job["steps"]
+        oidc = _workflow_step(registry_job, "Publish through GitHub OIDC")
+        steps[steps.index(oidc)], steps[steps.index(pypi)] = pypi, oidc
+
+    writer = YAML()
+    with publish_path.open("w", encoding="utf-8") as stream:
+        writer.dump(publish, stream)
+    with registry_path.open("w", encoding="utf-8") as stream:
+        writer.dump(registry, stream)
+
+    findings = check(tmp_path)
+    assert any(".github/workflows/publish" in finding for finding in findings), mutation
 
 
 def test_checker_reports_windows_source_and_linux_product_job(tmp_path):
@@ -1067,7 +1265,13 @@ def test_checker_binds_published_artifact_to_exact_verify_producer(
         text = text.replace(f"name: {RELEASE_ARTIFACT}", "name: other-dist", 1)
         text = text.replace(f"name: {RELEASE_ARTIFACT}", "name: other-dist", 1)
     elif mutation == "producer_path":
-        text = text.replace("          path: dist/\n", "          path: build/\n", 1)
+        text = text.replace(
+            "          path: |\n"
+            "            dist/fcp_mcp-0.3.0-py3-none-any.whl\n",
+            "          path: |\n"
+            "            build/fcp_mcp-0.3.0-py3-none-any.whl\n",
+            1,
+        )
     elif mutation == "producer_missing_policy":
         text = text.replace("          if-no-files-found: error\n", "", 1)
     elif mutation == "moving_upload_tag":

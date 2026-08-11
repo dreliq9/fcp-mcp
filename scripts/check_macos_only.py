@@ -45,6 +45,7 @@ PUBLISH_ACTION = (
     "pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e"
 )
 RELEASE_ARTIFACT = "fcp-mcp-v0.3.0-release-dist"
+RELEASE_MANIFEST = "fcp-mcp-v0.3.0.sha256"
 REGISTRY_WORKFLOW = ".github/workflows/publish-registry.yml"
 REGISTRY_PUBLISHER_DIGEST = (
     "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
@@ -313,7 +314,7 @@ def _check_publish_job(job: Any, findings: list[str]) -> None:
             not isinstance(inputs, dict)
             or set(inputs) != {"name", "path"}
             or inputs.get("name") != RELEASE_ARTIFACT
-            or inputs.get("path") != "dist/"
+            or inputs.get("path") != "."
         ):
             findings.append(f"{prefix} artifact download inputs are not isolated")
 
@@ -347,9 +348,13 @@ def _check_verify_producer(verify: Any, findings: list[str]) -> None:
         "uses": UPLOAD_ACTION,
         "with": {
             "name": RELEASE_ARTIFACT,
-            "path": "dist/",
+            "path": (
+                "dist/fcp_mcp-0.3.0-py3-none-any.whl\n"
+                "dist/fcp_mcp-0.3.0.tar.gz\n"
+                f"{RELEASE_MANIFEST}\n"
+            ),
             "if-no-files-found": "error",
-            "retention-days": 1,
+            "retention-days": 7,
         },
     }
     allowed_actions = {CHECKOUT_ACTION, SETUP_PYTHON_ACTION, UPLOAD_ACTION}
@@ -453,13 +458,32 @@ def _expected_verify_job() -> dict[str, Any]:
                 ),
             },
             {
+                "name": "Create release checksum manifest",
+                "run": (
+                    "set -euo pipefail\n"
+                    'actual_files="$(find dist -mindepth 1 -maxdepth 1 -type f '
+                    '-print | LC_ALL=C sort)"\n'
+                    'expected_files="$(printf \'%s\\n\' \\\n'
+                    "  dist/fcp_mcp-0.3.0-py3-none-any.whl \\\n"
+                    '  dist/fcp_mcp-0.3.0.tar.gz)"\n'
+                    'test "$actual_files" = "$expected_files"\n'
+                    "shasum -a 256 \\\n"
+                    "  dist/fcp_mcp-0.3.0-py3-none-any.whl \\\n"
+                    f"  dist/fcp_mcp-0.3.0.tar.gz > {RELEASE_MANIFEST}\n"
+                ),
+            },
+            {
                 "name": "Upload verified distributions",
                 "uses": UPLOAD_ACTION,
                 "with": {
                     "name": RELEASE_ARTIFACT,
-                    "path": "dist/",
+                    "path": (
+                        "dist/fcp_mcp-0.3.0-py3-none-any.whl\n"
+                        "dist/fcp_mcp-0.3.0.tar.gz\n"
+                        f"{RELEASE_MANIFEST}\n"
+                    ),
                     "if-no-files-found": "error",
-                    "retention-days": 1,
+                    "retention-days": 7,
                 },
             },
         ],
@@ -543,7 +567,46 @@ case "$RELEASE_SHA" in
   {REGISTRY_RELEASE_SHA_PATTERN}) ;;
   *) echo "release_sha must be a full lowercase 40-hex commit SHA" >&2; exit 1 ;;
 esac
+case "$PUBLISH_RUN_ID" in
+  ''|*[!0-9]*) echo "publish_run_id must be a decimal workflow run ID" >&2; exit 1 ;;
+esac
 '''
+    )
+    run_identity = _normalize_run(
+        '''set -euo pipefail
+run_json="$RUNNER_TEMP/publish-run.json"
+curl --fail --silent --show-error --location --max-time 20 --retry 0 \\
+  --header "Accept: application/vnd.github+json" \\
+  --header "Authorization: Bearer $GH_TOKEN" \\
+  --header "X-GitHub-Api-Version: 2022-11-28" \\
+  --output "$run_json" \\
+  "https://api.github.com/repos/dreliq9/fcp-mcp/actions/runs/$PUBLISH_RUN_ID"
+jq -e --argjson run_id "$PUBLISH_RUN_ID" --arg release_sha "$RELEASE_SHA" '
+  .id == $run_id and
+  .repository.full_name == "dreliq9/fcp-mcp" and
+  .path == ".github/workflows/publish.yml" and
+  .event == "push" and
+  .status == "completed" and
+  .conclusion == "success" and
+  .head_sha == $release_sha and
+  .run_attempt == 1
+' "$run_json"'''
+    )
+    artifact = _normalize_run(
+        f'''set -euo pipefail
+artifact_dir="$RUNNER_TEMP/fcp-mcp-v0.3.0-release-dist"
+manifest="$artifact_dir/{RELEASE_MANIFEST}"
+actual_entries="$(cd "$artifact_dir" && find . -mindepth 1 -print | LC_ALL=C sort)"
+expected_entries="$(printf '%s\\n' \\
+  ./dist \\
+  ./dist/fcp_mcp-0.3.0-py3-none-any.whl \\
+  ./dist/fcp_mcp-0.3.0.tar.gz \\
+  ./{RELEASE_MANIFEST})"
+test "$actual_entries" = "$expected_entries"
+test "$(wc -l < "$manifest" | tr -d '[:space:]')" = "2"
+sed -n '1p' "$manifest" | grep -Eq '^[0-9a-f]{{64}}  dist/fcp_mcp-0[.]3[.]0-py3-none-any[.]whl$'
+sed -n '2p' "$manifest" | grep -Eq '^[0-9a-f]{{64}}  dist/fcp_mcp-0[.]3[.]0[.]tar[.]gz$'
+(cd "$artifact_dir" && sha256sum -c {RELEASE_MANIFEST})'''
     )
     identity = _normalize_run(
         '''set -euo pipefail
@@ -561,22 +624,66 @@ test "$(jq -r '.packages[0].version' server.json)" = "0.3.0"
 test "$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')" = "0.3.0"'''
     )
     pypi = _normalize_run(
-        '''set -euo pipefail
+        f'''set -euo pipefail
+artifact_dir="$RUNNER_TEMP/fcp-mcp-v0.3.0-release-dist"
+manifest="$artifact_dir/{RELEASE_MANIFEST}"
 package_json="$RUNNER_TEMP/pypi-fcp-mcp-0.3.0.json"
+wheel_provenance="$RUNNER_TEMP/pypi-wheel-provenance.json"
+sdist_provenance="$RUNNER_TEMP/pypi-sdist-provenance.json"
+wheel_sha="$(sed -n '1s/  dist\\/fcp_mcp-0[.]3[.]0-py3-none-any[.]whl$//p' "$manifest")"
+sdist_sha="$(sed -n '2s/  dist\\/fcp_mcp-0[.]3[.]0[.]tar[.]gz$//p' "$manifest")"
+provenance_query='
+  [.attestation_bundles[] | select(
+    .publisher.kind == "GitHub" and
+    .publisher.repository == "dreliq9/fcp-mcp" and
+    .publisher.workflow == "publish.yml" and
+    (.attestations | length) >= 1
+  )] | length >= 1
+'
 for attempt in $(seq 1 12); do
   if curl --fail --silent --show-error --location --max-time 20 --retry 0 \\
     --output "$package_json" \\
     https://pypi.org/pypi/fcp-mcp/0.3.0/json && \\
-    jq -e --arg name "fcp-mcp" --arg version "0.3.0" \\
-      '.info.name == $name and .info.version == $version and ([.urls[] | select(.filename == "fcp_mcp-0.3.0-py3-none-any.whl")] | length == 1)' \\
-      "$package_json"; then
+    jq -e \\
+      --arg name "fcp-mcp" \\
+      --arg version "0.3.0" \\
+      --arg wheel "fcp_mcp-0.3.0-py3-none-any.whl" \\
+      --arg sdist "fcp_mcp-0.3.0.tar.gz" \\
+      --arg wheel_sha "$wheel_sha" \\
+      --arg sdist_sha "$sdist_sha" '
+        .info.name == $name and
+        .info.version == $version and
+        (.urls | length == 2) and
+        ([.urls[] | select(
+          .filename == $wheel and
+          .packagetype == "bdist_wheel" and
+          .digests.sha256 == $wheel_sha and
+          .yanked == false
+        )] | length == 1) and
+        ([.urls[] | select(
+          .filename == $sdist and
+          .packagetype == "sdist" and
+          .digests.sha256 == $sdist_sha and
+          .yanked == false
+        )] | length == 1)
+      ' "$package_json" && \\
+    curl --fail --silent --show-error --location --max-time 20 --retry 0 \\
+      --header "Accept: application/vnd.pypi.integrity.v1+json" \\
+      --output "$wheel_provenance" \\
+      https://pypi.org/integrity/fcp-mcp/0.3.0/fcp_mcp-0.3.0-py3-none-any.whl/provenance && \\
+    curl --fail --silent --show-error --location --max-time 20 --retry 0 \\
+      --header "Accept: application/vnd.pypi.integrity.v1+json" \\
+      --output "$sdist_provenance" \\
+      https://pypi.org/integrity/fcp-mcp/0.3.0/fcp_mcp-0.3.0.tar.gz/provenance && \\
+    jq -e "$provenance_query" "$wheel_provenance" && \\
+    jq -e "$provenance_query" "$sdist_provenance"; then
     exit 0
   fi
   if [ "$attempt" -lt 12 ]; then
     sleep 10
   fi
 done
-echo "PyPI fcp-mcp 0.3.0 was not publicly available" >&2
+echo "PyPI fcp-mcp 0.3.0 files or provenance did not match the release artifact" >&2
 exit 1'''
     )
     publisher = _normalize_run(
@@ -625,8 +732,11 @@ exit 1'''
             "permissions": {},
             "steps": [
                 {
-                    "name": "Validate source and release SHA",
-                    "env": {"RELEASE_SHA": "${{ inputs.release_sha }}"},
+                    "name": "Validate source and release inputs",
+                    "env": {
+                        "PUBLISH_RUN_ID": "${{ inputs.publish_run_id }}",
+                        "RELEASE_SHA": "${{ inputs.release_sha }}",
+                    },
                     "run": validation,
                 }
             ],
@@ -635,8 +745,34 @@ exit 1'''
             "name": "Publish immutable v0.3.0 Registry metadata",
             "needs": "validate",
             "runs-on": PUBLISH_RUNNER,
-            "permissions": {"contents": "read", "id-token": "write"},
+            "permissions": {
+                "contents": "read",
+                "actions": "read",
+                "id-token": "write",
+            },
             "steps": [
+                {
+                    "name": "Verify exact publish workflow run",
+                    "env": {
+                        "GH_TOKEN": "${{ github.token }}",
+                        "PUBLISH_RUN_ID": "${{ inputs.publish_run_id }}",
+                        "RELEASE_SHA": "${{ inputs.release_sha }}",
+                    },
+                    "run": run_identity,
+                },
+                {
+                    "name": "Download exact release artifact",
+                    "uses": DOWNLOAD_ACTION,
+                    "with": {
+                        "name": RELEASE_ARTIFACT,
+                        "path": "${{ runner.temp }}/fcp-mcp-v0.3.0-release-dist",
+                        "github-token": "${{ github.token }}",
+                        "repository": "dreliq9/fcp-mcp",
+                        "run-id": "${{ inputs.publish_run_id }}",
+                        "digest-mismatch": "error",
+                    },
+                },
+                {"name": "Verify release artifact contents", "run": artifact},
                 {
                     "name": "Checkout immutable release SHA",
                     "uses": CHECKOUT_ACTION,
@@ -652,7 +788,7 @@ exit 1'''
                     "run": identity,
                 },
                 {"name": "Verify immutable release metadata", "run": metadata},
-                {"name": "Wait for public PyPI 0.3.0", "run": pypi},
+                {"name": "Verify public PyPI files and provenance", "run": pypi},
                 {"name": "Download verified mcp-publisher", "run": publisher},
                 {"name": "Publish through GitHub OIDC", "run": publish},
                 {"name": "Verify Registry response", "run": response},
@@ -672,7 +808,14 @@ def _check_registry_publish(root: Path, findings: list[str]) -> None:
                     "description": "40-hex commit SHA peeled from refs/tags/v0.3.0",
                     "required": True,
                     "type": "string",
-                }
+                },
+                "publish_run_id": {
+                    "description": (
+                        "Decimal workflow run ID that built and published v0.3.0"
+                    ),
+                    "required": True,
+                    "type": "string",
+                },
             }
         }
     }

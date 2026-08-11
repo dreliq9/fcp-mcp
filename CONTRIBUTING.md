@@ -120,9 +120,12 @@ maintainers must:
 2. Require a maintainer review on the GitHub `pypi` environment.
 3. Protect `v*` tags against unreviewed creation or replacement.
 
-The unprivileged workflow job repeats every release gate and uploads the
-verified distributions. Only the separate two-step publish job receives
-`id-token: write`. Do not add a long-lived PyPI token to the workflow.
+The unprivileged workflow job repeats every release gate, creates the exact
+two-line SHA-256 manifest for the wheel and sdist after all distribution smoke
+gates, and retains those three files as one immutable artifact for seven days.
+Only the separate two-step publish job receives `id-token: write`; it downloads
+the artifact at the repository root so the pinned PyPA publisher still sees
+only `dist/`. Do not add a long-lived PyPI token to the workflow.
 Apple-DTD and live-import checks remain local macOS release gates because CI
 runners do not contain the licensed Final Cut Pro application bundle.
 
@@ -133,17 +136,27 @@ available. Do not move or recreate the `v0.3.0` tag, and do not rerun PyPI
 publication for this version. After Task 9 creates the immutable `v0.3.0`
 tag, dispatch `.github/workflows/publish-registry.yml` from `main` only. Its
 required `release_sha` input is the full lowercase 40-hex SHA peeled from
-`refs/tags/v0.3.0`; the workflow rejects any other ref, checks out that exact
-SHA with full tag history, and proves both `HEAD` and the peeled explicit tag
-ref equal it before requesting Registry OIDC. A separate no-OIDC validation
-job fails (rather than skips) non-`main` dispatches and malformed input; the
-OIDC job receives the SHA through a quoted `RELEASE_SHA` environment variable,
-not shell interpolation. It never publishes a Python distribution.
+`refs/tags/v0.3.0`; `publish_run_id` is the decimal ID of that tag-triggered
+`publish.yml` run. The workflow rejects any other ref or malformed input, then
+uses only its short-lived `github.token` to prove that exact repository-owned
+run used `publish.yml`, was a first-attempt successful push, and built the
+declared release SHA. It downloads only that run's named artifact into the
+runner temporary directory with digest mismatch set to error. It then checks
+out the exact SHA with full tag history and proves both `HEAD` and the peeled
+explicit tag ref equal it before requesting Registry OIDC. A separate no-OIDC
+validation job fails (rather than skips) invalid dispatches; untrusted inputs
+reach shell only through quoted environment variables. It never publishes a
+Python distribution.
 
 The workflow downloads the pinned MCP publisher, verifies its SHA-256 before
-execution, verifies both `server.json` versions and the package version, then
-waits (with bounded retries) for PyPI's `0.3.0` JSON response. It fails closed
-unless the Registry detail response confirms
+execution, verifies both `server.json` versions and the package version, and
+fails closed unless the downloaded artifact contains exactly the expected
+wheel, sdist, and two-row checksum manifest with matching local hashes. Bounded
+PyPI retries require exactly those two non-yanked filenames, both public
+SHA-256 digests equal to the manifest, and Integrity API provenance for both
+files identifying GitHub repository `dreliq9/fcp-mcp`, workflow `publish.yml`,
+and at least one attestation. Only then can Registry OIDC be requested. The
+final Registry detail response must confirm
 `io.github.dreliq9/fcp-mcp`, PyPI package `fcp-mcp`, and version `0.3.0`.
 Do not add a Registry PAT or any long-lived Registry token to this workflow.
 
