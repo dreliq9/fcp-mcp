@@ -9,14 +9,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from .contracts import ErrorCode, FCPMCPError
 from .fcpxml.time_utils import RationalTime
+from .fcpxml.transaction import FCPXMLTransactionReceipt
+from .fcpxml.validator import FCPXMLValidator, ValidationResult
+from .observability import emit_event
 from .profiles import ToolClass
 from .result_models.handoff import YouTubeClipPlanGenerationResult
 from .tool_metadata import OFFLINE_WRITE
+from .utils.atomic_write import AtomicBundleItem, atomic_replace_bundle
 
 MATERIALIZED_SCHEMA = "youtube-mcp.materialized-clip-plan/v1"
 PROVENANCE_SCHEMA = "fcp-mcp.youtube-mcp-provenance/v1"
@@ -31,15 +37,19 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _load_manifest(runtime: Any, manifest_path: str) -> tuple[Path, dict[str, Any]]:
+def _load_manifest(
+    runtime: Any,
+    manifest_path: str,
+) -> tuple[Path, dict[str, Any], str]:
     path = runtime._resolve_input(
         manifest_path,
         suffixes={".json"},
         kind="youtube-mcp materialized clip-plan manifest",
     )
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        manifest_bytes = path.read_bytes()
+        data = json.loads(manifest_bytes.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FCPMCPError(
             ErrorCode.VALIDATION_FAILED,
             "youtube-mcp materialized clip-plan manifest is unreadable",
@@ -60,7 +70,87 @@ def _load_manifest(runtime: Any, manifest_path: str) -> tuple[Path, dict[str, An
             ErrorCode.VALIDATION_FAILED,
             "youtube-mcp materialized clip-plan contains no assets",
         )
-    return path, data
+    return path, data, hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def _validation_error(message: str, **details: Any) -> FCPMCPError:
+    return FCPMCPError(ErrorCode.VALIDATION_FAILED, message, details or None)
+
+
+def _validate_fcpxml_candidate(
+    path: Path,
+    validator: FCPXMLValidator,
+) -> ValidationResult:
+    result = validator.validate_file(path)
+    if not result.valid:
+        raise _validation_error(
+            f"Generated FCPXML did not pass structural validation: {result.summary()}",
+            issues=[
+                {
+                    "severity": issue.severity,
+                    "message": issue.message,
+                    "location": issue.location,
+                }
+                for issue in result.issues
+            ],
+        )
+    return result
+
+
+def _encode_provenance(provenance: dict[str, Any]) -> bytes:
+    return (json.dumps(provenance, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _validate_provenance_candidate(
+    path: Path,
+    expected: dict[str, Any],
+) -> None:
+    try:
+        candidate = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _validation_error("Generated provenance sidecar is not valid JSON") from error
+    if candidate != expected:
+        raise _validation_error(
+            "Generated provenance sidecar does not match its bound FCPXML attempt"
+        )
+
+
+def _existing_bundle_transaction_id(
+    destination: Path,
+    provenance_path: Path,
+    fcpxml_sha256: str,
+    provenance_without_transaction: dict[str, Any],
+) -> str | None:
+    if (
+        destination.is_symlink()
+        or provenance_path.is_symlink()
+        or not destination.is_file()
+        or not provenance_path.is_file()
+        or _sha256(destination) != fcpxml_sha256
+    ):
+        return None
+    try:
+        existing_bytes = provenance_path.read_bytes()
+        existing = json.loads(existing_bytes.decode("utf-8"))
+        transaction_id = str(existing.pop("transaction_id"))
+        canonical_transaction_id = str(uuid.UUID(transaction_id))
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        UnicodeDecodeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return None
+    if transaction_id != canonical_transaction_id or existing != provenance_without_transaction:
+        return None
+    expected = dict(provenance_without_transaction)
+    expected["transaction_id"] = canonical_transaction_id
+    if existing_bytes != _encode_provenance(expected):
+        return None
+    return canonical_transaction_id
 
 
 def _validated_assets(
@@ -119,7 +209,11 @@ def _validated_assets(
             raise FCPMCPError(
                 ErrorCode.ARTIFACT_CORRUPT,
                 f"Materialized clip {clip_id} SHA-256 does not match its handoff manifest",
-                details={"clip_id": clip_id, "expected_sha256": expected_sha, "actual_sha256": actual_sha},
+                details={
+                    "clip_id": clip_id,
+                    "expected_sha256": expected_sha,
+                    "actual_sha256": actual_sha,
+                },
             )
 
         item = dict(raw)
@@ -153,7 +247,11 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
         full-duration local assets because youtube-mcp already applied source trims.
         A `.sources.json` sidecar preserves original YouTube URLs/time ranges.
         """
-        source_manifest, manifest = _load_manifest(runtime, manifest_path)
+        started = time.perf_counter()
+        source_manifest, manifest, source_manifest_sha256 = _load_manifest(
+            runtime,
+            manifest_path,
+        )
         assets = _validated_assets(runtime, manifest)
 
         normalized_project = project_name.strip()
@@ -191,19 +289,16 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
             project_name=normalized_project,
             event_name="YouTube MCP Handoff",
         )
-        receipt = generator.save_with_receipt(
-            destination,
-            event_format=runtime.CONFIG.log_format,
-        )
-
-        provenance_path = receipt.destination.with_name(
-            receipt.destination.stem + ".sources.json"
-        )
-        provenance = {
+        fcpxml_bytes = f"{generator.to_string()}\n".encode()
+        fcpxml_sha256 = hashlib.sha256(fcpxml_bytes).hexdigest()
+        provenance_path = destination.with_name(destination.stem + ".sources.json")
+        provenance_without_transaction = {
             "schema": PROVENANCE_SCHEMA,
             "project": normalized_project,
-            "fcpxml_path": str(receipt.destination),
+            "fcpxml_path": str(destination),
+            "fcpxml_sha256": fcpxml_sha256,
             "source_manifest_path": str(source_manifest),
+            "source_manifest_sha256": source_manifest_sha256,
             "source_manifest_schema": manifest.get("schema"),
             "plan_revision": manifest.get("plan_revision"),
             "materialization_revision": manifest.get("materialization_revision"),
@@ -228,18 +323,104 @@ def register_youtube_clip_plan_tool(runtime: Any) -> None:
                 for asset in assets
             ],
         }
-        runtime.atomic_replace_bytes(
+        transaction_id = _existing_bundle_transaction_id(
+            destination,
             provenance_path,
-            (json.dumps(provenance, indent=2, ensure_ascii=False) + "\n").encode("utf-8"),
-            event_format=runtime.CONFIG.log_format,
+            fcpxml_sha256,
+            provenance_without_transaction,
+        ) or str(uuid.uuid4())
+        provenance = dict(provenance_without_transaction)
+        provenance["transaction_id"] = transaction_id
+        provenance_bytes = _encode_provenance(provenance)
+        validator = FCPXMLValidator()
+        latest_validation: ValidationResult | None = None
+
+        def validate_fcpxml(path: Path) -> None:
+            nonlocal latest_validation
+            latest_validation = _validate_fcpxml_candidate(path, validator)
+
+        def validate_provenance(path: Path) -> None:
+            _validate_provenance_candidate(path, provenance)
+
+        try:
+            bundle_receipt = atomic_replace_bundle(
+                (
+                    AtomicBundleItem(destination, fcpxml_bytes, validate_fcpxml),
+                    AtomicBundleItem(
+                        provenance_path,
+                        provenance_bytes,
+                        validate_provenance,
+                    ),
+                ),
+                event_format=runtime.CONFIG.log_format,
+                transaction_id=transaction_id,
+            )
+        except FCPMCPError as error:
+            emit_event(
+                {
+                    "event": "fcpxml_transaction",
+                    "operation": "youtube_clip_plan_bundle",
+                    "transaction_id": transaction_id,
+                    "input_path": str(source_manifest),
+                    "output_path": str(destination),
+                    "input_sha256": source_manifest_sha256,
+                    "validation_outcome": "failed",
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                    "disposition": "failed",
+                    "error_code": error.code.value,
+                },
+                format=runtime.CONFIG.log_format,
+            )
+            raise
+        primary = bundle_receipt.items[0]
+        receipt = FCPXMLTransactionReceipt(
+            transaction_id=bundle_receipt.transaction_id,
+            source=None,
+            destination=primary.destination,
+            backup_path=primary.backup_path,
+            input_sha256=None,
+            prior_sha256=primary.prior_sha256,
+            output_sha256=primary.output_sha256,
+            validation_warnings=tuple(
+                issue.message
+                for issue in (latest_validation.issues if latest_validation else ())
+                if issue.severity == "warning"
+            ),
+            elapsed_ms=round((time.perf_counter() - started) * 1000),
+        )
+        emit_event(
+            {
+                "event": "fcpxml_transaction",
+                "operation": "youtube_clip_plan_bundle",
+                "transaction_id": receipt.transaction_id,
+                "input_path": str(source_manifest),
+                "output_path": str(receipt.destination),
+                "input_sha256": source_manifest_sha256,
+                "prior_sha256": receipt.prior_sha256,
+                "output_sha256": receipt.output_sha256,
+                "backup_path": str(receipt.backup_path) if receipt.backup_path else None,
+                "validation_outcome": "valid",
+                "elapsed_ms": receipt.elapsed_ms,
+                "disposition": receipt.disposition,
+                "bundle_replayed": bundle_receipt.replayed,
+            },
+            format=runtime.CONFIG.log_format,
         )
 
         return YouTubeClipPlanGenerationResult(
             project=normalized_project,
             selected_clip_count=len(assets),
             target_duration_seconds=total_duration,
-            plan_revision=(str(manifest.get("plan_revision")) if manifest.get("plan_revision") is not None else None),
-            materialization_revision=(str(manifest.get("materialization_revision")) if manifest.get("materialization_revision") is not None else None),
+            plan_revision=(
+                str(manifest.get("plan_revision"))
+                if manifest.get("plan_revision") is not None
+                else None
+            ),
+            materialization_revision=(
+                str(manifest.get("materialization_revision"))
+                if manifest.get("materialization_revision") is not None
+                else None
+            ),
             hashes_verified=True,
             destination=runtime._artifact_reference(receipt),
             provenance=runtime._artifact_reference_for_path(

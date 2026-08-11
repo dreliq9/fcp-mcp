@@ -47,8 +47,20 @@ The tool:
 4. requires a valid SHA-256 digest and verifies every materialized asset's content,
 5. preserves manifest ordering,
 6. uses the existing `FCPXMLGenerator` to create a native primary-storyline timeline,
-7. commits the FCPXML through the existing atomic generator transaction path,
-8. writes `<project>.sources.json` with the original YouTube URLs, source time ranges, clip hashes, plan revision, and materialization revision.
+7. builds and validates the FCPXML and `<project>.sources.json` candidates before changing either destination,
+8. binds the sidecar to the exact FCPXML digest, output path, source-manifest digest, and shared transaction ID,
+9. durably stages and commits the pair through one recoverable bundle transaction, and
+10. returns destination, provenance, and receipt references for that same committed attempt.
+
+The bundle transaction does not claim that two POSIX replacements happen
+simultaneously. It serializes conflicting writers and coordinates the two
+single-path replacements with same-directory stages, rollback copies, and a
+durable integrity-checked journal. A handled failure restores both outputs to
+their exact prior state, including prior absence. A later conflicting invocation reconciles an
+interrupted non-terminal journal before starting new work; ambiguous or
+tampered recovery evidence returns `recovery_required` without overwriting the
+observed destinations. An identical retry of an already committed pair reuses
+the bound transaction identity and creates no duplicate logical effect.
 
 Materialized youtube-mcp assets have already been source-trimmed. FCP-MCP therefore uses each local clip from `0s` for its full `duration_s`; it does not reinterpret the original YouTube in/out points.
 
@@ -73,6 +85,12 @@ This is intentional: provenance and SHA validation establish media identity, but
 
 ## Provenance
 
-The `.sources.json` sidecar is deliberately separate from FCPXML creative semantics. It preserves the exact research/media lineage without adding visible timeline markers or abusing Final Cut metadata fields.
+The `.sources.json` sidecar is deliberately separate from FCPXML creative
+semantics. It preserves the exact research/media lineage without adding visible
+timeline markers or abusing Final Cut metadata fields. In addition to the
+existing source records and revisions, it carries `transaction_id`,
+`fcpxml_sha256`, and `source_manifest_sha256`. These fields bind the sidecar to
+the exact generated timeline, immutable handoff-manifest identity, destination,
+and public primary receipt.
 
 Publication rights are not inferred by either MCP. The provenance is retained so a human or downstream policy layer can evaluate attribution, licensing, platform policy, and fair-use/fair-dealing context before distribution.

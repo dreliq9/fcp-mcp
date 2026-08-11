@@ -14,6 +14,7 @@ from fcp_mcp.fcpxml.generator import FCPXMLGenerator
 from fcp_mcp.registry import ToolRegistry
 from fcp_mcp.result_models.common import ArtifactReference
 from fcp_mcp.result_models.fcpxml import TransactionReceiptResult
+from fcp_mcp.result_models.handoff import YouTubeClipPlanGenerationResult
 from fcp_mcp.utils.atomic_write import atomic_replace_bytes
 from fcp_mcp.youtube_clip_plan import (
     MATERIALIZED_SCHEMA,
@@ -42,9 +43,7 @@ def _runtime(tmp_path: Path):
         default_name=None,
         suffixes=(),
     ) -> Path:
-        destination = (
-            Path(output_path) if output_path else tmp_path / str(default_name)
-        ).resolve()
+        destination = (Path(output_path) if output_path else tmp_path / str(default_name)).resolve()
         if suffixes and destination.suffix.lower() not in suffixes:
             raise FCPMCPError(ErrorCode.INVALID_PATH, "bad output suffix")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -160,6 +159,109 @@ def test_handoff_generates_native_fcpxml_and_provenance(tmp_path: Path) -> None:
     assert "verify_hashes" not in provenance
     assert provenance["timeline_order"] == ["clip-001", "clip-002"]
     assert provenance["sources"][0]["source_start_s"] == 98.0
+    assert provenance["transaction_id"] == result.receipt.transaction_id
+    assert provenance["fcpxml_path"] == result.destination.path
+    assert provenance["fcpxml_sha256"] == result.destination.sha256
+    assert provenance["source_manifest_path"] == str(
+        Path(result.provenance.path).with_name("handoff.json").resolve()
+    )
+    assert provenance["source_manifest_sha256"] == _sha256(Path(provenance["source_manifest_path"]))
+    assert result.receipt.output_sha256 == result.destination.sha256
+
+
+def test_handoff_overwrite_and_identical_retry_keep_one_bound_logical_effect(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    manifest = _manifest(tmp_path)
+    destination = tmp_path / "frontier.fcpxml"
+    provenance_path = tmp_path / "frontier.sources.json"
+    destination.write_bytes(b"old timeline")
+    provenance_path.write_bytes(b'{"old": true}\n')
+
+    first = handler(
+        str(manifest),
+        project_name="Frontier Montage",
+        output_path=str(destination),
+    )
+    first_backups = sorted(tmp_path.glob("*.bak.*"))
+    second = handler(
+        str(manifest),
+        project_name="Frontier Montage",
+        output_path=str(destination),
+    )
+
+    assert first.receipt.transaction_id == second.receipt.transaction_id
+    assert first.destination == second.destination
+    assert first.provenance == second.provenance
+    assert len(first_backups) == 2
+    assert sorted(tmp_path.glob("*.bak.*")) == first_backups
+    assert first.receipt.backup_path is not None
+    assert Path(first.receipt.backup_path).read_bytes() == b"old timeline"
+    provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+    assert provenance["transaction_id"] == second.receipt.transaction_id
+    assert provenance["fcpxml_sha256"] == _sha256(destination)
+
+
+def test_invalid_sidecar_candidate_preserves_existing_output_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import fcp_mcp.youtube_clip_plan as clip_plan_module
+
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    destination = tmp_path / "frontier.fcpxml"
+    provenance_path = tmp_path / "frontier.sources.json"
+    destination.write_bytes(b"old timeline")
+    provenance_path.write_bytes(b'{"old": true}\n')
+    monkeypatch.setattr(
+        clip_plan_module,
+        "_encode_provenance",
+        lambda _provenance: b"not-json",
+    )
+
+    with pytest.raises(FCPMCPError) as caught:
+        handler(
+            str(_manifest(tmp_path)),
+            output_path=str(destination),
+        )
+
+    assert caught.value.code is ErrorCode.VALIDATION_FAILED
+    assert destination.read_bytes() == b"old timeline"
+    assert provenance_path.read_bytes() == b'{"old": true}\n'
+
+
+def test_handoff_failure_emits_the_standard_transaction_failure_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import fcp_mcp.youtube_clip_plan as clip_plan_module
+
+    runtime = _runtime(tmp_path)
+    runtime.CONFIG.log_format = "json"
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    monkeypatch.setattr(
+        clip_plan_module,
+        "_encode_provenance",
+        lambda _provenance: b"not-json",
+    )
+
+    with pytest.raises(FCPMCPError):
+        handler(
+            str(_manifest(tmp_path)),
+            output_path=str(tmp_path / "frontier.fcpxml"),
+        )
+
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    transaction_events = [event for event in events if event["event"] == "fcpxml_transaction"]
+    assert len(transaction_events) == 1
+    assert transaction_events[0]["operation"] == "youtube_clip_plan_bundle"
+    assert transaction_events[0]["validation_outcome"] == "failed"
+    assert transaction_events[0]["disposition"] == "failed"
+    assert transaction_events[0]["error_code"] == ErrorCode.VALIDATION_FAILED.value
 
 
 def test_handoff_rejects_tampered_materialized_media(tmp_path: Path) -> None:
@@ -212,9 +314,7 @@ def test_handoff_requires_a_hex_sha256_and_accepts_uppercase_digest(tmp_path: Pa
     assert exc.value.code == ErrorCode.ARTIFACT_CORRUPT
     assert "no valid SHA-256" in str(exc.value)
 
-    payload["assets"][0]["sha256"] = _sha256(
-        Path(payload["assets"][0]["path"])
-    ).upper()
+    payload["assets"][0]["sha256"] = _sha256(Path(payload["assets"][0]["path"])).upper()
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     result = handler(str(manifest), output_path=str(tmp_path / "uppercase.fcpxml"))
     assert result.hashes_verified is True
@@ -225,6 +325,33 @@ def test_handoff_has_no_public_hash_verification_opt_out(tmp_path: Path) -> None
     handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
 
     assert "verify_hashes" not in inspect.signature(handler).parameters
+
+
+def test_handoff_preserves_public_signature_and_result_schema(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    signature = inspect.signature(handler)
+
+    assert list(signature.parameters) == [
+        "manifest_path",
+        "project_name",
+        "output_path",
+    ]
+    assert signature.parameters["manifest_path"].default is inspect.Parameter.empty
+    assert signature.parameters["project_name"].default == "YouTube Remix"
+    assert signature.parameters["output_path"].default == ""
+    assert set(YouTubeClipPlanGenerationResult.model_fields) == {
+        "schema_version",
+        "project",
+        "selected_clip_count",
+        "target_duration_seconds",
+        "plan_revision",
+        "materialization_revision",
+        "hashes_verified",
+        "destination",
+        "provenance",
+        "receipt",
+    }
 
 
 def test_registration_is_idempotent(tmp_path: Path) -> None:
