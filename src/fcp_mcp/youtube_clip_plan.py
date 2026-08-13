@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 import uuid
 from pathlib import Path
@@ -207,10 +208,10 @@ def _validated_assets(
                 ErrorCode.VALIDATION_FAILED,
                 f"Materialized clip {clip_id} has invalid duration_s",
             ) from exc
-        if duration_s <= 0:
+        if not math.isfinite(duration_s) or duration_s <= 0:
             raise FCPMCPError(
                 ErrorCode.VALIDATION_FAILED,
-                f"Materialized clip {clip_id} duration_s must be positive",
+                f"Materialized clip {clip_id} duration_s must be finite and positive",
             )
 
         expected_sha = str(raw.get("sha256") or "")

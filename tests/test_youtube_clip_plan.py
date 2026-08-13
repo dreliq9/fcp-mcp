@@ -467,6 +467,27 @@ def test_handoff_rejects_unknown_schema(tmp_path: Path) -> None:
     assert exc.value.code == ErrorCode.UNSUPPORTED_CONTRACT
 
 
+@pytest.mark.parametrize("duration_s", ["NaN", "Infinity", "-Infinity"])
+def test_handoff_rejects_non_finite_materialized_durations(
+    tmp_path: Path,
+    duration_s: str,
+) -> None:
+    runtime = _runtime(tmp_path)
+    handler = runtime.TOOLS.definitions["fcpxml_generate_from_clip_plan"].handler
+    manifest = _manifest(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["assets"][0]["duration_s"] = duration_s
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    destination = tmp_path / "non-finite.fcpxml"
+
+    with pytest.raises(FCPMCPError) as exc:
+        handler(str(manifest), output_path=str(destination))
+
+    assert exc.value.code == ErrorCode.VALIDATION_FAILED
+    assert not destination.exists()
+    assert not (tmp_path / "non-finite.sources.json").exists()
+
+
 @pytest.mark.parametrize("root", [[], None, "not-a-manifest", 3])
 def test_handoff_rejects_non_object_manifest_roots(tmp_path: Path, root: object) -> None:
     runtime = _runtime(tmp_path)
