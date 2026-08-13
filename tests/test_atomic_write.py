@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 import fcp_mcp.utils.atomic_write as atomic_write_module
-from fcp_mcp.contracts import FCPMCPError
+from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.utils.atomic_write import _sync_directory, atomic_replace_bytes
 
 
@@ -50,6 +50,43 @@ def test_post_commit_failure_restores_existing_destination(tmp_path: Path):
         atomic_replace_bytes(destination, b"after", validate=validate)
 
     assert destination.read_bytes() == b"before"
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_postcommit_rollback_failure_preserves_new_destination_and_old_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch loss of both new output and rollback evidence when restore fails."""
+    destination = tmp_path / "out.txt"
+    destination.write_bytes(b"before")
+
+    def reject_committed(path: Path) -> None:
+        if path == destination:
+            raise ValueError("post-commit rejection")
+
+    original_replace = atomic_write_module.os.replace
+    replacement_count = 0
+
+    def fail_rollback_replace(source: str | Path, target: str | Path) -> None:
+        nonlocal replacement_count
+        if Path(target) == destination:
+            replacement_count += 1
+            if replacement_count == 2:
+                raise OSError("rollback denied")
+        original_replace(source, target)
+
+    monkeypatch.setattr(atomic_write_module.os, "replace", fail_rollback_replace)
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bytes(destination, b"after", validate=reject_committed)
+
+    assert caught.value.code is ErrorCode.TRANSACTION_FAILED
+    assert "rollback failed" in caught.value.message.lower()
+    assert destination.read_bytes() == b"after"
+    backups = list(tmp_path.glob("out.txt.bak.*"))
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == b"before"
     assert list(tmp_path.glob("*.tmp")) == []
 
 

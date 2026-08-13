@@ -559,14 +559,42 @@ def _load_bundle_journal(
     key: str,
     destinations: Sequence[Path],
 ) -> _BundleJournal:
+    descriptor = -1
     try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
         entry = path.lstat()
-        if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1 or entry.st_size > 65536:
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_uid != os.geteuid()
+            or opened.st_nlink != 1
+            or opened.st_size > 65536
+            or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)
+        ):
             raise ValueError("journal is not a bounded regular file")
-        raw = path.read_bytes()
+        chunks: list[bytes] = []
+        read_size = 0
+        while read_size <= 65536:
+            chunk = os.read(descriptor, 65537 - read_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            read_size += len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
         current = path.lstat()
-        if (entry.st_dev, entry.st_ino) != (current.st_dev, current.st_ino):
-            raise ValueError("journal identity changed")
+        if (
+            read_size > 65536
+            or opened.st_size != read_size
+            or opened.st_size != after.st_size
+            or (opened.st_dev, opened.st_ino) != (after.st_dev, after.st_ino)
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise ValueError("journal identity or size changed")
         data = json.loads(raw.decode("utf-8"))
         if not isinstance(data, dict):
             raise TypeError("journal root is not an object")
@@ -660,6 +688,12 @@ def _load_bundle_journal(
             "Bundle recovery journal is malformed or ambiguous",
             journal_path=str(path),
         ) from error
+    finally:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _replace_bundle_journal(

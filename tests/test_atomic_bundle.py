@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import stat
 import threading
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -18,6 +21,8 @@ from fcp_mcp.utils.atomic_write import (
     _write_exclusive,
     atomic_replace_bundle,
 )
+
+_PRIOR = (b"old timeline", b'{"old": true}\n')
 
 
 def _sha256_bytes(payload: bytes) -> str:
@@ -113,6 +118,120 @@ def _inject_boundary_failure(
         real_replace(source, destination)
 
     monkeypatch.setattr(atomic_write_module.os, "replace", replace)
+
+
+@dataclass(frozen=True)
+class _HotBundle:
+    attempt: str
+    items: tuple[AtomicBundleItem, AtomicBundleItem]
+    journal: Path
+
+    @property
+    def destinations(self) -> tuple[Path, Path]:
+        return tuple(Path(item.destination) for item in self.items)
+
+
+def _interrupt_hot_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    boundary: str = "before_first",
+    committed: bool = False,
+) -> _HotBundle:
+    attempt, items = _bundle(tmp_path)
+    destinations = tuple(Path(item.destination) for item in items)
+    for destination, payload in zip(destinations, _PRIOR):
+        destination.write_bytes(payload)
+    if committed:
+        original_write = atomic_write_module._write_exclusive
+
+        def interrupt(path: Path, payload: bytes) -> None:
+            if path.name.endswith(f".{attempt}.receipt.json"):
+                raise KeyboardInterrupt("interrupted before receipt")
+            original_write(path, payload)
+
+        monkeypatch.setattr(atomic_write_module, "_write_exclusive", interrupt)
+    else:
+        _inject_boundary_failure(
+            monkeypatch,
+            destinations,
+            boundary=boundary,
+            error=KeyboardInterrupt(f"interrupted {boundary}"),
+        )
+    with pytest.raises(KeyboardInterrupt):
+        atomic_replace_bundle(items, transaction_id=attempt)
+    if committed:
+        monkeypatch.setattr(atomic_write_module, "_write_exclusive", original_write)
+    return _HotBundle(attempt, items, _journal_paths(tmp_path)[0])
+
+
+def _record_journal_descriptors(
+    monkeypatch: pytest.MonkeyPatch,
+    journal: Path,
+    after_open: Callable[[], None] | None = None,
+) -> list[int]:
+    original_open = os.open
+    descriptors: list[int] = []
+
+    def record_open(path: str | Path, flags: int, mode: int = 0o777) -> int:
+        descriptor = original_open(path, flags, mode)
+        if Path(path) == journal:
+            descriptors.append(descriptor)
+            if after_open is not None:
+                after_open()
+        return descriptor
+
+    monkeypatch.setattr(atomic_write_module.os, "open", record_open)
+    return descriptors
+
+
+def _observed_pair(hot: _HotBundle) -> tuple[bytes, bytes]:
+    return tuple(path.read_bytes() for path in hot.destinations)
+
+
+def _assert_descriptors_closed(descriptors: list[int]) -> None:
+    assert descriptors
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
+
+
+def _inject_growth_during_journal_read(
+    monkeypatch: pytest.MonkeyPatch,
+    journal: Path,
+) -> None:
+    journal_identity = (journal.stat().st_dev, journal.stat().st_ino)
+    original_path_read = Path.read_bytes
+    original_os_read = os.read
+    path_grown = descriptor_grown = descriptor_eof = False
+
+    def legacy_read(path: Path) -> bytes:
+        nonlocal path_grown
+        raw = original_path_read(path)
+        if path == journal and not path_grown:
+            with path.open("ab") as stream:
+                stream.write(b" " * 65536)
+            path_grown = True
+        return raw
+
+    def descriptor_read(descriptor: int, size: int) -> bytes:
+        nonlocal descriptor_grown, descriptor_eof
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino) != journal_identity:
+            return original_os_read(descriptor, size)
+        if descriptor_grown and not descriptor_eof:
+            descriptor_eof = True
+            return b""
+        raw = original_os_read(descriptor, size)
+        if not descriptor_grown:
+            with journal.open("ab") as stream:
+                stream.write(b" " * 65536)
+            descriptor_grown = True
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", legacy_read)
+    monkeypatch.setattr(atomic_write_module.os, "read", descriptor_read)
 
 
 def test_exclusive_evidence_collision_never_deletes_existing_file(
@@ -215,6 +334,38 @@ def test_atomic_bundle_rejects_noncanonical_artifact_pairs(tmp_path: Path) -> No
 
     assert caught.value.code is ErrorCode.INVALID_PATH
     assert all(not Path(item.destination).exists() for item in items)
+
+
+def test_short_stage_write_removes_partial_stage_without_mutating_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt, items = _bundle(tmp_path)
+    destinations = tuple(Path(item.destination) for item in items)
+    for destination, payload in zip(destinations, _PRIOR):
+        destination.write_bytes(payload)
+
+    original_write = os.write
+
+    def short_stage_write(descriptor: int, payload: bytes | bytearray | memoryview) -> int:
+        opened = os.fstat(descriptor)
+        for path in _stage_paths(tmp_path):
+            if path.exists():
+                identity = path.stat()
+                if (identity.st_dev, identity.st_ino) == (opened.st_dev, opened.st_ino):
+                    return 0
+        return original_write(descriptor, payload)
+
+    monkeypatch.setattr(atomic_write_module.os, "write", short_stage_write)
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(items, transaction_id=attempt)
+
+    assert caught.value.code is ErrorCode.TRANSACTION_FAILED
+    assert tuple(destination.read_bytes() for destination in destinations) == _PRIOR
+    assert _stage_paths(tmp_path) == []
+    assert _journal_paths(tmp_path) == []
+    assert _receipt_paths(tmp_path) == []
 
 
 @pytest.mark.parametrize("boundary", ["before_first", "between", "before_terminal"])
@@ -461,36 +612,129 @@ def test_different_request_reconciles_each_hot_journal_boundary_before_commit(
     assert _stage_paths(tmp_path) == []
 
 
-def test_recovered_commit_revalidates_the_committed_destinations(
+@pytest.mark.parametrize(
+    ("validation_error", "expected_code"),
+    [
+        (
+            FCPMCPError(ErrorCode.VALIDATION_FAILED, "rejected recovered pair"),
+            ErrorCode.VALIDATION_FAILED,
+        ),
+        (ValueError("rejected recovered pair"), ErrorCode.TRANSACTION_FAILED),
+    ],
+    ids=["domain-error", "non-domain-error"],
+)
+def test_recovered_prepared_pair_validation_restores_exact_prior_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    validation_error: Exception,
+    expected_code: ErrorCode,
+) -> None:
+    """Catch omitted rollback or error normalization after recovered validation."""
+    hot = _interrupt_hot_bundle(tmp_path, monkeypatch, boundary="before_terminal")
+
+    def reject_committed(path: Path) -> None:
+        if path == hot.destinations[0]:
+            raise validation_error
+
+    requested = (
+        AtomicBundleItem(hot.destinations[0], hot.items[0].payload, reject_committed),
+        hot.items[1],
+    )
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(requested, transaction_id=hot.attempt)
+
+    assert caught.value.code is expected_code
+    assert _observed_pair(hot) == _PRIOR
+    assert _journal_paths(tmp_path) == []
+    assert _stage_paths(tmp_path) == []
+    assert not list(tmp_path.glob(f"*.bak.{hot.attempt}"))
+    assert _receipt_paths(tmp_path) == []
+
+
+def test_committed_hot_journal_validation_failure_preserves_terminal_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    attempt, original_items = _bundle(tmp_path)
-    destinations = tuple(Path(item.destination) for item in original_items)
-    validated: list[Path] = []
+    """Catch rollback of terminal evidence after committed-pair validation fails."""
+    hot = _interrupt_hot_bundle(tmp_path, monkeypatch, committed=True)
+    assert json.loads(hot.journal.read_text(encoding="utf-8"))["state"] == "committed"
 
-    def record_validation(path: Path) -> None:
-        validated.append(path)
+    def reject_committed(path: Path) -> None:
+        if path == hot.destinations[0]:
+            raise ValueError("terminal output rejected")
 
-    items = tuple(
-        AtomicBundleItem(item.destination, item.payload, record_validation)
-        for item in original_items
+    requested = (
+        AtomicBundleItem(hot.destinations[0], hot.items[0].payload, reject_committed),
+        hot.items[1],
     )
-    _inject_boundary_failure(
-        monkeypatch,
-        destinations,
-        boundary="before_terminal",
-        error=KeyboardInterrupt("interrupted before terminal journal"),
-    )
-    with pytest.raises(KeyboardInterrupt):
+    evidence = set(tmp_path.iterdir())
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(requested, transaction_id=hot.attempt)
+
+    assert caught.value.code is ErrorCode.RECOVERY_REQUIRED
+    assert _observed_pair(hot) == tuple(item.payload for item in hot.items)
+    assert all(path.exists() for path in evidence)
+
+
+@pytest.mark.parametrize(
+    ("source", "damage"),
+    [
+        ("hot", "none"),
+        ("hot", "size"),
+        ("replay", "state"),
+        ("replay", "size"),
+    ],
+)
+def test_terminal_receipt_evidence_must_match_committed_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: str,
+    damage: str,
+) -> None:
+    """Catch replay from absent, false-state, or size-contradictory evidence."""
+    if source == "hot":
+        hot = _interrupt_hot_bundle(tmp_path, monkeypatch, boundary="before_terminal")
+        payload = json.loads(hot.journal.read_text(encoding="utf-8"))
+        payload["state"] = "committed"
+        key = hot.journal.name.split(".")[3]
+        receipt = tmp_path / f".fcp-mcp.bundle.{key}.{hot.attempt}.receipt.json"
+    else:
+        attempt, items = _bundle(tmp_path)
         atomic_replace_bundle(items, transaction_id=attempt)
+        receipt = _receipt_paths(tmp_path)[0]
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        hot = _HotBundle(
+            attempt,
+            items,
+            receipt,
+        )
+    if damage == "state":
+        payload["state"] = "rolled_back"
+    elif damage == "size":
+        payload["items"][0]["output_size_bytes"] += 1
+    _write_checksummed_journal(receipt, payload)
+    receipt.chmod(0o600)
+    descriptors = _record_journal_descriptors(monkeypatch, hot.journal)
 
-    validated.clear()
-    receipt = atomic_replace_bundle(items, transaction_id=attempt)
-
-    assert receipt.replayed is True
-    assert validated == list(destinations)
-    assert _journal_paths(tmp_path) == []
+    if damage == "none":
+        validated: list[Path] = []
+        requested = tuple(
+            AtomicBundleItem(item.destination, item.payload, validated.append) for item in hot.items
+        )
+        replay = atomic_replace_bundle(requested, transaction_id=hot.attempt)
+        assert replay.replayed is True
+        assert validated == list(hot.destinations)
+        assert _journal_paths(tmp_path) == []
+    else:
+        backups = set(tmp_path.glob(f"*.bak.{hot.attempt}"))
+        with pytest.raises(FCPMCPError) as caught:
+            atomic_replace_bundle(hot.items, transaction_id=hot.attempt)
+        assert caught.value.code is ErrorCode.RECOVERY_REQUIRED
+        assert hot.journal.exists()
+        assert receipt.exists()
+        assert source == "replay" or all(path.exists() for path in backups)
+    assert _observed_pair(hot) == tuple(item.payload for item in hot.items)
+    _assert_descriptors_closed(descriptors)
 
 
 def test_repeated_identical_bundle_is_a_noop_with_same_transaction_identity(
@@ -561,9 +805,7 @@ def test_conflicting_retry_refuses_another_attempts_orphan_stage(
     attempt, items = _bundle(tmp_path)
     atomic_replace_bundle(items, transaction_id=attempt)
     orphan_attempt = str(uuid.uuid4())
-    orphan_stage = (
-        tmp_path / f".{Path(items[0].destination).name}.{orphan_attempt}.stage"
-    )
+    orphan_stage = tmp_path / f".{Path(items[0].destination).name}.{orphan_attempt}.stage"
     orphan_stage.write_bytes(items[0].payload)
 
     with pytest.raises(FCPMCPError) as caught:
@@ -650,6 +892,163 @@ def test_ambiguous_recovery_preserves_observed_destinations_and_evidence(
         == observed
     )
     assert journal.exists()
+
+
+def test_hot_journal_growth_during_read_preserves_pair_and_recovery_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch removal of descriptor-bound journal size and stability checks."""
+    hot = _interrupt_hot_bundle(tmp_path, monkeypatch)
+    evidence = set(tmp_path.iterdir())
+    _inject_growth_during_journal_read(monkeypatch, hot.journal)
+    descriptors = _record_journal_descriptors(monkeypatch, hot.journal)
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(hot.items, transaction_id=hot.attempt)
+
+    assert caught.value.code is ErrorCode.RECOVERY_REQUIRED
+    assert _observed_pair(hot) == _PRIOR
+    assert hot.journal.stat().st_size > 65536
+    assert all(path.exists() for path in evidence)
+    _assert_descriptors_closed(descriptors)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "unknown_destination",
+        "root_not_object",
+        "contract",
+        "item_not_object",
+        "duplicate_destination",
+        "stage_identity",
+        "backup_identity",
+        "absent_prior_evidence",
+    ],
+)
+def test_checksummed_malformed_hot_journal_never_mutates_observed_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: str,
+) -> None:
+    """Catch guesses through unknown state or malformed checksummed evidence."""
+    hot = _interrupt_hot_bundle(tmp_path, monkeypatch)
+    if damage == "unknown_destination":
+        hot.destinations[0].write_bytes(b"foreign timeline state")
+    elif damage == "root_not_object":
+        hot.journal.write_text("[]\n", encoding="utf-8")
+    else:
+        body = json.loads(hot.journal.read_text(encoding="utf-8"))
+        item = body["items"][0]
+        target, key, value = {
+            "contract": (body, "schema", "foreign.schema/v1"),
+            "item_not_object": (body["items"], 0, "not-an-object"),
+            "duplicate_destination": (
+                body["items"][1],
+                "destination_name",
+                item["destination_name"],
+            ),
+            "stage_identity": (item, "stage_name", ".foreign.stage"),
+            "backup_identity": (item, "backup_name", "foreign.backup"),
+            "absent_prior_evidence": (item, "prior_exists", False),
+        }[damage]
+        target[key] = value
+        _write_checksummed_journal(hot.journal, body)
+    observed = _observed_pair(hot)
+    evidence = set(tmp_path.iterdir())
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(hot.items, transaction_id=hot.attempt)
+
+    assert caught.value.code is ErrorCode.RECOVERY_REQUIRED
+    assert _observed_pair(hot) == observed
+    assert all(path.exists() for path in evidence)
+
+
+@pytest.mark.parametrize(
+    "invariant",
+    ["wrong_mode", "hard_link", "path_replacement", "symlink", "premature_eof"],
+)
+def test_hot_journal_descriptor_invariants_fail_closed_and_release_descriptor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invariant: str,
+) -> None:
+    """Catch removal of descriptor identity, trust, bounded-read, or close checks."""
+    hot = _interrupt_hot_bundle(tmp_path, monkeypatch)
+    original_bytes = hot.journal.read_bytes()
+    after_open: Callable[[], None] | None = None
+    if invariant == "wrong_mode":
+        hot.journal.chmod(0o640)
+    elif invariant == "hard_link":
+        os.link(hot.journal, hot.journal.with_suffix(".link"))
+    elif invariant in {"path_replacement", "symlink"}:
+        target = hot.journal.with_suffix(".target")
+        if invariant == "symlink":
+            hot.journal.replace(target)
+            hot.journal.symlink_to(target.name)
+            original_lstat = Path.lstat
+            monkeypatch.setattr(
+                Path,
+                "lstat",
+                lambda path: path.stat() if path == hot.journal else original_lstat(path),
+            )
+        else:
+
+            def replace_path() -> None:
+                hot.journal.replace(target)
+                hot.journal.write_bytes(original_bytes)
+                hot.journal.chmod(0o600)
+
+            after_open = replace_path
+
+    descriptors = _record_journal_descriptors(
+        monkeypatch,
+        hot.journal,
+        after_open=after_open,
+    )
+    if invariant == "premature_eof":
+        with hot.journal.open("ab") as stream:
+            stream.write(b" ")
+        assert stat.S_IMODE(hot.journal.stat().st_mode) == 0o600
+        journal_identity = hot.journal.stat()
+        original_read = os.read
+        returned_partial = False
+        injected = False
+
+        def short_read(descriptor: int, size: int) -> bytes:
+            nonlocal injected, returned_partial
+            descriptor_identity = os.fstat(descriptor)
+            if (
+                descriptor_identity.st_dev != journal_identity.st_dev
+                or descriptor_identity.st_ino != journal_identity.st_ino
+            ):
+                return original_read(descriptor, size)
+            if returned_partial:
+                return b""
+            returned_partial = True
+            raw = original_read(descriptor, size)
+            assert raw.endswith(b" ")
+            injected = True
+            return raw[:-1]
+
+        monkeypatch.setattr(atomic_write_module.os, "read", short_read)
+    observed = _observed_pair(hot)
+    evidence = set(tmp_path.iterdir())
+
+    with pytest.raises(FCPMCPError) as caught:
+        atomic_replace_bundle(hot.items, transaction_id=hot.attempt)
+
+    assert caught.value.code is ErrorCode.RECOVERY_REQUIRED
+    assert _observed_pair(hot) == observed
+    assert all(path.exists() for path in evidence)
+    if invariant == "symlink":
+        assert descriptors == []
+    else:
+        _assert_descriptors_closed(descriptors)
+    if invariant == "premature_eof":
+        assert injected is True
 
 
 def test_rolled_back_terminal_journal_never_reclassifies_outputs_as_committed(
