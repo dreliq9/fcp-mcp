@@ -298,12 +298,7 @@ def _save_modifier_receipt(
             destination,
             event_format=CONFIG.log_format,
         )
-    ET.indent(modifier.root, space="    ")
-    xml_text = ET.tostring(
-        modifier.root,
-        encoding="unicode",
-        xml_declaration=True,
-    )
+    xml_text = modifier.serialize().decode("utf-8")
     return commit_fcpxml(
         source=modifier.path,
         destination=destination,
@@ -2692,7 +2687,7 @@ def fcpxml_add_title(
         title_ref = "r_title"
         effect.set("id", title_ref)
         effect.set("name", "Basic Title")
-        effect.set("uid", ".../Titles.localized/Build In:Out.localized/Basic Title.localized/Basic Title.moti")
+        effect.set("uid", ".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti")
 
     spine = mod.root.find(".//spine")
     if spine is None:
@@ -2707,11 +2702,23 @@ def fcpxml_add_title(
     title_el.set("duration", duration)
     title_el.set("role", "Titles")
 
-    # Add text parameter
-    param = ET.SubElement(title_el, "param")
-    param.set("name", "Text")
-    param.set("key", "Text")
-    param.set("value", text)
+    used_ids = {element.get("id") for element in mod.root.iter()}
+    style_id = "ts_title"
+    style_suffix = 2
+    while style_id in used_ids:
+        style_id = f"ts_title_{style_suffix}"
+        style_suffix += 1
+    text_el = ET.SubElement(title_el, "text")
+    text_style = ET.SubElement(text_el, "text-style", {"ref": style_id})
+    text_style.text = text
+    style_def = ET.SubElement(title_el, "text-style-def", {"id": style_id})
+    ET.SubElement(style_def, "text-style", {
+        "font": "Helvetica",
+        "fontSize": "63",
+        "fontFace": "Regular",
+        "fontColor": "1 1 1 1",
+        "alignment": "center",
+    })
 
     if position == "start":
         spine.insert(0, title_el)
@@ -2736,6 +2743,7 @@ def fcpxml_add_title(
 
     # Recalculate offsets
     mod._recalculate_offsets(spine)
+    mod._sync_primary_sequence_duration(title_el)
 
     receipt = _save_modifier_receipt(mod, output_path)
     root = _committed_root(receipt)
@@ -2749,8 +2757,10 @@ def fcpxml_add_title(
             if candidate.get("name") == text
             and candidate.get("duration") == duration
             and candidate.get("ref") == title_ref
-            and candidate.find("param") is not None
-            and candidate.find("param").get("value") == text
+            and candidate.find("text/text-style") is not None
+            and candidate.find("text/text-style").text == (text or None)
+            and candidate.find("text/text-style").get("ref") == style_id
+            and candidate.find("text-style-def").get("id") == style_id
         ),
         None,
     )
@@ -5059,6 +5069,9 @@ def fcp_open_library(
 def fcp_import_xml(fcpxml_path: str) -> ToolOutcome[FCPImportXMLResult]:
     """Import an FCPXML file into Final Cut Pro.
 
+    Final Cut Pro controls destination selection. Select and confirm the
+    intended library in its import dialog; this tool does not target a library.
+
     Args:
         fcpxml_path: Path to .fcpxml file
     """
@@ -5074,7 +5087,10 @@ def fcp_import_xml(fcpxml_path: str) -> ToolOutcome[FCPImportXMLResult]:
                 raw_response=text,
                 verification_status=VerificationStatus.UNVERIFIED,
                 observed_outcome=None,
-                warnings=[_UNVERIFIED_FCP_WARNING],
+                warnings=[
+                    _UNVERIFIED_FCP_WARNING,
+                    "Final Cut Pro controls the import destination. Confirm the intended library in its import dialog; this tool does not select or verify it.",
+                ],
             ),
         )
     except subprocess.TimeoutExpired as error:
@@ -6029,8 +6045,8 @@ def media_detect_silence(
 
     Args:
         path: Path to media file
-        noise_threshold: Noise floor threshold (e.g., "-30dB", "-40dB")
-        min_duration: Minimum silence duration in seconds
+        noise_threshold: Decimal/scientific amplitude or dB scalar (e.g., "-30dB", "0.01", "1e-3"); expressions and filter syntax are rejected
+        min_duration: Finite minimum silence duration in seconds, from 0 through 86400
     """
     from .media.ffprobe import detect_silence
 

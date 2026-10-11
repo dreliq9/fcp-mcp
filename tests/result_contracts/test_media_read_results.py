@@ -6,10 +6,12 @@ from pathlib import Path
 from subprocess import CompletedProcess
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, ValidationError
 
 from fcp_mcp import server
 from fcp_mcp.config import RuntimeConfig
+from fcp_mcp.contracts import ErrorCode, FCPMCPError
 from fcp_mcp.media import ffprobe
 from fcp_mcp.security.paths import PathPolicy
 
@@ -391,6 +393,37 @@ CASES: tuple[tuple[str, str, dict[str, object], str, ResultAssertion], ...] = (
         _assert_presets,
     ),
 )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [
+    {"noise_threshold": "-30dB,anull"},
+    {"noise_threshold": "/noise=/tmp/input"},
+    {"min_duration": -1},
+    {"min_duration": "0.5,anull"},
+])
+async def test_silence_mcp_rejects_filter_syntax_without_commands(
+    monkeypatch, multimedia_boundary, arguments
+):
+    source, _ = multimedia_boundary
+    calls = []
+    def unexpected(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("invalid input reached a command")
+    monkeypatch.setattr(ffprobe, "_find_ffmpeg", unexpected)
+    monkeypatch.setattr(ffprobe, "_run_checked", unexpected)
+    with pytest.raises(ToolError, match="invalid_arguments"):
+        await server.mcp.call_tool("media_detect_silence", {"path": str(source), **arguments})
+    assert not calls
+
+
+def test_silence_keeps_media_path_scope(monkeypatch, multimedia_boundary, tmp_path):
+    calls = []
+    monkeypatch.setattr(ffprobe, "_find_ffmpeg", lambda: calls.append("binary"))
+    with pytest.raises(FCPMCPError) as caught:
+        server.media_detect_silence(str(tmp_path.parent / "outside.wav"))
+    assert caught.value.code == ErrorCode.PATH_OUTSIDE_SCOPE
+    assert not calls
 
 
 @pytest.fixture

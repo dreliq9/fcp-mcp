@@ -13,7 +13,8 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import INTERNAL_ERROR, INVALID_PARAMS, CallToolResult, TextContent, ToolAnnotations
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, GetCoreSchemaHandler, ValidationError
+from pydantic_core import core_schema
 
 from .config import RuntimeConfig
 from .contracts import ErrorCode, FCPMCPError
@@ -44,7 +45,9 @@ class FCPFastMCP(MCPServer):
         except ToolError as error:
             cause = error.__cause__
             if isinstance(cause, FCPMCPError):
-                raise
+                # Newer SDKs sanitize arbitrary exception messages. Domain
+                # failures are deliberate public errors with stable codes.
+                raise ToolError(f"Error executing tool {name}: {cause}") from cause
             if isinstance(cause, ValidationError):
                 raise ToolError(
                     f"Error executing tool {name}: "
@@ -202,6 +205,17 @@ def _json_output_validator(result_model: type[BaseModel]):
     """Validate JSON-compatible structured content against strict result models."""
 
     class JSONOutputValidator:
+        @classmethod
+        def __get_pydantic_core_schema__(
+            cls, source: Any, handler: GetCoreSchemaHandler
+        ) -> core_schema.CoreSchema:
+            # MCP 2.1+ uses TypeAdapter.validate_python on structured JSON.
+            # Convert through JSON first so strict enums and tuples retain the
+            # same semantics as MCP 2.0's model_validate integration.
+            return core_schema.no_info_before_validator_function(
+                cls.model_validate, handler.generate_schema(result_model)
+            )
+
         @classmethod
         def model_validate(cls, value: Any) -> BaseModel:
             return result_model.model_validate_json(

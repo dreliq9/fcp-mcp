@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import subprocess
 from collections.abc import Callable, Sequence
+from decimal import Decimal
 from pathlib import Path
 from subprocess import CompletedProcess
 from typing import Any
@@ -141,6 +144,36 @@ def get_streams(path: str) -> list[dict]:
     return info.get("streams", [])
 
 
+_NOISE_SCALAR = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?(?:dB)?")
+
+
+def _silence_parameters(noise_threshold: str, min_duration: float) -> tuple[str, str]:
+    """Validate filter scalars before discovering binaries or touching media."""
+    if not isinstance(noise_threshold, str):
+        raise FCPMCPError(ErrorCode.INVALID_ARGUMENTS, "noise_threshold must be a numeric string, optionally ending in dB")
+    noise = str(noise_threshold)
+    if len(noise) > 128 or _NOISE_SCALAR.fullmatch(noise) is None:
+        raise FCPMCPError(ErrorCode.INVALID_ARGUMENTS, "noise_threshold must be a decimal or scientific scalar, optionally ending in dB")
+    is_db = noise.endswith("dB")
+    value = float(noise[:-2] if is_db else noise)
+    try:
+        amplitude = 10 ** (value / 20) if is_db else value
+    except OverflowError:
+        amplitude = math.inf
+    if not math.isfinite(value) or not math.isfinite(amplitude) or amplitude < 0:
+        raise FCPMCPError(ErrorCode.INVALID_ARGUMENTS, "noise_threshold must represent a finite nonnegative amplitude")
+    if isinstance(min_duration, bool) or not isinstance(min_duration, (int, float)):
+        raise FCPMCPError(ErrorCode.INVALID_ARGUMENTS, "min_duration must be a finite number of seconds between 0 and 86400")
+    try:
+        duration = float(min_duration)
+    except OverflowError:
+        duration = math.inf
+    if not math.isfinite(duration) or not 0 <= duration <= 86400:
+        raise FCPMCPError(ErrorCode.INVALID_ARGUMENTS, "min_duration must be a finite number of seconds between 0 and 86400")
+    # FFmpeg duration syntax accepts decimal seconds, not Python's exponent form.
+    return noise, format(Decimal(str(duration)), "f")
+
+
 def detect_silence(
     path: str,
     noise_threshold: str = "-30dB",
@@ -148,14 +181,19 @@ def detect_silence(
 ) -> list[dict]:
     """Detect silent sections in audio using FFmpeg's silencedetect filter.
 
+    Noise accepts a decimal/scientific amplitude or a scalar ending in dB.
+    FFmpeg expressions, units other than dB, and filter syntax are rejected.
+    Minimum duration is a finite number of seconds from 0 through 86400.
+
     Returns list of {start, end, duration} for each silent section.
     """
+    noise, duration = _silence_parameters(noise_threshold, min_duration)
     ffmpeg = _find_ffmpeg()
     source = _source_path(path)
     result = _run_checked(
         [
             ffmpeg, "-i", str(source),
-            "-af", f"silencedetect=noise={noise_threshold}:d={min_duration}",
+            "-af", f"silencedetect=noise={noise}:d={duration}",
             "-f", "null", "-",
         ],
         timeout=120,

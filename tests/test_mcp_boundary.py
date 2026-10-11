@@ -3,17 +3,18 @@ from __future__ import annotations
 import asyncio
 import inspect
 import threading
+from enum import Enum
 from typing import Annotated, get_args, get_origin
 
 import pytest
 from mcp import Client
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp_types import CallToolResult
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from fcp_mcp.config import RuntimeConfig
 from fcp_mcp.contracts import ErrorCode, FCPMCPError
-from fcp_mcp.mcp_boundary import build_mcp_server
+from fcp_mcp.mcp_boundary import _json_output_validator, build_mcp_server
 from fcp_mcp.profiles import Profile, ToolClass
 from fcp_mcp.registry import PromptRegistry, ResourceRegistry, ToolRegistry
 from fcp_mcp.result_models.common import ToolOutcome
@@ -26,6 +27,47 @@ class CountResult(BaseModel):
 
     schema_version: str = "1"
     count: int
+
+
+class StrictChoice(str, Enum):
+    READY = "ready"
+
+
+class StrictJSONResult(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+    choice: StrictChoice
+    samples: tuple[int, ...]
+
+
+def test_output_validator_supports_pydantic_adapter_without_weakening_json_validation():
+    adapter = TypeAdapter(_json_output_validator(StrictJSONResult))
+    payload = {"choice": "ready", "samples": [1, 2]}
+    assert adapter.validate_python(payload) == StrictJSONResult(
+        choice=StrictChoice.READY, samples=(1, 2),
+    )
+    assert adapter.json_schema() == StrictJSONResult.model_json_schema()
+    for invalid in (
+        {"choice": "unknown", "samples": [1]},
+        {"choice": "ready", "samples": ["1"]},
+        {"choice": "ready", "samples": [True]},
+        {**payload, "extra": "forbidden"},
+    ):
+        with pytest.raises(ValidationError):
+            adapter.validate_python(invalid)
+
+
+def test_boundary_round_trips_strict_enum_and_tuple_json(tmp_path):
+    tools = ToolRegistry()
+    @tools.tool(tool_class=ToolClass.INSPECT, result_model=StrictJSONResult)
+    def strict() -> ToolOutcome[StrictJSONResult]:
+        return ToolOutcome(text="ready", structured=StrictJSONResult(
+            choice=StrictChoice.READY, samples=(1, 2),
+        ))
+    server = build_mcp_server(_config(tmp_path), tools, PromptRegistry())
+    result = asyncio.run(server.call_tool("strict", {}))
+    assert result.content[0].text == "ready"
+    assert result.structured_content == {"choice": "ready", "samples": [1, 2]}
+    assert asyncio.run(server.list_tools())[0].output_schema == StrictJSONResult.model_json_schema()
 
 
 def _config(tmp_path, profile: str = "inspect") -> RuntimeConfig:

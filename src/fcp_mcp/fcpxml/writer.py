@@ -79,7 +79,12 @@ class FCPXMLModifier:
         """Serialize deterministic UTF-8 candidate bytes without mutating live state."""
         root = copy.deepcopy(self.root)
         ET.indent(root, space="    ")
-        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+        # Emit the canonical declaration; never reproduce an input DTD subset
+        # or external identifier from untrusted XML.
+        return (
+            b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n'
+            + ET.tostring(root, encoding="utf-8", xml_declaration=False)
+        )
 
     # --- Markers ---
 
@@ -500,6 +505,9 @@ class FCPXMLModifier:
     def _recalculate_offsets(self, spine_el: ET.Element) -> None:
         """Recalculate offsets for all clips in a spine sequentially."""
         current_offset = RationalTime.zero()
+        sequence = self._find_parent(spine_el)
+        if sequence is not None and sequence.tag == "sequence":
+            current_offset = RationalTime.from_fcpxml(sequence.get("tcStart", "0s"))
         for child in spine_el:
             if child.tag == "transition":
                 # Transitions overlap — don't advance offset

@@ -480,6 +480,7 @@ def test_open_and_import_preserve_resolved_request_and_unverified_status(
     assert imported.structured.request.fcpxml_path == str(fcpxml.resolve())
     assert imported.structured.verification_status is VerificationStatus.UNVERIFIED
     assert imported.structured.observed_outcome is None
+    assert any("does not select or verify" in warning for warning in imported.structured.warnings)
 
 
 def test_compressor_submission_keeps_exact_argv_and_command_channels(

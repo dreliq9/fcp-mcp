@@ -184,6 +184,19 @@ class TestBatchOps:
 
 
 class TestSaveRoundtrip:
+    def test_serialize_uses_canonical_doctype_without_external_identifier(self, tmp_path):
+        source = tmp_path / "external-doctype.fcpxml"
+        source.write_text(
+            '<!DOCTYPE fcpxml SYSTEM "file:///unused.dtd">'
+            '<fcpxml version="1.11"><resources/></fcpxml>',
+            encoding="utf-8",
+        )
+        candidate = FCPXMLModifier(source).serialize()
+        assert candidate.count(b"<!DOCTYPE fcpxml>") == 1
+        assert b"SYSTEM" not in candidate
+        assert b"unused.dtd" not in candidate
+        assert parse_string(candidate).tag == "fcpxml"
+
     def test_serialize_is_deterministic_and_non_mutating(
         self, modifier, sample_fcpxml_path
     ):
@@ -195,7 +208,8 @@ class TestSaveRoundtrip:
         second = modifier.serialize()
 
         assert first == second
-        assert first.startswith(b"<?xml version='1.0' encoding='utf-8'?>")
+        assert first.startswith(b'<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE fcpxml>\n')
+        assert first.count(b"<!DOCTYPE") == 1
         assert b"    <resources>" in first
         assert "Début 東京".encode() in first
         assert ET.tostring(modifier.root, encoding="utf-8") == root_before

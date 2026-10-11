@@ -7,7 +7,7 @@
         <asset id="r3" name="Broll_Beach" src="file:///Users/example/Movies/broll_beach.mov" start="0s" duration="150150/30000s" hasVideo="1" hasAudio="1" format="r1"/>
         <asset id="r4" name="Broll_City" src="file:///Users/example/Movies/broll_city.mov" start="0s" duration="90090/30000s" hasVideo="1" hasAudio="0" format="r1"/>
         <asset id="r5" name="Music_Track" src="file:///Users/example/Movies/music.aac" start="0s" duration="600600/30000s" hasVideo="0" hasAudio="1"/>
-        <effect id="r6" name="Basic Title" uid=".../Titles.localized/Build In:Out.localized/Basic Title.localized/Basic Title.moti"/>
+        <effect id="r6" name="Basic Title" uid=".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti"/>
         <effect id="r7" name="Cross Dissolve" uid=".../Transitions.localized/Dissolves.localized/Cross Dissolve.localized/Cross Dissolve.motr"/>
     </resources>
     <library location="file:///Users/example/Movies/MyLibrary.fcpbundle/">

@@ -559,7 +559,7 @@ def _assert_committed_entity(
         title = _find_named(root, "title", "Act Two")
         assert title.get("offset") == "121121/10000s"
         assert title.get("duration") == "60060/30000s"
-        assert title.find("param").get("value") == "Act Two"  # type: ignore[union-attr]
+        assert title.find("text/text-style").text == "Act Two"  # type: ignore[union-attr]
     else:
         clip = _find_named(root, "asset-clip", "Voiceover")
         asset = next(
@@ -587,6 +587,68 @@ def edit_path_policy(
     )
     monkeypatch.setattr(server, "CONFIG", config)
     monkeypatch.setattr(server, "PATHS", PathPolicy(config))
+
+
+@pytest.mark.parametrize("position", ["start", "end", "Clip"])
+@pytest.mark.parametrize("tc_start", [0, 3600])
+def test_added_title_keeps_sequence_endpoint_and_canonical_resource(
+    position, tc_start, tmp_path, edit_path_policy
+):
+    source = tmp_path / "title-source.fcpxml"
+    destination = tmp_path / "title-output.fcpxml"
+    source.write_text(
+        f'<fcpxml version="1.11"><resources><format id="r1" frameDuration="1/24s" width="1920" height="1080"/>'
+        '<asset id="r2" name="Clip" start="0s" duration="4s" hasVideo="1" format="r1"/></resources>'
+        f'<library><event name="Event"><project name="Project"><sequence format="r1" duration="4s" tcStart="{tc_start}s">'
+        f'<spine><asset-clip ref="r2" name="Clip" offset="{tc_start}s" start="0s" duration="4s"/>'
+        '</spine></sequence></project></event></library></fcpxml>',
+        encoding="utf-8",
+    )
+    original = source.read_bytes()
+    server.fcpxml_add_title(str(source), "Title", "3s", position, str(destination))
+    assert source.read_bytes() == original
+    candidate = destination.read_bytes()
+    assert candidate.count(b"<!DOCTYPE fcpxml>") == 1
+    root = ET.fromstring(candidate)
+    assert root.find(".//sequence").get("duration") == "7s"
+    children = list(root.find(".//spine"))
+    expected = [tc_start, tc_start + (3 if position == "start" else 4)]
+    assert [child.get("offset") for child in children] == [f"{offset}s" for offset in expected]
+    assert root.find("resources/effect").get("uid") == (
+        ".../Titles.localized/Bumper:Opener.localized/Basic Title.localized/Basic Title.moti"
+    )
+
+
+@pytest.mark.parametrize("text", ["Issue4 Canary Title", 'A & <B>\n"Café"'])
+def test_added_title_uses_exported_text_structure_and_unique_style_ids(
+    text, tmp_path, edit_path_policy
+):
+    fixture = Path(__file__).parents[1] / "fixtures" / "basic_title_export.fcpxml"
+    source = tmp_path / "exported-title.fcpxml"
+    shutil.copy2(fixture, source)
+    original = source.read_bytes()
+    first = tmp_path / "first-title.fcpxml"
+    second = tmp_path / "second-title.fcpxml"
+    server.fcpxml_add_title(str(source), text, "3s", "end", str(first))
+    server.fcpxml_add_title(str(first), text, "3s", "end", str(second))
+    assert source.read_bytes() == original
+    root = ET.parse(second).getroot()
+    titles = root.findall(".//spine/title")
+    assert len(titles) == 3
+    exported = titles[0]
+    assert exported.find("text/text-style").text == "Title"
+    ids = [element.get("id") for element in root.iter() if element.get("id")]
+    assert len(ids) == len(set(ids))
+    for title in titles[1:]:
+        assert [child.tag for child in title] == ["text", "text-style-def"]
+        run = title.find("text/text-style")
+        definition = title.find("text-style-def")
+        assert run.text == text
+        assert run.get("ref") == definition.get("id")
+        assert definition.find("text-style").attrib == exported.find(
+            "text-style-def/text-style"
+        ).attrib
+    assert root.find(".//sequence").get("duration") == "9s"
 
 
 @pytest.mark.asyncio

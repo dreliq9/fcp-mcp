@@ -243,7 +243,7 @@ EFFECTS = {
             "id": "r6",
             "name": "Basic Title",
             "uid": (
-                ".../Titles.localized/Build In:Out.localized/"
+                ".../Titles.localized/Bumper:Opener.localized/"
                 "Basic Title.localized/Basic Title.moti"
             ),
         },

@@ -43,6 +43,8 @@ edit and inspect is the #1 cause of wasted tool calls.
    call; looping `fcpxml_assign_role` is 30 calls and 30× more context.
 5. **Live tools are last.** Do all FCPXML work off-line, then
    `fcp_import_xml` to load it into a running FCP, then trigger Share.
+   Final Cut Pro controls the import destination. Have the human confirm the
+   intended library in its import dialog; the tool does not select or verify it.
 
 ## Resolve clip names by listing first
 
