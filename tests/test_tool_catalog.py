@@ -69,6 +69,9 @@ EXPECTED_TOOLS = {
     "fcp_get_app_state",
     "fcp_open_library",
     "fcp_import_xml",
+    "fcpxml_prepare_import",
+    "fcp_request_import",
+    "fcp_reconcile_import",
     "fcp_export_xml",
     "fcp_playback",
     "fcp_navigate",
@@ -108,10 +111,10 @@ EXPECTED_TOOLS = {
 }
 
 
-def test_full_catalog_is_exactly_94_annotated_tools():
+def test_full_catalog_is_exactly_97_annotated_tools():
     tools = asyncio.run(mcp.list_tools())
     assert {tool.name for tool in tools} == EXPECTED_TOOLS
-    assert len(tools) == 94
+    assert len(tools) == 97
     assert all(tool.annotations is not None for tool in tools)
 
 

@@ -9,13 +9,13 @@ def read(path: str) -> str:
     return (ROOT / path).read_text(encoding="utf-8")
 
 
-def test_readme_leads_with_bounded_outcome_and_frozen_catalog():
+def test_readme_leads_with_bounded_outcome_and_development_catalog():
     text = read("README.md")
     first_screen = "\n".join(text.splitlines()[:45]).lower()
     assert "trusted, local" in first_screen
     assert "human-approved" in first_screen
     assert "most capable" not in first_screen
-    assert "94 tools" in text
+    assert "97 tools" in text
     assert "93 tools" not in text
     assert "v0.3 release candidate" not in text.lower()
 

@@ -7,7 +7,8 @@ generates, and transactionally edits FCPXML, then optionally hands verified
 artifacts to Final Cut Pro. The default profile never performs direct live or
 offline mutation.
 
-Version 0.3.0 freezes a 94-tool catalog across four profiles. It is a bounded
+This development catalog adds three import-bridge tools to the v0.3.0 baseline
+across four profiles. It is a bounded
 FCPXML interchange and tested Final Cut Pro handoff surface—not a claim of
 complete autonomous Final Cut Pro control. The default workflow is inspect,
 prepare, review, hash approval, then commit.
@@ -181,17 +182,17 @@ reviewable.
 |---|---:|---:|---:|---|
 | `inspect` | 30 | 2 | 0 | Offline inspection and diagnostics |
 | `workflow` (default) | 34 | 3 | 3 | Reviewable transactional FCPXML edits |
-| `edit` | 75 | 5 | 3 | Direct offline mutation plus workflows |
-| `full` | 94 | 5 | 3 | All offline tools and opt-in live FCP, media, and Compressor tools |
+| `edit` | 76 | 5 | 3 | Direct offline mutation, import preparation, and workflows |
+| `full` | 97 | 5 | 3 | All offline tools and opt-in live FCP, media, and Compressor tools |
 
-The 94 tools include the `youtube-mcp.materialized-clip-plan/v1` provenance
+The 97 tools include the `youtube-mcp.materialized-clip-plan/v1` provenance
 adapter, `fcpxml_generate_from_clip_plan`, in `edit` and `full` only. Live FCP
 control remains independently disabled unless `FCP_MCP_ENABLE_LIVE_CONTROL=1`;
 choosing `full` does not grant that authority.
 
-## Available Tools (94 in `full`)
+## Available Tools (97 in `full`)
 
-The full catalog combines 93 domain tools across 13 functional categories with
+The full catalog combines 96 domain tools across 14 functional categories with
 `fcp_doctor`.
 
 | Category | Count | What it does |
@@ -205,6 +206,7 @@ The full catalog combines 93 domain tools across 13 functional categories with
 | **templates** | 3 | List and save FCPXML templates; `fcpxml_apply_template` remains `unsupported_contract` in v0.3.0 |
 | **io** | 5 | Import SRT/EDL, export EDL + DaVinci Resolve XML + Premiere FCP7 XMEML |
 | **live** | 20 | AppleScript-backed library/events/projects, playback, menu/keyboard, share, and discovery |
+| **import bridge** | 3 | Validated destination-bound XML preparation, one approved native request, and metadata reconciliation |
 | **puppet** | 7 | Parametric character rigs in FCPXML with motion presets |
 | **media** | 10 | ffprobe + ffmpeg info, loudness, silence, beats, scenes, thumbnails, and audio-to-MIDI |
 | **compressor** | 2 | List Compressor settings and dispatch encode jobs |
@@ -315,6 +317,68 @@ fcpxml_qc_report("hero.fcpxml")
 Media links, frame rates, audio levels, safe zones, and target duration
 are separate `fcpxml_check_*` tools. Run the specific checks you need
 instead of assuming the aggregate report includes them.
+
+### Programmatic XML import bridge
+
+`fcpxml_prepare_import(path, library_path)` prepares one named event/project
+without contacting Final Cut. It requires an existing `.fcpbundle`, scoped
+local media files, and a matching installed Apple DTD. Its private artifact
+contains Apple's documented `import-options` library URL. Media is copied into
+private snapshots within `FCP_MCP_WORKFLOW_MAX_ARTIFACT_BYTES` (aggregate staged
+media plus staged XML; default 268,435,456 bytes / 256 MiB per preparation),
+and Final Cut is asked to copy assets into its library. Warnings remain visible.
+Conflicting embedded destinations are rejected. Factory Motion template UIDs and
+matching installed factory locators are supported; external Motion templates and
+locator resources are rejected. Media bookmarks are removed in favor of the
+reviewed snapshot URLs.
+
+Dispatch uses a separate sealed copy of the reviewed XML, with pinned identities
+and hashes for every staged file. The bridge checks these after native preflight.
+Files are mode 0400 and snapshot directories 0500; public path tools cannot access
+the reserved staging tree. Snapshots are retained for asynchronous reads, including
+after metadata observation; there is no automatic cleanup. This consumes disk space.
+Retain the entire private import state under `FCP_MCP_STATE_DIR/import-bridge`,
+including snapshots, plans and dispatch records, across requests, reconciliation
+and evidence/recovery decisions. Keep the source XML unchanged until dispatch.
+Do not delete, move or change permissions on prepared snapshots. Acceptance or
+matching metadata does not establish that Final Cut has finished reading them.
+Deleting state also removes duplicate-dispatch evidence; its absence does not
+authorize another import.
+
+Use a stable private `FCP_MCP_STATE_DIR` for retained work. Managed workspaces may
+normalize directory permissions, invalidating the 0500 seal. Temporary locations
+such as `/private/tmp` can avoid that normalization for a bounded test, but the OS
+or another process may remove their contents; they are not a persistent-retention
+guarantee. If state, permissions or identities change, stop and investigate;
+do not repair permissions or bypass verification to force a send. No cleanup or
+state-migration behavior is provided by this bridge.
+
+These controls assume a trusted OS account and installed Final Cut application.
+They do not isolate against malicious processes running as the same user or root,
+which can change permissions or replace paths before the app reads them. The three
+bridge tools reject unknown arguments and require strict schema types.
+
+Review that artifact and target before approving the returned `plan_sha256`.
+With the `full` profile, live control enabled, and client approval mode,
+`fcp_request_import(prepared_id, expected_plan_sha256)` inspects the exact open
+library, blocks existing event names, records intent, and sends one Open Document
+AppleEvent. `accepted_unverified` means the event returned without error;
+it does not mean the import completed. Preflight is not atomic with native
+processing, so app state can change and Final Cut may still prompt. Apple may
+create a library if the target disappears before processing. Native errors/timeouts stay ambiguous,
+and recorded requests are never automatically resent. An unresolved request
+also blocks another request into that library.
+
+`fcp_reconcile_import(prepared_id)` reads app metadata and updates private
+bookkeeping. `metadata_observed` establishes only the expected library URL,
+event/project identity and duration. It does not verify timeline content or
+rendering. Missing, mismatched or unavailable observations require waiting or
+manual inspection, without another import. CLI approval mode blocks bridge
+dispatch; it is not silently replaced by client approval. XML export and
+rendering still depend on Final Cut. The older `fcp_import_xml` tool is unchanged.
+
+Apple contracts: [programmatic import](https://developer.apple.com/documentation/professional-video-applications/sending-data-programmatically-to-final-cut-pro)
+and [import options](https://developer.apple.com/documentation/professional-video-applications/import-options).
 
 ### Live FCP control
 

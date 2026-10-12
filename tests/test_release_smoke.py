@@ -65,7 +65,7 @@ def test_real_stdio_initialize_catalog_and_doctor(tmp_path: Path):
 
     assert report["package_version"] == "0.3.0"
     assert report["server_name"] == "fcp-mcp"
-    assert report["tool_count"] == 94
+    assert report["tool_count"] == 97
     assert report["prompt_count"] == 5
     assert report["resource_template_count"] == 3
     assert report["doctor_status"] in {"ready", "degraded"}
@@ -93,7 +93,7 @@ def test_quickstart_uses_stdio_without_writing_roundtrip(tmp_path: Path):
     assert result.returncode == 0, result.stderr or result.stdout
     payload = json.loads(result.stdout)
     assert payload["package_version"] == "0.3.0"
-    assert payload["tool_count"] == 94
+    assert payload["tool_count"] == 97
     assert payload["prompt_count"] == 5
     assert not roundtrip.exists()
 
@@ -102,8 +102,8 @@ def test_profile_contract_includes_workflow_default():
     assert PROFILE_COUNTS == {
         "inspect": (30, 2, 0),
         "workflow": (34, 3, 3),
-        "edit": (75, 5, 3),
-        "full": (94, 5, 3),
+        "edit": (76, 5, 3),
+        "full": (97, 5, 3),
     }
 
 

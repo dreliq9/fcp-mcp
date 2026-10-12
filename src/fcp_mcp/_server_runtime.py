@@ -25,6 +25,7 @@ from .automation import osascript as automation
 from .config import RuntimeConfig
 from .contracts import DoctorReport, ErrorCode, FCPMCPError
 from .diagnostics import collect_doctor
+from .fcp_control.import_bridge import ImportBridge
 from .fcpxml.analysis import (
     analyze_pacing,
     analyze_timeline_stats,
@@ -128,6 +129,7 @@ from .result_models.fcpxml import (
     TransitionMutationResult,
     UnsupportedToolResult,
 )
+from .result_models.import_bridge import ImportBridgeResult, PreparedImportResult
 from .result_models.live import (
     CollectionParentFilter,
     CompressorCLIInformationRecord,
@@ -208,6 +210,7 @@ from .tool_metadata import (
     OFFLINE_READ,
     OFFLINE_WRITE,
     STATEFUL_WRITE,
+    SafetyHints,
 )
 from .utils.atomic_write import AtomicWriteReceipt, atomic_replace_bytes
 from .workflow.surface import register_workflow_surface
@@ -5103,6 +5106,55 @@ def fcp_import_xml(fcpxml_path: str) -> ToolOutcome[FCPImportXMLResult]:
             ErrorCode.COMMAND_FAILED,
             f"Could not import FCPXML: {error}",
         ) from error
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.OFFLINE_WRITE,
+    safety_hints=OFFLINE_WRITE,
+    result_model=PreparedImportResult,
+    strict_arguments=True,
+)
+def fcpxml_prepare_import(path: str, library_path: str) -> ToolOutcome[PreparedImportResult]:
+    """Prepare and Apple-DTD-validate one event/project for an existing destination library.
+
+    Does not contact Final Cut. Review the returned artifact, target and plan hash
+    before approving fcp_request_import. Media must use scoped local file URLs.
+    """
+    result = ImportBridge(CONFIG).prepare(path, library_path)
+    return ToolOutcome(text=f"Prepared import {result.prepared_id}; no app request sent.", structured=result)
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_WRITE,
+    safety_hints=LIVE_WRITE,
+    result_model=ImportBridgeResult,
+    strict_arguments=True,
+)
+def fcp_request_import(prepared_id: str, expected_plan_sha256: str) -> ToolOutcome[ImportBridgeResult]:
+    """Request one exactly reviewed import using Apple's Open Document AppleEvent.
+
+    Requires live control, client approval mode and the prepared plan hash. The
+    destination must be uniquely open and event name unused. Acceptance is not
+    completion. Recorded or uncertain dispatches are never automatically resent.
+    """
+    result = ImportBridge(CONFIG).request(prepared_id, expected_plan_sha256)
+    return ToolOutcome(text=f"Import request {prepared_id}: {result.status}.", structured=result)
+
+
+@TOOLS.tool(
+    tool_class=ToolClass.LIVE_READ,
+    safety_hints=SafetyHints(read_only=False, destructive=False, idempotent=True, open_world=True),
+    result_model=ImportBridgeResult,
+    strict_arguments=True,
+)
+def fcp_reconcile_import(prepared_id: str) -> ToolOutcome[ImportBridgeResult]:
+    """Inspect FCP library/event/project metadata without importing or modifying the app.
+
+    Updates private pending-request bookkeeping. Matching metadata does not prove
+    full timeline contents or rendering; export/render remain app-dependent.
+    """
+    result = ImportBridge(CONFIG).reconcile(prepared_id)
+    return ToolOutcome(text=f"Import reconciliation {prepared_id}: {result.status}.", structured=result)
 
 
 @TOOLS.tool(

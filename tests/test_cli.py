@@ -104,7 +104,7 @@ def test_doctor_json_is_machine_readable(capsys, tmp_path, monkeypatch):
     assert code in {0, 1, 2}
     assert payload["schema_version"] == "1"
     assert payload["package_version"] == "0.3.0"
-    assert payload["tool_count"] == 94
+    assert payload["tool_count"] == 97
     assert payload["prompt_count"] == 5
     ledger = next(
         check for check in payload["checks"] if check["id"] == "workflow_ledger"
@@ -353,7 +353,7 @@ def test_server_main_builds_profile_override_without_mutating_environment(
     assert os.environ["FCP_MCP_PROFILE"] == "inspect"
     assert len(started) == 1
     assert "profile=edit" in started[0].instructions
-    assert len(asyncio.run(started[0].list_tools())) == 75
+    assert len(asyncio.run(started[0].list_tools())) == 76
 
 
 def test_invalid_option_uses_argparse_error(capsys):

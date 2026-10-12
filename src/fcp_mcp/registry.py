@@ -34,6 +34,7 @@ class ToolDefinition:
     result_model: ResultModel
     description: str
     registration_order: int
+    strict_arguments: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class ToolRegistry:
         result_model: ResultModel | None = None,
         name: str | None = None,
         description: str | None = None,
+        strict_arguments: bool = False,
     ) -> Callable[[HandlerT], HandlerT]:
         def decorator(handler: HandlerT) -> HandlerT:
             tool_name = name or handler.__name__
@@ -102,6 +104,7 @@ class ToolRegistry:
                 result_model=result_model or _inferred_result_model(handler),
                 description=description if description is not None else handler.__doc__ or "",
                 registration_order=len(self._definitions),
+                strict_arguments=strict_arguments,
             )
             return handler
 

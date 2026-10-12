@@ -2,10 +2,41 @@
 
 MCP server giving you (Claude) professional-grade Final Cut Pro editing
 via FCPXML + AppleScript + ffprobe. The default `workflow` profile exposes
-34 tools, three prompts, and three workflow resources; `full` exposes 93
-tools across 13 categories and five prompts.
+34 tools, three prompts, and three workflow resources; `full` exposes 97
+tools across 14 categories and five prompts.
 Modified FCPXMLs are written alongside their input with a `_modified`
 suffix unless `output_path` is specified.
+
+## Destination-bound import bridge (`edit`/`full`)
+
+The import bridge snapshots media within `FCP_MCP_WORKFLOW_MAX_ARTIFACT_BYTES`
+(default 256 MiB per preparation, aggregate staged media plus staged XML), retaining sealed
+XML/media for asynchronous app reads, and asks Final Cut to copy assets. Review the
+rewritten snapshot URLs. External Motion templates/locator resources are unsupported;
+installed factory UIDs remain supported. Read-only staging assumes a trusted OS user.
+
+Retain the whole private `FCP_MCP_STATE_DIR/import-bridge` tree, including plans,
+snapshots and dispatch records, across request/reconciliation and evidence/recovery
+decisions. Keep source XML unchanged until dispatch. There is no automatic cleanup;
+acceptance or metadata observation does not prove all asynchronous reads are finished.
+Do not delete, move or change permissions on prepared snapshots, or treat missing
+state/dispatch records as permission to resend.
+
+Choose stable private state outside workspace permission normalization. A temporary
+location such as `/private/tmp` can work for a retained bounded test but may be
+removed by the OS or another process. It does not guarantee persistence. Changed
+state, modes or identities require stopping and investigation, not verification
+bypasses or permission repair. The bridge provides no cleanup or state migration.
+
+Use `fcpxml_prepare_import` for offline validation of one event/project and an
+existing target library. Show the candidate, target, warnings and plan hash.
+Only after explicit approval, use `fcp_request_import` in the opt-in `full`
+profile with that exact hash. Client mode is required; no verified-human claim
+is made. Acceptance never proves completion. Reconcile the same prepared ID
+with `fcp_reconcile_import`; do not resend a timed-out or recorded request.
+An unresolved request blocks additional dispatches into that library.
+Metadata observation is not a rendered-output or full timeline verification.
+Keep XML export/rendering as app-dependent steps. See README's import bridge.
 
 ## Default transactional contract
 

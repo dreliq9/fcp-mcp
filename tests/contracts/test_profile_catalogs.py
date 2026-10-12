@@ -26,7 +26,7 @@ EXPECTED = {
         "resource_count": 3,
     },
     "edit": {
-        "tool_count": 75,
+        "tool_count": 76,
         "prompts": {
             "qc-check",
             "rough-cut",
@@ -37,7 +37,7 @@ EXPECTED = {
         "resource_count": 3,
     },
     "full": {
-        "tool_count": 94,
+        "tool_count": 97,
         "prompts": {
             "qc-check",
             "rough-cut",

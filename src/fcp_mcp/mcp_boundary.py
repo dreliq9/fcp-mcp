@@ -257,6 +257,11 @@ def build_mcp_server(
             annotations=_tool_annotations(definition.safety_hints),
         )(invoke)
         registered = server._tool_manager.get_tool(definition.name)
+        if definition.strict_arguments:
+            argument_model = registered.fn_metadata.arg_model
+            argument_model.model_config.update(extra="forbid", strict=True)
+            argument_model.model_rebuild(force=True)
+            registered.parameters = argument_model.model_json_schema()
         registered.fn_metadata.output_model = _json_output_validator(
             definition.result_model
         )

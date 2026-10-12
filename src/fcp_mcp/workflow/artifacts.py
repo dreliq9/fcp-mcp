@@ -1292,18 +1292,29 @@ class ArtifactStore:
         with _run_thread_guard(self.paths.root, run_id):
             return self._read_posix(metadata, run_id, kind)
 
-    def _read_fd(self, fd: int, metadata: ArtifactMetadataV1) -> bytes:
+    def read_current(
+        self, run_id: str, kind: ArtifactKind | str
+    ) -> tuple[ArtifactMetadataV1, bytes]:
+        """Read a mutable private record without claiming a previously pinned hash."""
+        canonical = _canonical_run_id(run_id)
+        closed_kind = _artifact_kind(kind)
+        with _run_thread_guard(self.paths.root, canonical):
+            payload = self._read_posix(None, canonical, closed_kind)
+        return self._metadata(canonical, closed_kind, payload), payload
+
+    def _read_fd(self, fd: int, metadata: ArtifactMetadataV1 | None) -> bytes:
         result = os.fstat(fd)
         if not stat.S_ISREG(result.st_mode):
             raise _coded(ErrorCode.ARTIFACT_CORRUPT, "recorded artifact is not a regular file")
         if stat.S_IMODE(result.st_mode) != _FILE_MODE:
             raise _coded(ErrorCode.ARTIFACT_CORRUPT, "recorded artifact mode is not private")
-        if result.st_size != metadata.byte_size or result.st_size > self.max_artifact_bytes:
+        expected_size = metadata.byte_size if metadata is not None else result.st_size
+        if result.st_size != expected_size or result.st_size > self.max_artifact_bytes:
             raise _coded(ErrorCode.ARTIFACT_CORRUPT, "recorded artifact size does not match")
         chunks: list[bytes] = []
         total = 0
         while total <= self.max_artifact_bytes:
-            remaining = metadata.byte_size + 1 - total
+            remaining = expected_size + 1 - total
             if remaining <= 0:
                 break
             chunk = os.read(
@@ -1315,15 +1326,15 @@ class ArtifactStore:
             chunks.append(chunk)
             total += len(chunk)
         payload = b"".join(chunks)
-        if len(payload) != metadata.byte_size:
+        if len(payload) != expected_size:
             raise _coded(ErrorCode.ARTIFACT_CORRUPT, "recorded artifact size changed during read")
-        if hashlib.sha256(payload).hexdigest() != metadata.sha256:
+        if metadata is not None and hashlib.sha256(payload).hexdigest() != metadata.sha256:
             raise _coded(ErrorCode.ARTIFACT_CORRUPT, "recorded artifact hash does not match")
         return payload
 
     def _read_posix(
         self,
-        metadata: ArtifactMetadataV1,
+        metadata: ArtifactMetadataV1 | None,
         run_id: str,
         kind: ArtifactKind,
     ) -> bytes:

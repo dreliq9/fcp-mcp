@@ -15,6 +15,14 @@ class PathPolicy:
     def _contained(path: Path, roots: tuple[Path, ...]) -> bool:
         return any(path == root or path.is_relative_to(root) for root in roots)
 
+    def _reject_import_staging(self, path: Path) -> None:
+        staging = (self.config.state_dir / "import-bridge" / "staged").resolve()
+        if path == staging or path.is_relative_to(staging):
+            raise FCPMCPError(
+                ErrorCode.PATH_OUTSIDE_SCOPE,
+                "Private import snapshots are reserved for the import bridge",
+            )
+
     def resolve_input(
         self,
         raw: str,
@@ -45,6 +53,7 @@ class PathPolicy:
         if not candidate.is_absolute():
             candidate = self.config.output_dir / candidate
         resolved = candidate.resolve()
+        self._reject_import_staging(resolved)
         if not self._contained(resolved, self.config.allowed_roots):
             raise FCPMCPError(
                 ErrorCode.PATH_OUTSIDE_SCOPE,
@@ -78,6 +87,7 @@ class PathPolicy:
         else:
             raise FCPMCPError(ErrorCode.INVALID_ARGUMENTS, "Output path is required")
         resolved = candidate.resolve()
+        self._reject_import_staging(resolved)
         write_roots = (self.config.output_dir,)
         if input_path is not None:
             write_roots += (input_path.resolve().parent,)
