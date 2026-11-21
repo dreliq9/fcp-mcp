@@ -6,5 +6,26 @@ version: "1.0"
 linter: qodana-python
 profile:
   name: qodana.recommended
+
+# Qodana for Python does not configure an interpreter on its own. Without one, the
+# standard library, typing, pydantic and mcp cannot be resolved, which produces
+# hundreds of false positives (e.g. "Invalid type annotation" on `X | None`,
+# "Class has no __init__" on dataclasses, invalid `Literal[...]`).
+# Follow the README install steps: a project-root `.venv` is auto-detected as the SDK.
+bootstrap: |
+  set -eu
+  python3 -m venv .venv
+  .venv/bin/python -m pip install --quiet --upgrade pip
+  .venv/bin/python -m pip install --quiet -e ".[dev]"
+
+exclude:
+  - name: All
+    paths:
+      - .venv
+      - build
+      - dist
+  # Mirrors pyproject's deliberate ruff `F841` ignore (unused locals in scaffolding).
+  - name: PyUnusedLocalVariableInspection
+
 include:
   - name: CheckDependencyLicenses
